@@ -1,0 +1,17 @@
+# Fleet repository code ownership (Q-GH1 posture).
+#
+# The `registry/**` zone is the human-PR-gated control plane: fleet topology,
+# the fleet-root Application, the platforms ApplicationSet, and the
+# diene-platform compiler chart. Every change to it requires a fleet-admin
+# code-owner review, enforced together with the `main` branch ruleset
+# (.github/rulesets/registry-guard-main.json).
+#
+# `platforms/**` is deliberately ABSENT: it is 100% machine-written (the T3
+# materializer + the Kargo bot). The Kargo bot pushes it directly under the
+# ruleset's Always bypass, and a human break-glass row change is an ordinary
+# fast PR with no code-owner gate.
+
+/registry/           @AtomiCloud/fleet-admin
+/registry/**         @AtomiCloud/fleet-admin
+/.github/CODEOWNERS  @AtomiCloud/fleet-admin
+/.github/rulesets/   @AtomiCloud/fleet-admin
