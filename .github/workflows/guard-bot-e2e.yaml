@@ -1,0 +1,72 @@
+name: Guard Bot E2E
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/guard-bot-e2e.yaml
+
+permissions:
+  contents: read
+
+jobs:
+  platforms-only-bypass:
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    steps:
+      - name: Mint scoped AtomiCloud Auth Bot token
+        id: app-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1
+        with:
+          app-id: 1170835
+          private-key: ${{ secrets.AUTH_BOT_SECRET_KEY }}
+          owner: AtomiCloud
+          repositories: fleet
+
+      - name: Check out protected main with the bot token
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30af803
+        with:
+          fetch-depth: 0
+          ref: main
+          token: ${{ steps.app-token.outputs.token }}
+
+      - name: Prove platforms-only direct push and clean up
+        id: proof
+        env:
+          PROOF_PATH: platforms/sandbox/kargo-bypass-check.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'AtomiCloud Auth Bot'
+          git config user.email 'auth-bot@atomi.cloud'
+
+          mkdir -p "$(dirname "${PROOF_PATH}")"
+          printf '%s\n' 'temporary Kargo-bypass proof; deleted by the same job' >"${PROOF_PATH}"
+          git add "${PROOF_PATH}"
+          test "$(git diff --cached --name-only)" = "${PROOF_PATH}"
+          git commit -m 'test(fleet): prove Kargo platforms bypass'
+          create_sha="$(git rev-parse HEAD)"
+          git push origin HEAD:main
+
+          git rm "${PROOF_PATH}"
+          test "$(git diff --cached --name-only)" = "${PROOF_PATH}"
+          git commit -m 'test(fleet): clean Kargo bypass proof'
+          cleanup_sha="$(git rev-parse HEAD)"
+          git push origin HEAD:main
+
+          printf 'create_sha=%s\n' "${create_sha}" >>"${GITHUB_OUTPUT}"
+          printf 'cleanup_sha=%s\n' "${cleanup_sha}" >>"${GITHUB_OUTPUT}"
+          {
+            printf '### Kargo bypass proof\n\n'
+            printf -- '- creation commit: %s\n' "${create_sha}"
+            printf -- '- cleanup commit: %s\n' "${cleanup_sha}"
+            printf -- '- exact allowed path: %s\n' "${PROOF_PATH}"
+          } >>"${GITHUB_STEP_SUMMARY}"
+
+      - name: Verify cleanup is the protected main tip
+        env:
+          CLEANUP_SHA: ${{ steps.proof.outputs.cleanup_sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git rev-parse HEAD)" = "${CLEANUP_SHA}"
+          test ! -e platforms/sandbox/kargo-bypass-check.txt
