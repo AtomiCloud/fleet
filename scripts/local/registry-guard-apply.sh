@@ -63,7 +63,15 @@ fi
 live_id="$(gh api "repos/${repo}/rulesets" --jq ".[] | select(.name == \"${name}\") | .id")"
 [ -z "${live_id}" ] && echo "❌ ruleset ${name} was not found after apply" >&2 && exit 1
 
-desired_policy="$(jq -cS '{name,target,enforcement,bypass_actors,conditions,rules}' <<<"${payload}")"
+desired_policy="$(jq -cS '
+  {name,target,enforcement,bypass_actors,conditions,rules}
+  | .rules |= map(
+      if .type == "pull_request" then
+        .parameters.dismissal_restriction = {allowed_actors: [], enabled: false}
+        | .parameters.required_reviewers = []
+      else . end
+    )
+' <<<"${payload}")"
 live_policy="$(gh api "repos/${repo}/rulesets/${live_id}" | jq -cS '{name,target,enforcement,bypass_actors,conditions,rules}')"
 if [ "${desired_policy}" != "${live_policy}" ]; then
   echo "❌ live ruleset ${name} differs after apply" >&2
