@@ -1138,6 +1138,574 @@ kargo-row-update-contract | kargo-row-update | kargo-yaml-update-contract)
   fi
   echo "  fast yaml-update contract model: exact Raichu pin.tag target, raw values bytes, and negatives ✓"
   ;;
+sit-namespace-lifecycle | sit-proof-lifecycle)
+  proof_source="${PWD}/scripts/ci/fleet-sit-proof.sh"
+  sit_source="${PWD}/scripts/ci/fleet-sit.sh"
+  pins_source="${PWD}/scripts/validate/fleet-sit/pins.env"
+  for source_file in "${proof_source}" "${sit_source}" "${pins_source}"; do
+    test -s "${source_file}" || fail "Namespace lifecycle source is missing: ${source_file}"
+  done
+
+  # Production source law. Historical failed-wrapper fixtures below may name
+  # the old substrate; no executable production byte may do so.
+  if rg -n 'k3d cluster create|k3d kubeconfig|host\.k3d\.internal|docker exec' \
+    "${proof_source}" "${sit_source}"; then
+    fail 'the production fleet proof retains a nested-cluster or node-exec path'
+  fi
+  if rg -n 'k3s[[:space:]]+ctr|images[[:space:]]+export|containerd.*export' \
+    "${proof_source}" "${sit_source}"; then
+    fail 'the production fleet proof introduced a forbidden containerd export path'
+  fi
+  rg -qF '/vendor/containerd/ctr --address /var/run/containerd/containerd.sock' \
+    "${sit_source}" || fail 'the production platform containerd socket is not explicit'
+  rg -qF -- '--namespace k8s.io "$@"' "${sit_source}" ||
+    fail 'the production platform containerd namespace is not explicit'
+  rg -qF 'k3s crictl "$@"' "${sit_source}" ||
+    fail 'the production CRI seam no longer uses built-in k3s crictl'
+  rg -qF '[ "${observed_k3s}" = "${NSC_K3S_VERSION}" ]' "${sit_source}" ||
+    fail 'the inner preflight no longer refuses a drifted k3s version'
+  rg -qF '[ "$(hostname)" = "${namespace_instance_id}" ]' "${sit_source}" ||
+    fail 'the inner preflight no longer binds hostname to exact instance id'
+  rg -qF 'namespace_first_line_receipt apk info --who-owns "${path}"' "${sit_source}" ||
+    fail 'Wolfi BusyBox tool receipts no longer use fail-closed package ownership'
+  if rg -n '(sha256sum|tar|timeout)[[:space:]]+--version' "${sit_source}"; then
+    fail 'a Wolfi BusyBox applet receipt reverted to a non-portable GNU --version probe'
+  fi
+  rg -qF 'apk awk bash curl docker git gzip head jq kubectl nproc sed sha256sum tar timeout tr' \
+    "${sit_source}" || fail 'the Namespace bootstrap gate no longer requires nproc before use'
+  rg -qF 'sit_require_command "${bootstrap}"' "${sit_source}" ||
+    fail 'the Namespace bootstrap command gate disappeared'
+  rg -qF "'namespace-platform.json' 'pins-verified.txt'" "${sit_source}" ||
+    fail 'the L0 evidence declaration omits the platform/toolchain preflight'
+
+  # Run the production receipt helpers, not a transcription. A command
+  # substitution used directly as an outer function argument can mask its
+  # non-zero status in Bash, so both empty-success and partial-output/failure
+  # probes are positive-controlled refusals here.
+  nsl_tool_fns="${tmp}/namespace-tool-receipt-fns.sh"
+  : >"${nsl_tool_fns}"
+  for nsl_tool_fn in \
+    namespace_tool_record \
+    namespace_first_line_receipt \
+    namespace_tool_command_record; do
+    sed -n "/^${nsl_tool_fn}() {\$/,/^}\$/p" "${sit_source}" >"${tmp}/nsl-tool-fn.sh"
+    test -s "${tmp}/nsl-tool-fn.sh" ||
+      fail "could not extract ${nsl_tool_fn}() for the Namespace receipt refusal test"
+    [ "$(tail -n 1 "${tmp}/nsl-tool-fn.sh")" = '}' ] ||
+      fail "the extracted ${nsl_tool_fn}() receipt helper is unterminated"
+    cat "${tmp}/nsl-tool-fn.sh" >>"${nsl_tool_fns}"
+  done
+  cat >"${tmp}/namespace-tool-receipt-driver.sh" <<'NSL_TOOL_RECEIPT_DRIVER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+fn_file="$1"
+work="$2"
+mkdir -p "${work}"
+
+sit_fail() {
+  printf 'fixture refusal: %s\n' "$*" >&2
+  return 1
+}
+
+# shellcheck source=/dev/null
+source "${fn_file}"
+
+receipt_ok() { printf 'version 1.2.3\nignored second line\n'; }
+receipt_empty() { :; }
+receipt_partial_failure() { printf 'misleading partial version\n'; return 23; }
+
+namespace_tool_command_record good /fixture/tool receipt_ok
+if namespace_tool_command_record empty /fixture/tool receipt_empty 2>/dev/null; then
+  echo 'empty version receipt was accepted' >&2
+  exit 31
+fi
+if namespace_tool_command_record partial /fixture/tool receipt_partial_failure 2>/dev/null; then
+  echo 'non-zero version probe with partial output was accepted' >&2
+  exit 32
+fi
+if namespace_tool_record direct-empty /fixture/tool '' 2>/dev/null; then
+  echo 'direct empty version receipt was accepted' >&2
+  exit 33
+fi
+[ "$(wc -l <"${work}/namespace-tools.tsv" | tr -d ' ')" -eq 1 ]
+grep -qxF $'good\t/fixture/tool\tversion 1.2.3' "${work}/namespace-tools.tsv"
+NSL_TOOL_RECEIPT_DRIVER
+  bash "${tmp}/namespace-tool-receipt-driver.sh" \
+    "${nsl_tool_fns}" "${tmp}/namespace-tool-receipt-work" ||
+    fail 'Namespace tool-version receipts did not fail closed'
+
+  nsl_root="${tmp}/namespace-lifecycle"
+  nsl_fixture="${nsl_root}/fixture"
+  nsl_bin="${nsl_root}/bin"
+  mkdir -p \
+    "${nsl_fixture}/platforms/canary" \
+    "${nsl_fixture}/registry/charts/diene-platform" \
+    "${nsl_fixture}/registry/fixtures/clusters" \
+    "${nsl_fixture}/registry/fixtures/negative" \
+    "${nsl_fixture}/scripts/ci" \
+    "${nsl_fixture}/scripts/validate/fleet-sit" \
+    "${nsl_bin}"
+  cp "${proof_source}" "${nsl_fixture}/scripts/ci/fleet-sit-proof.sh"
+  cp "${pins_source}" "${nsl_fixture}/scripts/validate/fleet-sit/pins.env"
+  printf '%s\n' fixture >"${nsl_fixture}/platforms/canary/services.yaml"
+  printf '%s\n' fixture >"${nsl_fixture}/registry/charts/diene-platform/fixture.yaml"
+  printf '%s\n' fixture >"${nsl_fixture}/registry/fixtures/clusters/fixture.yaml"
+  printf '%s\n' fixture >"${nsl_fixture}/registry/fixtures/negative/fixture.yaml"
+  printf '%s\n' fixture >"${nsl_fixture}/registry/argocd-webhook-secret.yaml"
+  printf '%s\n' fixture >"${nsl_fixture}/registry/machinery-stable.yaml"
+  printf '%s\n' fixture >"${nsl_fixture}/registry/platforms-appset.yaml"
+  cat >"${nsl_fixture}/scripts/ci/fleet-sit.sh" <<'NSL_SIT_STUB'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+[ "${1:-}" = '--prepare-only' ] || {
+  echo 'the lifecycle fixture inner run must be supplied by the nsc shim' >&2
+  exit 91
+}
+printf 'fixture prepare-only invoked\n'
+NSL_SIT_STUB
+  chmod +x "${nsl_fixture}/scripts/ci/fleet-sit.sh" \
+    "${nsl_fixture}/scripts/ci/fleet-sit-proof.sh"
+  git -C "${nsl_fixture}" init --quiet --initial-branch=main
+  git -C "${nsl_fixture}" config user.name fleet-sit-lifecycle
+  git -C "${nsl_fixture}" config user.email fleet-sit-lifecycle@invalid.example
+  git -C "${nsl_fixture}" add .
+  git -C "${nsl_fixture}" commit --quiet -m 'Namespace lifecycle fixture'
+
+  cat >"${nsl_bin}/sleep" <<'NSL_SLEEP_SHIM'
+#!/usr/bin/env sh
+exit 0
+NSL_SLEEP_SHIM
+  chmod +x "${nsl_bin}/sleep"
+
+  cat >"${nsl_bin}/nsc" <<'NSL_NSC_SHIM'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+state="${NSC_SHIM_STATE:?}"
+id="${NSC_SHIM_ID:?}"
+mkdir -p "${state}"
+
+log() {
+  printf '%s\n' "$1" >>"${state}/calls.log"
+}
+
+active_instance_json() {
+  local cpu=16 memory=32768 kubernetes='1.33'
+  [ "${NSC_SHIM_LIST_SHAPE:-}" != 'wrong' ] || {
+    cpu=4
+    memory=8192
+  }
+  jq -n \
+    --arg id "${id}" \
+    --argjson cpu "${cpu}" \
+    --argjson memory "${memory}" \
+    --arg kubernetes "${kubernetes}" '
+      [{cluster_id:$id,labels:{"ratchet-node":"fleet","ratchet-generation":"7"},
+        shape:{virtual_cpu:$cpu,memory_megabytes:$memory,machine_arch:"amd64",os:"linux"},
+        kubernetes:$kubernetes}]
+    '
+}
+
+write_synthetic_report() {
+  local source="${state}/remote/source"
+  local report="${state}/remote/result/sit-report"
+  local commit="$1" status='pass'
+  [ "${NSC_SHIM_FAIL_STAGE:-}" != 'report-validation' ] || status='fail'
+  mkdir -p "${report}"
+  local -a roots=(
+    'platforms/canary'
+    'registry/argocd-webhook-secret.yaml'
+    'registry/charts/diene-platform'
+    'registry/fixtures/clusters'
+    'registry/fixtures/negative'
+    'registry/machinery-stable.yaml'
+    'registry/platforms-appset.yaml'
+    'scripts/ci/fleet-sit-proof.sh'
+    'scripts/ci/fleet-sit.sh'
+    'scripts/validate/fleet-sit'
+  )
+  local inventory="${report}/direct-input-inventory.sha256"
+  : >"${inventory}"
+  local record mode type object path sha
+  while IFS= read -r -d '' record; do
+    mode="${record%% *}"
+    type="$(printf '%s' "${record}" | cut -d' ' -f2)"
+    object="$(printf '%s' "${record}" | cut -d' ' -f3 | cut -f1)"
+    path="${record#*$'\t'}"
+    sha="$(git -C "${source}" cat-file blob "${object}" | sha256sum | awk '{print $1}')"
+    printf '%s,%s,%s,%s,%s\n' "${mode}" "${type}" "${object}" "${sha}" "${path}" >>"${inventory}"
+  done < <(git -C "${source}" ls-tree -r -z "${commit}" -- "${roots[@]}")
+  LC_ALL=C sort -t, -k5 -o "${inventory}" "${inventory}"
+  local digest count tree legs_json roots_json contract_json
+  digest="$(sha256sum -- "${inventory}" | awk '{print $1}')"
+  count="$(wc -l <"${inventory}" | tr -d ' ')"
+  tree="$(git -C "${source}" rev-parse "${commit}^{tree}")"
+  roots_json="$(printf '%s\n' "${roots[@]}" | jq -Rsc 'split("\n")[:-1]')"
+  local -a legs=(
+    'L0-runtime-setup'
+    'L1-baseline-generation'
+    'L2-signed-webhook-one-row'
+    'L3-invalid-signatures-no-refresh'
+    'L4-main-tag-and-manual-policy'
+    'L5-machinery-pointer-forward-only-and-automated-policy'
+    'L6-two-row-union-and-no-row'
+    'L7-polling-fallback'
+    'L8-kargo-v1-field-contract'
+    'L9-kargo-v1-runtime'
+  )
+  contract_json="$(printf '%s\n' "${legs[@]}" | jq -Rsc 'split("\n")[:-1]')"
+  : >"${state}/legs.jsonl"
+  local index=0 leg evidence
+  for leg in "${legs[@]}"; do
+    if [ "${index}" -eq 0 ]; then
+      evidence='namespace-platform.json'
+      printf '%s\n' '{"fixture":true,"tools":[]}' >"${report}/${evidence}"
+    else
+      evidence="fixture-leg-${index}.txt"
+      printf 'synthetic outer-lifecycle fixture for %s\n' "${leg}" >"${report}/${evidence}"
+    fi
+    jq -n --arg leg "${leg}" --arg evidence "${evidence}" \
+      '{leg:$leg,status:"pass",started:"2026-07-31T20:00:00Z",elapsed_s:1,evidence:[$evidence],note:"outer lifecycle fixture"}' \
+      >>"${state}/legs.jsonl"
+    index=$((index + 1))
+  done
+  legs_json="$(jq -s . "${state}/legs.jsonl")"
+  jq -n \
+    --arg status "${status}" \
+    --arg commit "${commit}" \
+    --arg tree "${tree}" \
+    --arg digest "${digest}" \
+    --argjson count "${count}" \
+    --argjson roots "${roots_json}" \
+    --argjson contract "${contract_json}" \
+    --argjson legs "${legs_json}" '
+      {
+        schemaVersion:2,status:$status,commit:$commit,
+        checkoutHeadAtStart:$commit,checkoutHeadAtFinish:$commit,
+        checkoutCleanAtStart:true,checkoutCleanAtFinish:true,
+        inputSnapshotCommit:$commit,inputSnapshotTree:$tree,inputSnapshotVerified:true,
+        directInputRoots:$roots,directInputSha256:$digest,directInputSha256AtFinish:$digest,
+        directInputFileCount:$count,directInputRecheckedAtFinish:true,
+        directInputInventory:"direct-input-inventory.sha256",harnessFileCount:1,
+        legContract:$contract,legs:$legs
+      }
+    ' >"${report}/sit-report.json"
+}
+
+command_name="${1:-}"
+shift || true
+case "${command_name}" in
+version)
+  log 'version'
+  if [ "${NSC_SHIM_FAIL_STAGE:-}" = 'wrong-nsc-version' ]; then
+    cat <<'WRONG_VERSION'
+version v0.0.531 (commit 0000000000000000000000000000000000000000)
+WRONG_VERSION
+  else
+    cat <<'VERSION'
+version v0.0.532 (commit 8fd20e2be4ee9d72b1357fa6f8ff2e15629abc96)
+  commit date 2026-07-06T06:09:45Z
+  architecture linux/amd64
+VERSION
+  fi
+  ;;
+create)
+  log "create"$'\t'"$(printf '%q ' "$@")"
+  cid=''
+  args=("$@")
+  for ((i = 0; i < ${#args[@]}; i++)); do
+    [ "${args[i]}" != '--cidfile' ] || cid="${args[i + 1]:-}"
+  done
+  expected=(
+    --ephemeral --duration 2h --machine_type 16x32 --enable=kubernetes:1.33
+    --wait_kube_system --label ratchet-node=fleet --label ratchet-generation=7
+    --purpose 'fleet full L0-L9 Namespace built-in-k3s proof'
+    --cidfile "${cid}" --output json
+  )
+  [ "${#args[@]}" -eq "${#expected[@]}" ] || {
+    echo 'shim: create argv length drifted' >&2
+    exit 40
+  }
+  for ((i = 0; i < ${#expected[@]}; i++)); do
+    [ "${args[i]}" = "${expected[i]}" ] || {
+      echo "shim: create argv drift at ${i}: ${args[i]} != ${expected[i]}" >&2
+      exit 41
+    }
+  done
+  [ -n "${cid}" ] || exit 42
+  printf '%s\n' "${id}" >"${cid}"
+  cpu=16
+  memory=32768
+  kubernetes='1.33'
+  [ "${NSC_SHIM_RECEIPT_SHAPE:-}" != 'wrong' ] || {
+    cpu=4
+    memory=8192
+  }
+  [ "${NSC_SHIM_RECEIPT_KUBERNETES:-}" != 'wrong' ] || kubernetes='1.32'
+  jq -n \
+    --arg id "${id}" --argjson cpu "${cpu}" --argjson memory "${memory}" \
+    --arg kubernetes "${kubernetes}" '
+      {
+        cluster_id:$id,created:"2026-07-31T20:00:00Z",deadline:"2026-07-31T22:00:00Z",
+        shape:{virtual_cpu:$cpu,memory_megabytes:$memory,machine_arch:"amd64",os:"linux"},
+        kubernetes_distribution:"k3s",label:[{name:"nsc.kubernetes",value:$kubernetes}],
+        service_state:[{name:"ssh",status:"READY"},{name:"kubernetes",status:"READY"}]
+      }
+    '
+  if [ "${NSC_SHIM_FAIL_STAGE:-}" = 'create-signal' ]; then
+    kill -TERM "${PPID}"
+  fi
+  ;;
+list)
+  log 'list'
+  printf '\033[?25l\033[0J\033[0K'
+  if { [ -f "${state}/destroyed" ] && [ "${NSC_SHIM_FAIL_STAGE:-}" != 'absence' ]; }; then
+    printf 'null\n'
+  else
+    active_instance_json
+  fi
+  printf '\033[0J\033[?25h'
+  ;;
+destroy)
+  log "destroy"$'\t'"${1:-}"$'\t'"${2:-}"
+  [ "${1:-}" = "${id}" ] && [ "${2:-}" = '--force' ] && [ "$#" -eq 2 ] || {
+    echo 'shim: destroy must target only the exact id with --force' >&2
+    exit 50
+  }
+  [ "${NSC_SHIM_FAIL_STAGE:-}" != 'destroy' ] || exit 51
+  : >"${state}/destroyed"
+  ;;
+ssh)
+  log "ssh"$'\t'"$(printf '%q ' "$@")"
+  [ "${1:-}" = '--disable-pty' ] || exit 60
+  shift
+  [ "${1:-}" = "${id}" ] || exit 61
+  shift
+  joined="$(printf '%s ' "$@")"
+  if [ "${1:-}" = 'hostname' ]; then
+    if [ "${NSC_SHIM_FAIL_STAGE:-}" = 'hostname' ]; then
+      printf 'wronghostname00\n'
+    else
+      printf '%s\n' "${id}"
+    fi
+  elif [ "${1:-}" = 'sh' ] && [[ ${joined} == *source.tgz*sha256sum*check* ]]; then
+    [ "${NSC_SHIM_FAIL_STAGE:-}" != 'setup' ] || exit 62
+    mkdir -p "${state}/remote/result"
+    tar -xzf "${state}/source.tgz" -C "${state}/remote"
+    printf 'source.tgz: OK\n'
+  elif [ "${1:-}" = 'env' ] && [[ ${joined} == *--inner* ]]; then
+    [ "${NSC_SHIM_FAIL_STAGE:-}" != 'inner' ] || exit 63
+    [ "${NSC_SHIM_FAIL_STAGE:-}" != 'wrong-k3s' ] || {
+      echo 'built-in k3s version must be v1.33.1+k3s1, found v1.32.0+k3s1' >&2
+      exit 64
+    }
+    expected_head=''
+    for arg in "$@"; do
+      case "${arg}" in
+      FLEET_SIT_EXPECTED_HEAD=*) expected_head="${arg#*=}" ;;
+      esac
+    done
+    [[ ${expected_head} =~ ^[0-9a-f]{40}$ ]] || exit 65
+    write_synthetic_report "${expected_head}"
+  elif [ "${1:-}" = 'sh' ] && [[ ${joined} == *sit-report.tgz* ]]; then
+    [ "${NSC_SHIM_FAIL_STAGE:-}" != 'archive' ] || exit 66
+    tar -czf "${state}/sit-report.tgz" -C "${state}/remote/result" sit-report
+    sha256sum "${state}/sit-report.tgz" | sed 's#  .*#  /tmp/fleet-sit-fixture/result/sit-report.tgz#'
+  else
+    echo "shim: unmodeled ssh argv: ${joined}" >&2
+    exit 67
+  fi
+  ;;
+instance)
+  subcommand="${1:-}"
+  shift || true
+  case "${subcommand}" in
+  upload)
+    log "upload"$'\t'"$(printf '%q ' "$@")"
+    [ "${NSC_SHIM_FAIL_STAGE:-}" != 'upload' ] || exit 70
+    [ "${1:-}" = "${id}" ] && [ "${4:-}" = '--mkdir' ] || exit 71
+    cp -- "${2}" "${state}/source.tgz"
+    ;;
+  download)
+    log "download"$'\t'"$(printf '%q ' "$@")"
+    [ "${NSC_SHIM_FAIL_STAGE:-}" != 'download' ] || exit 72
+    [ "${1:-}" = "${id}" ] || exit 73
+    cp -- "${state}/sit-report.tgz" "${3}"
+    ;;
+  *) exit 74 ;;
+  esac
+  ;;
+*)
+  echo "shim: unsupported nsc command ${command_name}" >&2
+  exit 80
+  ;;
+esac
+NSL_NSC_SHIM
+  chmod +x "${nsl_bin}/nsc"
+
+  nsl_id='abcdefghijklmn'
+  nsl_status=0
+  nsl_report=''
+  nsl_state=''
+  nsl_run() {
+    local name="$1" expected="$2"
+    shift 2
+    nsl_state="${nsl_root}/cases/${name}/state"
+    nsl_report="${nsl_root}/cases/${name}/report"
+    mkdir -p "${nsl_state}"
+    nsl_status=0
+    env \
+      PATH="${nsl_bin}:${PATH}" \
+      NSC_SHIM_STATE="${nsl_state}" \
+      NSC_SHIM_ID="${nsl_id}" \
+      FLEET_SIT_REPORT="${nsl_report}" \
+      "$@" \
+      bash "${nsl_fixture}/scripts/ci/fleet-sit-proof.sh" --full \
+      >"${nsl_root}/cases/${name}/stdout.txt" \
+      2>"${nsl_root}/cases/${name}/stderr.txt" || nsl_status=$?
+    if [ "${expected}" = 'pass' ]; then
+      [ "${nsl_status}" -eq 0 ] ||
+        fail "Namespace lifecycle ${name}: expected pass, got ${nsl_status}: $(tr '\n' ' ' <"${nsl_root}/cases/${name}/stderr.txt")"
+    else
+      [ "${nsl_status}" -ne 0 ] || fail "Namespace lifecycle ${name}: expected refusal"
+    fi
+  }
+
+  nsl_assert_exact_destroy() {
+    local name="$1"
+    grep -qxF $'destroy\t'"${nsl_id}"$'\t--force' "${nsl_state}/calls.log" ||
+      fail "Namespace lifecycle ${name}: no exact-id destroy --force attempt was recorded"
+    if grep '^destroy' "${nsl_state}/calls.log" | grep -vFx $'destroy\t'"${nsl_id}"$'\t--force' >/dev/null; then
+      fail "Namespace lifecycle ${name}: a non-exact destructive selector was attempted"
+    fi
+  }
+
+  nsl_assert_failed_lifecycle() {
+    local name="$1"
+    test -s "${nsl_report}/lifecycle/lifecycle.json" ||
+      fail "Namespace lifecycle ${name}: failed run retained no lifecycle receipt"
+    jq -e '
+      .status == "fail" and
+      .cleanup.destroyAttempts >= 1 and
+      (.passLaw | contains("pass is impossible"))
+    ' "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+      fail "Namespace lifecycle ${name}: failed receipt claimed completion or omitted cleanup"
+  }
+
+  # Prepare-only runs the real production wrapper from a committed fixture and
+  # must never even resolve nsc through PATH.
+  nsl_prepare_state="${nsl_root}/prepare-state"
+  mkdir -p "${nsl_prepare_state}"
+  env PATH="${nsl_bin}:${PATH}" NSC_SHIM_STATE="${nsl_prepare_state}" NSC_SHIM_ID="${nsl_id}" \
+    FLEET_SIT_REPORT="${nsl_root}/prepare-report" \
+    bash "${nsl_fixture}/scripts/ci/fleet-sit-proof.sh" --prepare-only \
+    >"${nsl_root}/prepare.stdout" 2>"${nsl_root}/prepare.stderr" ||
+    fail "Namespace prepare-only fixture failed: $(tr '\n' ' ' <"${nsl_root}/prepare.stderr")"
+  test ! -e "${nsl_prepare_state}/calls.log" ||
+    fail 'prepare-only created, listed, used, or destroyed a Namespace instance'
+
+  nsl_run success pass
+  jq -e '
+    .status == "pass" and
+    .namespace.createdByHarness == true and
+    (.namespace.createArgvSha256 | test("^[0-9a-f]{64}$")) and
+    (.namespace.createReceiptSha256 | test("^[0-9a-f]{64}$")) and
+    .innerReport.collected == true and .innerReport.validated == true and
+    .cleanup.destroySucceeded == true and .cleanup.exactIdAbsenceProven == true and
+    .timings.setup.startedEpoch > 0 and .timings.setup.finishedEpoch >= .timings.setup.startedEpoch and
+    .failureStage == "complete"
+  ' "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+    fail 'successful Namespace lifecycle receipt is not bound through report validation, setup, destroy, and absence'
+  jq -e '
+    .executable == "nsc" and .subcommand == "create" and
+    .source == "outer-wrapper" and
+    (.argv | index("--ephemeral")) != null and
+    (.argv | index("2h")) != null and
+    (.argv | index("16x32")) != null and
+    (.argv | index("--enable=kubernetes:1.33")) != null
+  ' "${nsl_report}/lifecycle/create-argv.json" >/dev/null ||
+    fail 'successful Namespace lifecycle did not retain its exact structured create argv'
+  nsl_assert_exact_destroy success
+
+  # A lead-provided instance/receipt skips create, is still fully validated,
+  # and remains owned by the exact-id cleanup path.
+  nsl_precreated_receipt="${nsl_root}/precreated-create.json"
+  jq -n --arg id "${nsl_id}" '{
+    cluster_id:$id,created:"2026-07-31T20:00:00Z",deadline:"2026-07-31T22:00:00Z",
+    shape:{virtual_cpu:16,memory_megabytes:32768,machine_arch:"amd64",os:"linux"},
+    kubernetes_distribution:"k3s",label:[{name:"nsc.kubernetes",value:"1.33"}],
+    service_state:[{name:"ssh",status:"READY"},{name:"kubernetes",status:"READY"}]
+  }' >"${nsl_precreated_receipt}"
+  nsl_run precreated pass \
+    FLEET_SIT_NSC_INSTANCE_ID="${nsl_id}" \
+    FLEET_SIT_NSC_CREATE_RECEIPT="${nsl_precreated_receipt}"
+  ! grep -q '^create' "${nsl_state}/calls.log" ||
+    fail 'pre-created Namespace interface silently created a second instance'
+  jq -e '
+    .source == "lead-provided" and .executable == null and
+    .subcommand == null and .argv == null
+  ' "${nsl_report}/lifecycle/create-argv.json" >/dev/null ||
+    fail 'pre-created Namespace handoff did not record the honest no-local-create marker'
+  nsl_assert_exact_destroy precreated
+
+  # Cleanup ownership starts before source and pinned-CLI preflight once the
+  # empty lifecycle evidence path and syntactically exact provided id are
+  # accepted. Neither refusal may leak the lead's registered instance.
+  nsl_run precreated-wrong-nsc-version fail \
+    FLEET_SIT_NSC_INSTANCE_ID="${nsl_id}" \
+    FLEET_SIT_NSC_CREATE_RECEIPT="${nsl_precreated_receipt}" \
+    NSC_SHIM_FAIL_STAGE=wrong-nsc-version
+  nsl_assert_exact_destroy precreated-wrong-nsc-version
+  nsl_assert_failed_lifecycle precreated-wrong-nsc-version
+  printf '\nfixture source drift\n' >>"${nsl_fixture}/scripts/ci/fleet-sit.sh"
+  nsl_run precreated-dirty-snapshot fail \
+    FLEET_SIT_NSC_INSTANCE_ID="${nsl_id}" \
+    FLEET_SIT_NSC_CREATE_RECEIPT="${nsl_precreated_receipt}"
+  nsl_assert_exact_destroy precreated-dirty-snapshot
+  nsl_assert_failed_lifecycle precreated-dirty-snapshot
+  git -C "${nsl_fixture}" restore scripts/ci/fleet-sit.sh
+
+  # Every injected post-create failure must fail closed and take the same
+  # exact-id destroy path. The report-validation case proves outer bytes do not
+  # trust an inner success claim; destroy/absence cases prove pass is ordered
+  # after cleanup, never before it.
+  for nsl_stage in create-signal upload setup inner wrong-k3s archive download report-validation destroy absence hostname; do
+    nsl_run "failure-${nsl_stage}" fail "NSC_SHIM_FAIL_STAGE=${nsl_stage}"
+    nsl_assert_exact_destroy "failure-${nsl_stage}"
+    nsl_assert_failed_lifecycle "failure-${nsl_stage}"
+  done
+
+  nsl_run wrong-receipt-shape fail NSC_SHIM_RECEIPT_SHAPE=wrong
+  nsl_assert_exact_destroy wrong-receipt-shape
+  nsl_assert_failed_lifecycle wrong-receipt-shape
+  nsl_run wrong-receipt-kubernetes fail NSC_SHIM_RECEIPT_KUBERNETES=wrong
+  nsl_assert_exact_destroy wrong-receipt-kubernetes
+  nsl_assert_failed_lifecycle wrong-receipt-kubernetes
+  nsl_run wrong-live-shape fail NSC_SHIM_LIST_SHAPE=wrong
+  nsl_assert_exact_destroy wrong-live-shape
+  nsl_assert_failed_lifecycle wrong-live-shape
+
+  nsl_run missing-receipt fail FLEET_SIT_NSC_INSTANCE_ID="${nsl_id}"
+  nsl_assert_exact_destroy missing-receipt
+  nsl_assert_failed_lifecycle missing-receipt
+  nsl_mismatched_receipt="${nsl_root}/mismatched-create.json"
+  jq '.cluster_id = "zzzzzzzzzzzzzz"' "${nsl_precreated_receipt}" >"${nsl_mismatched_receipt}"
+  nsl_run mismatched-receipt-id fail \
+    FLEET_SIT_NSC_INSTANCE_ID="${nsl_id}" \
+    FLEET_SIT_NSC_CREATE_RECEIPT="${nsl_mismatched_receipt}"
+  nsl_assert_exact_destroy mismatched-receipt-id
+  nsl_assert_failed_lifecycle mismatched-receipt-id
+  nsl_run missing-id fail FLEET_SIT_NSC_CREATE_RECEIPT="${nsl_precreated_receipt}"
+  ! grep -q '^destroy' "${nsl_state}/calls.log" 2>/dev/null ||
+    fail 'missing instance id produced a destructive selector'
+  nsl_run malformed-id fail \
+    FLEET_SIT_NSC_INSTANCE_ID='fleet-sit-prefix' \
+    FLEET_SIT_NSC_CREATE_RECEIPT="${nsl_precreated_receipt}"
+  ! grep -q '^destroy' "${nsl_state}/calls.log" 2>/dev/null ||
+    fail 'malformed instance id produced a destructive selector'
+
+  echo '  Namespace outer lifecycle, pre-created handoff, exact pins, failure collection, exact-id cleanup, and pass ordering are refusal-tested ✓'
+  ;;
 sit-host-image-binding | sit-host-image)
   # Deterministic offline model of the L9 host-image step. No docker daemon, no
   # network, no cluster, no k3d — the gate runs anywhere `bash`, `jq`, `awk` and
@@ -1426,6 +1994,10 @@ HOSTIMAGEDRIVER
   echo "  R4 a classic-store daemon, whose .Id can never equal the pinned index digest, is rejected at the source ✓"
   ;;
 sit-node-image-import | sit-node-image)
+  # Ordinary fleet CI already invokes this mode. Run the outer lifecycle model
+  # first so the Namespace refusal matrix cannot be omitted from the standard
+  # source gate while scripts/ci/fleet.sh remains outside this worker's scope.
+  bash "$0" sit-namespace-lifecycle
   # Deterministic offline model of the L9 node-image IMPORT step, the leg that
   # follows the host-image binding above. No docker daemon, no network, no
   # cluster, no k3d — the gate runs anywhere `bash`, `jq`, `awk` and `sed` run.
@@ -1466,6 +2038,8 @@ sit-node-image-import | sit-node-image)
   nii_fns="${tmp}/node-image-fns.sh"
   : >"${nii_fns}"
   for nii_fn in \
+    namespace_ctr \
+    namespace_crictl \
     kargo_runtime_canonical_image_tag \
     kargo_runtime_import_node_image \
     kargo_runtime_assert_import_transcript \
@@ -1488,17 +2062,21 @@ sit-node-image-import | sit-node-image)
     fail "the extracted import function does not stream a docker image save; the extraction is not the production function"
   grep -q -- '--platform linux/amd64' "${nii_fns}" ||
     fail "the extracted import function does not scope the node-side import to linux/amd64"
-  grep -q -- '--namespace k8s.io' "${nii_fns}" ||
-    fail "the extracted import function does not target the k8s.io containerd namespace the CRI reads"
+  grep -qF '/vendor/containerd/ctr --address /var/run/containerd/containerd.sock' "${nii_fns}" ||
+    fail "the extracted platform ctr seam does not target the reviewed containerd socket"
+  grep -qF -- '--namespace k8s.io "$@"' "${nii_fns}" ||
+    fail "the extracted platform ctr seam does not target the k8s.io namespace the CRI reads"
+  grep -qF 'k3s crictl "$@"' "${nii_fns}" ||
+    fail "the extracted CRI seam does not use built-in k3s crictl"
   # The repair's own bytes, guarded the same way. The ORCHESTRATION is extracted
   # too (kargo_runtime_bind_node_images), so every case below drives the real
   # call sites — a gate that only extracted the helpers could stay green while
   # production never called them.
   grep -q -- 'images tag' "${nii_fns}" ||
     fail "the extracted functions never create a containerd image alias; the extraction is not the production repair"
-  grep -q -- 'crictl images -o json' "${nii_fns}" ||
+  grep -q -- 'namespace_crictl images -o json' "${nii_fns}" ||
     fail "the extracted functions never read the CRI image inventory"
-  grep -q -- 'crictl inspecti -o json' "${nii_fns}" ||
+  grep -q -- 'namespace_crictl inspecti -o json' "${nii_fns}" ||
     fail "the extracted functions never resolve the exact combined workload reference through the CRI"
   # The no-force rule, read off EXECUTABLE ARGV rather than prose: production
   # explains at length why it omits --force, and a check that greps the whole
@@ -1506,7 +2084,7 @@ sit-node-image-import | sit-node-image)
   # positive-controlled, so this can neither false-red on documentation nor
   # stay silently green if it stops seeing the flag at all.
   nii_tag_argv() {
-    grep -F 'ctr --namespace k8s.io images tag' "$1" | grep -v '^[[:space:]]*#'
+    grep -F 'namespace_ctr images tag' "$1" | grep -v '^[[:space:]]*#'
   }
   nii_forces() {
     [ "$(nii_tag_argv "$1" | grep -cF -- '--force')" -gt 0 ]
@@ -1515,7 +2093,7 @@ sit-node-image-import | sit-node-image)
     fail "the extracted alias step carries no ctr images tag argv at all"
   ! nii_forces "${nii_fns}" ||
     fail "the extracted alias step passes --force; a name collision on a fresh per-run cluster must fail closed, not be replaced"
-  sed 's/ctr --namespace k8s.io images tag/& --force/' "${nii_fns}" \
+  sed 's/namespace_ctr images tag/& --force/' "${nii_fns}" \
     >"${tmp}/node-image-fns-force.sh"
   nii_forces "${tmp}/node-image-fns-force.sh" ||
     fail "the no-force check cannot see --force even when it is injected into the alias argv, so its silence proves nothing"
@@ -1528,7 +2106,7 @@ sit-node-image-import | sit-node-image)
   # The literal call-site bytes, deliberately unexpanded: this asserts what
   # production SOURCE says, not what a shell would substitute.
   # shellcheck disable=SC2016
-  grep -qF 'kargo_runtime_alias_node_image "${node}"' "${nii_fns}" ||
+  grep -qF 'kargo_runtime_alias_node_image "${pairs[i]}"' "${nii_fns}" ||
     fail "the extracted orchestration never calls the alias step; the gate would be asserting on a call site production does not have"
 
   # The offline driver. Generated, not committed, so nothing here can become a
@@ -1808,6 +2386,12 @@ shim_ctr() {
   printf '%s\t%s\n' "${ref}" "${digest}" >>"${node_state}"
 }
 
+# Override the extracted production seams after sourcing them. The source
+# assertions above separately bind the exact platform socket/namespace and
+# `k3s crictl` argv; these functions model their state effects offline.
+namespace_ctr() { shim_ctr --namespace k8s.io "$@"; }
+namespace_crictl() { shim_crictl "$@"; }
+
 docker() {
   local sub="$1"
   shift
@@ -1897,15 +2481,15 @@ fixed-path)
   # The whole production leg, orchestration bytes included: import, transcript
   # acceptance, alias creation, and every node/CRI assertion, driven by the
   # extracted call sites rather than by this driver.
-  kargo_runtime_bind_node_images "${node}" "${pairs[@]}"
+  kargo_runtime_bind_node_images "${pairs[@]}"
   ;;
 project-cri)
   seed_node_state "$@"
-  docker exec "${node}" crictl images -o json >"${cri_images}"
+  namespace_crictl images -o json >"${cri_images}"
   ;;
 seeded-cri)
   seed_node_state "$@"
-  docker exec "${node}" crictl images -o json >"${cri_images}"
+  namespace_crictl images -o json >"${cri_images}"
   kargo_runtime_verify_cri_image "${cri_images}" "${pairs[0]}" \
     "$(kargo_runtime_alias_image_ref "${pairs[0]}" "${pairs[1]}")"
   ;;
@@ -2154,7 +2738,7 @@ NIIBASE
   cmp -s "${nii_fns}" "${tmp}/node-image-fns-noplatform.sh" &&
     fail 'R3 platform-scope mutation: stripping --platform linux/amd64 changed nothing, so the flag is not where the gate thinks it is'
   nii_case r3 fixed-path "${tmp}/node-image-fns-noplatform.sh"
-  nii_expect 'R3 platform-scope mutation' 1 'streaming the pinned image into the k3d node failed' r3
+  nii_expect 'R3 platform-scope mutation' 1 'streaming the pinned image into platform containerd failed' r3
   grep -qF "ctr: content digest ${nii_kargo_missing}: not found" \
     "${tmp}/r3/report/kargo-runtime-image-imports.txt" ||
     fail 'R3 platform-scope mutation: the retained transcript did not capture the node-side failure'
@@ -2361,7 +2945,7 @@ NIIBASE
   # The neuter tokens are production SOURCE text and must never expand here.
   # shellcheck disable=SC2016
   nii_neuter "${nii_fns}" "${tmp}/node-image-fns-noalias.sh" \
-    'kargo_runtime_alias_node_image "${node}"' 'N1a the alias call is load-bearing'
+    'kargo_runtime_alias_node_image "${pairs[i]}"' 'N1a the alias call is load-bearing'
   nii_case n1a fixed-path "${tmp}/node-image-fns-noalias.sh"
   nii_expect 'N1a the alias call is load-bearing' 1 \
     "does not bind ${nii_kargo_alias} to pinned digest ${KARGO_IMAGE_DIGEST}" n1a
@@ -2404,7 +2988,7 @@ NIIBASE
   # single CRI predicate is carrying the others.
   # shellcheck disable=SC2016
   nii_neuter "${tmp}/node-image-fns-noalias-noctr.sh" "${tmp}/node-image-fns-joinonly.sh" \
-    'kargo_runtime_assert_cri_reference "${node}"' \
+    'kargo_runtime_assert_cri_reference "${tag_ref}@${digest}"' \
     'N1c the same-entry CRI join is load-bearing'
   nii_case n1c fixed-path "${tmp}/node-image-fns-joinonly.sh"
   nii_expect 'N1c the same-entry CRI join is load-bearing' 1 \

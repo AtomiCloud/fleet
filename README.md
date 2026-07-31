@@ -356,25 +356,63 @@ the `values:` >7d guardrail; registry/rendered CR validation (including
 CloudflareDeploy rollout and Warehouse); rollout and WebhookEngine negatives;
 AppSet scope; platforms AppSet; registry guard policy; and presence.
 
-`scripts/ci/fleet-sit-proof.sh` is the required serialized live-local SIT entry
-point. It verifies a clean exact HEAD, executes `fleet-sit.sh` from a detached
-throwaway snapshot, and independently rechecks the report and direct-input
-inventory. The harness creates a throwaway k3d cluster, installs
-checksum-pinned Argo CD v3.4.5, derives Argo cluster Secrets from the checked-in
-serving and infrastructure-only fixtures, and exercises the real
-ApplicationSet and Application controllers. Run it from the repository root:
+`scripts/ci/fleet-sit-proof.sh` is the one required serialized full-proof entry
+point. It verifies a clean exact HEAD, builds a detached pristine snapshot, and
+keeps `--prepare-only` local, cheap, snapshot-bound, and entirely free of
+Namespace instance operations. Public `--full` is an outer lifecycle: it cold
+creates one anonymous ephemeral Namespace instance, transfers the self-contained
+snapshot, runs an explicit inner mode on the VM over `nsc ssh`, downloads the
+report, validates its report and direct-input inventory independently, and then
+destroys the exact instance id and proves it absent. Run it from the repository
+root:
 
 ```sh
-nix develop .#ci -c ./scripts/ci/fleet-sit-proof.sh
+nix develop .#ci -c ./scripts/ci/fleet-sit-proof.sh --full
 ```
 
-The structured result is `sit-report/sit-report.json`, with raw snapshots and
-HTTP/controller evidence beside it. Full mode refuses a dirty worktree and
-requires the recorded starting HEAD to remain unchanged and clean before it can
-mark the report passed. L0–L7 cover the bounded Argo refresh, row-scoping, and
-`main`/`machinery-stable` journeys. L8 is deliberately the separate pinned
-Kargo schema/admission contract: it verifies the v1.9.10 CRDs and expression
-engine, applies the committed render, reads it back, and checks the exact
+The cold-first creation contract is exactly `nsc create --ephemeral --duration
+2h --machine_type 16x32 --enable=kubernetes:1.33 --wait_kube_system` with the
+reviewed fleet/generation labels. The two-hour TTL is a cost fence and incident
+backstop, never the normal cleanup mechanism. A ratchet lead that must register
+the venue before first SSH may provide both `FLEET_SIT_NSC_INSTANCE_ID` and an
+absolute `FLEET_SIT_NSC_CREATE_RECEIPT`; the wrapper refuses a missing or
+mismatched half, revalidates the exact receipt/id, labels, shape, Kubernetes
+line and hostname before transfer, then still owns exact-id destroy and absence
+on every success, failure, and signal path. It never accepts a prefix or
+name-wide destructive selector. That cleanup ownership starts before source
+snapshot and pinned-nsc preflight once the invocation has reserved an empty
+evidence directory and syntactically staged the exact provided id; either
+preflight refusing still takes the same destroy-and-absence path.
+
+The inner worker verifies hostname equals the exact instance id, Wolfi, pinned
+k3s `v1.33.1+k3s1`, a Ready one-node topology, and every required tool before
+application mutation. It installs only missing allowlisted Wolfi driver tools
+and records their observed versions. Pods reach the on-VM Bun git server using
+the Ready node's Kubernetes `InternalIP`; no Namespace ingress, endpoint, or
+external name is load-bearing. Digest-qualified Docker pull/save remains the
+source proof, while image import/tag/list uses `/vendor/containerd/ctr --address
+/var/run/containerd/containerd.sock --namespace k8s.io` and CRI resolution uses
+`k3s crictl`. No containerd export command is used, and the worker never stops
+or restarts platform-managed k3s.
+
+The structured inner result is `sit-report/sit-report.json`, with raw snapshots
+and HTTP/controller evidence beside it. `sit-report/namespace-platform.json`
+records the substrate/topology/toolchain preflight. The outer lifecycle evidence
+lives under `sit-report/lifecycle/`: exact create argv and receipt, nsc version,
+hostname, upload/setup/inner/download transcripts, per-attempt destroy/list
+receipts, and `lifecycle.json`. That lifecycle document binds the exact
+commit/tree and direct-input digest, transferred archive digest, downloaded
+report-archive and inner-report digests, timings, explicit destroy, and exact-id
+absence. It cannot say `pass` until report collection and independent validation
+plus destroy and absence have all succeeded; failed collection remains failed
+even when cleanup succeeds.
+
+Full mode refuses a dirty worktree and requires the recorded starting HEAD to
+remain unchanged and clean before it can mark the report passed. L0–L7 cover
+the bounded Argo refresh, row-scoping, and `main`/`machinery-stable` journeys on
+the built-in k3s API. L8 is deliberately the separate pinned Kargo
+schema/admission contract: it verifies the v1.9.10 CRDs and expression engine,
+applies the committed render, reads it back, and checks the exact
 policy/DAG/verification/soak fields while reporting preserved-unknown-field
 blind spots. L9 is the runtime proof: it installs the digest-pinned Kargo
 controller, management-controller, kubernetes-webhooks-server, Argo Rollouts,
@@ -384,6 +422,11 @@ auto/manual policies, both analysis gates, all-members rendezvous, policy
 flips, denial cases, both soak orderings, and a separate 90-second wall-clock
 strengthener. Its runtime render changes only `fleet.repoURL` and
 `oci.registry`, with a canonical delta oracle protecting every policy byte.
+
+This connected L0-L9 journey downloads only its reviewed, pinned public inputs.
+The separately ruled `fleet-independence` lane owns in-guest egress denial and
+hostile negative probes; it is not an extra leg silently added to this proof's
+fixed L0-L9 contract.
 
 The report keeps the remaining boundaries explicit:
 

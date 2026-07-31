@@ -57,8 +57,11 @@ SIT_DIRECT_INPUT_ROOTS=(
 work=''
 sit_tmp_root="${TMPDIR:-/tmp}"
 report=''
-cluster_name=''
-cluster_created=0
+namespace_platform_ready=0
+namespace_instance_id=''
+namespace_node_name=''
+namespace_node_internal_ip=''
+namespace_installed_packages='[]'
 report_active=0
 cleanup_started=0
 final_evidence_collected=0
@@ -121,14 +124,28 @@ remove_sit_scratch() {
 
 validate_inputs() {
   local command
-  for command in bash bun curl docker git go helm jq k3d kubectl openssl rg sha256sum timeout yq; do
+  for command in bash bun curl docker git go helm jq kubectl openssl rg sha256sum timeout yq; do
     sit_require_command "${command}"
   done
 
   [ "${ARGOCD_VERSION}" = 'v3.4.5' ] || sit_fail 'ARGOCD_VERSION must remain v3.4.5'
   [[ ${ARGOCD_SOURCE_COMMIT} =~ ^[0-9a-f]{40}$ ]] || sit_fail 'invalid Argo CD source commit pin'
   [[ ${ARGOCD_MANIFEST_SHA256} =~ ^[0-9a-f]{64}$ ]] || sit_fail 'invalid Argo CD install-manifest checksum'
-  [[ ${K3S_IMAGE} =~ @sha256:[0-9a-f]{64}$ ]] || sit_fail 'k3s image must use an immutable digest'
+  [ "${NSC_CLI_VERSION}" = 'v0.0.532' ] || sit_fail 'nsc client version pin must remain v0.0.532'
+  [[ ${NSC_CLI_COMMIT} =~ ^[0-9a-f]{40}$ ]] || sit_fail 'invalid nsc client commit pin'
+  [ "${NSC_DURATION}" = '2h' ] && [ "${NSC_DURATION_SECONDS}" -eq 7200 ] ||
+    sit_fail 'Namespace duration pin must remain exactly 2h'
+  [ "${NSC_MACHINE_TYPE}" = '16x32' ] &&
+    [ "${NSC_VCPU}" -eq 16 ] && [ "${NSC_MEMORY_MEGABYTES}" -eq 32768 ] ||
+    sit_fail 'Namespace shape pin must remain exactly 16x32'
+  [ "${NSC_KUBERNETES_VERSION}" = '1.33' ] ||
+    sit_fail 'Namespace Kubernetes version pin must remain 1.33'
+  [ "${NSC_K3S_VERSION}" = 'v1.33.1+k3s1' ] ||
+    sit_fail 'built-in k3s version pin must remain v1.33.1+k3s1'
+  [ "${NSC_CONTAINERD_CTR}" = '/vendor/containerd/ctr' ] &&
+    [ "${NSC_CONTAINERD_ADDRESS}" = '/var/run/containerd/containerd.sock' ] &&
+    [ "${NSC_CONTAINERD_NAMESPACE}" = 'k8s.io' ] ||
+    sit_fail 'Namespace platform containerd pins changed'
   [ "${KARGO_CHART_VERSION}" = '1.9.10' ] || sit_fail 'Kargo chart version must remain 1.9.10'
   [[ ${KARGO_CHART_DIGEST} =~ ^sha256:[0-9a-f]{64}$ ]] || sit_fail 'invalid Kargo chart OCI digest'
   [[ ${KARGO_CHART_ARCHIVE_SHA256} =~ ^[0-9a-f]{64}$ ]] || sit_fail 'invalid Kargo chart archive checksum'
@@ -143,6 +160,182 @@ validate_inputs() {
   [ -d registry/charts/diene-platform ] || sit_fail 'diene-platform compiler chart is missing'
   [ -d registry/fixtures/clusters ] || sit_fail 'registry/fixtures/clusters is missing'
   [ -f registry/machinery-stable.yaml ] || sit_fail 'registry/machinery-stable.yaml pointer file is missing'
+}
+
+# --- Namespace built-in-k3s substrate -------------------------------------
+
+namespace_validate_instance_id() {
+  local value="$1"
+  [ -n "${value}" ] && [[ ${value} =~ ${NSC_INSTANCE_ID_PATTERN} ]] || {
+    sit_fail "invalid Namespace instance id: ${value:-<missing>}"
+    return 1
+  }
+}
+
+namespace_prepare_tools() {
+  [ "${FLEET_SIT_NAMESPACE_INNER:-}" = 'namespace-k3s-v1' ] ||
+    sit_fail 'full mode is inner-only and requires the explicit Namespace recursion marker'
+  namespace_instance_id="${FLEET_SIT_INSTANCE_ID:-}"
+  namespace_validate_instance_id "${namespace_instance_id}"
+  [ "$(hostname)" = "${namespace_instance_id}" ] ||
+    sit_fail 'Namespace hostname does not equal the exact instance id'
+  [ -r /etc/os-release ] || sit_fail 'Namespace instance has no readable /etc/os-release'
+  local os_id
+  os_id="$(. /etc/os-release && printf '%s' "${ID:-}")"
+  [ "${os_id}" = "${NSC_INSTANCE_OS_ID}" ] ||
+    sit_fail "Namespace instance OS must be ${NSC_INSTANCE_OS_ID}, found ${os_id:-unknown}"
+
+  local bootstrap
+  for bootstrap in apk awk bash curl docker git gzip head jq kubectl nproc sed sha256sum tar timeout tr; do
+    sit_require_command "${bootstrap}"
+  done
+  [ -x "${NSC_CONTAINERD_CTR}" ] ||
+    sit_fail "platform containerd client is missing: ${NSC_CONTAINERD_CTR}"
+  sit_require_command k3s
+
+  local -a packages=()
+  local entry command package
+  for entry in \
+    'bun bun' \
+    'go go' \
+    'helm helm' \
+    'openssl openssl' \
+    'rg ripgrep' \
+    'yq yq'; do
+    command="${entry%% *}"
+    package="${entry##* }"
+    command -v "${command}" >/dev/null 2>&1 || packages+=("${package}")
+  done
+  if [ "${#packages[@]}" -gt 0 ]; then
+    apk add --no-cache "${packages[@]}"
+    namespace_installed_packages="$(printf '%s\n' "${packages[@]}" | jq -Rsc 'split("\n")[:-1]')"
+  else
+    namespace_installed_packages='[]'
+  fi
+
+  local observed_k3s
+  observed_k3s="$(k3s --version | awk 'NR == 1 {print $3}')"
+  [ "${observed_k3s}" = "${NSC_K3S_VERSION}" ] ||
+    sit_fail "built-in k3s version must be ${NSC_K3S_VERSION}, found ${observed_k3s:-unknown}"
+  [ "$(nproc)" -eq "${NSC_VCPU}" ] ||
+    sit_fail "Namespace instance CPU count disagrees with ${NSC_MACHINE_TYPE}"
+}
+
+namespace_tool_record() {
+  local name="$1" path="$2" version="$3"
+  [ -n "${name}" ] && [ -n "${path}" ] && [ -n "${version}" ] || {
+    sit_fail "tool receipt is incomplete: ${name:-<missing-name>}"
+    return 1
+  }
+  version="${version//$'\t'/ }"
+  version="${version//$'\n'/ }"
+  printf '%s\t%s\t%s\n' "${name}" "${path}" "${version}" >>"${work}/namespace-tools.tsv"
+}
+
+namespace_first_line_receipt() {
+  local output
+  output="$("$@" 2>&1)" || {
+    sit_fail "tool receipt command failed: $*"
+    return 1
+  }
+  output="${output%%$'\n'*}"
+  [ -n "${output}" ] || {
+    sit_fail "tool receipt command returned no version or ownership line: $*"
+    return 1
+  }
+  printf '%s\n' "${output}"
+}
+
+namespace_tool_command_record() {
+  local name="$1" path="$2" version
+  shift 2
+  version="$(namespace_first_line_receipt "$@")" || return 1
+  namespace_tool_record "${name}" "${path}" "${version}"
+}
+
+namespace_wolfi_tool_receipt() {
+  local path="$1"
+  namespace_first_line_receipt apk info --who-owns "${path}"
+}
+
+namespace_wolfi_tool_record() {
+  local name="$1" path="$2" version
+  version="$(namespace_wolfi_tool_receipt "${path}")" || return 1
+  namespace_tool_record "${name}" "${path}" "${version}"
+}
+
+namespace_capture_platform() {
+  local node_json="${work}/namespace-node.json"
+  kubectl get nodes -o json >"${node_json}"
+  jq -e \
+    --arg id "${namespace_instance_id}" \
+    --arg k3s "${NSC_K3S_VERSION}" \
+    --arg os "${NSC_INSTANCE_OS_ID}" \
+    --argjson count "${NSC_NODE_COUNT}" '
+      (.items | length) == $count and
+      .items[0].metadata.name == $id and
+      .items[0].status.nodeInfo.kubeletVersion == $k3s and
+      (.items[0].status.nodeInfo.osImage | ascii_downcase | contains($os)) and
+      any(.items[0].status.conditions[]?; .type == "Ready" and .status == "True") and
+      ([.items[0].status.addresses[]? | select(.type == "InternalIP") | .address] | length) == 1
+    ' "${node_json}" >/dev/null ||
+    sit_fail 'Namespace must expose the exact Ready single-node built-in-k3s topology'
+  namespace_node_name="$(jq -r '.items[0].metadata.name' "${node_json}")"
+  namespace_node_internal_ip="$(jq -r '.items[0].status.addresses[] | select(.type == "InternalIP") | .address' "${node_json}")"
+  [[ ${namespace_node_internal_ip} =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]] ||
+    sit_fail "Ready node InternalIP is not IPv4: ${namespace_node_internal_ip}"
+
+  : >"${work}/namespace-tools.tsv"
+  namespace_tool_command_record apk "$(command -v apk)" apk --version
+  namespace_tool_command_record bash "$(command -v bash)" bash --version
+  namespace_tool_command_record bun "$(command -v bun)" bun --version
+  namespace_tool_command_record curl "$(command -v curl)" curl --version
+  namespace_tool_command_record docker "$(command -v docker)" docker --version
+  namespace_tool_command_record git "$(command -v git)" git --version
+  namespace_tool_command_record go "$(command -v go)" go version
+  namespace_tool_command_record helm "$(command -v helm)" helm version --short
+  namespace_tool_command_record jq "$(command -v jq)" jq --version
+  namespace_tool_command_record k3s "$(command -v k3s)" k3s --version
+  namespace_tool_command_record crictl "$(command -v k3s) crictl" k3s crictl --version
+  local kubectl_version ctr_version
+  kubectl_version="$(kubectl version --client -o json | jq -c '.clientVersion')" || {
+    sit_fail 'kubectl client version receipt failed'
+    return 1
+  }
+  namespace_tool_record kubectl "$(command -v kubectl)" "${kubectl_version}"
+  namespace_tool_command_record openssl "$(command -v openssl)" openssl version
+  namespace_tool_command_record rg "$(command -v rg)" rg --version
+  namespace_wolfi_tool_record gzip "$(command -v gzip)"
+  namespace_wolfi_tool_record sha256sum "$(command -v sha256sum)"
+  namespace_wolfi_tool_record tar "$(command -v tar)"
+  namespace_wolfi_tool_record timeout "$(command -v timeout)"
+  namespace_tool_command_record yq "$(command -v yq)" yq --version
+  ctr_version="$("${NSC_CONTAINERD_CTR}" --address "${NSC_CONTAINERD_ADDRESS}" version 2>&1)" || {
+    sit_fail 'platform containerd version receipt failed'
+    return 1
+  }
+  ctr_version="${ctr_version//$'\n'/ }"
+  namespace_tool_record ctr "${NSC_CONTAINERD_CTR}" "${ctr_version}"
+
+  jq -Rn \
+    --arg instanceId "${namespace_instance_id}" \
+    --arg os "${NSC_INSTANCE_OS_ID}" \
+    --arg machineType "${NSC_MACHINE_TYPE}" \
+    --arg kubernetes "${NSC_KUBERNETES_VERSION}" \
+    --arg k3s "${NSC_K3S_VERSION}" \
+    --arg node "${namespace_node_name}" \
+    --arg internalIP "${namespace_node_internal_ip}" \
+    --argjson installedPackages "${namespace_installed_packages}" \
+    --slurpfile topology "${node_json}" '
+      [inputs | split("\t") | {name:.[0],path:.[1],version:.[2]}] as $tools |
+      {
+        instanceId:$instanceId,hostname:$instanceId,os:$os,machineType:$machineType,
+        requestedKubernetes:$kubernetes,k3sVersion:$k3s,nodeName:$node,nodeInternalIP:$internalIP,
+        topology:$topology[0],installedPackages:$installedPackages,tools:$tools,
+        checkedBeforeApplicationMutation:true
+      }
+    ' <"${work}/namespace-tools.tsv" >"${report}/namespace-platform.json"
+  namespace_platform_ready=1
 }
 
 # The harness digest. It pins ONLY this script plus scripts/validate/fleet-sit,
@@ -418,10 +611,16 @@ start_git_server() {
     "${evidence_dir}/git-smart-http.headers" ||
     sit_fail 'git server did not advertise the smart HTTP upload-pack service'
 
-  FLEET_REPO_URL="http://host.k3d.internal:${GIT_SERVER_PORT}/fleet.git"
-  FLEET_SERVICES_REPO_URL="http://host.k3d.internal:${GIT_SERVER_PORT}/fleet-services.git"
-  CANARY_REPO_URL="http://host.k3d.internal:${GIT_SERVER_PORT}/canary.carbon.git"
-  SITOTHER_REPO_URL="http://host.k3d.internal:${GIT_SERVER_PORT}/sitother.carbon.git"
+  local git_host='127.0.0.1'
+  if [ "${mode}" = 'full' ]; then
+    [ -n "${namespace_node_internal_ip}" ] ||
+      sit_fail 'Ready node InternalIP was not established before starting the git server'
+    git_host="${namespace_node_internal_ip}"
+  fi
+  FLEET_REPO_URL="http://${git_host}:${GIT_SERVER_PORT}/fleet.git"
+  FLEET_SERVICES_REPO_URL="http://${git_host}:${GIT_SERVER_PORT}/fleet-services.git"
+  CANARY_REPO_URL="http://${git_host}:${GIT_SERVER_PORT}/canary.carbon.git"
+  SITOTHER_REPO_URL="http://${git_host}:${GIT_SERVER_PORT}/sitother.carbon.git"
 }
 
 fleet_commit() {
@@ -1561,6 +1760,15 @@ run_kargo_contract_leg() {
 
 # --- L9: real pinned Kargo controller runtime ------------------------------
 
+namespace_ctr() {
+  /vendor/containerd/ctr --address /var/run/containerd/containerd.sock \
+    --namespace k8s.io "$@"
+}
+
+namespace_crictl() {
+  k3s crictl "$@"
+}
+
 kargo_runtime_verify_host_image() {
   local image_ref="$1"
   local digest_ref="$2"
@@ -1571,7 +1779,7 @@ kargo_runtime_verify_host_image() {
   docker image inspect "${image_ref}" >"${output}"
   # Docker may abbreviate docker.io/library repositories in RepoDigests. The
   # inspected reference itself is digest-qualified, so match the immutable
-  # digest here and separately require the tag that k3d will export to resolve.
+  # digest here and separately require the tag that docker save will stream.
   jq -e --arg digest "${digest}" '
     length == 1 and
     any(.[0].RepoDigests[]?; endswith("@" + $digest))
@@ -1587,8 +1795,8 @@ kargo_runtime_verify_host_image() {
   jq -e --arg digest "${digest}" '.[0].Id == $digest' "${output}" >/dev/null ||
     sit_fail "the daemon does not expose the pinned index digest as the image id, so it is not running the containerd image store: ${image_ref}"
   # A digest-qualified pull stores the image under its digest ONLY and never
-  # creates name:tag (classic and containerd stores alike), so the export tag
-  # k3d needs has to be bound explicitly - and bound FROM the verified digest
+  # creates name:tag (classic and containerd stores alike), so the save input
+  # has to be bound explicitly - and bound FROM the verified digest
   # reference, so the pin, not the registry tag, decides the content. `docker
   # image tag` also overwrites any stale binding a warm daemon carried in.
   docker image tag "${digest_ref}" "${tag_ref}" ||
@@ -1613,19 +1821,10 @@ kargo_runtime_canonical_image_tag() {
 }
 
 kargo_runtime_import_node_image() {
-  local node="$1"
-  local tag_ref="$2"
-  local digest="$3"
-  # `k3d image import` cannot be used here, for two independent reasons.
-  # (1) It runs `ctr image import --all-platforms` inside the node (k3d v5.8.3,
-  # pkg/client/tools.go:143). A digest-qualified pull on a containerd-image-
-  # store daemon fetches ONLY the linux/amd64 child while recording the whole
-  # multi-platform index as the image root, so the exported archive is partial
-  # and the all-platforms walk aborts on the first absent child.
-  # (2) Its tools-mode importer never returns that per-node error: it logs and
-  # returns nil, so the CLI prints "Successfully imported image(s)" and exits 0.
-  #
-  # Streaming the save directly into the node's containerd removes both. The
+  local tag_ref="$1"
+  local digest="$2"
+  # Streaming the save directly into the platform containerd keeps the
+  # digest-qualified proof independent of wrapper-specific import behavior. The
   # save stays UNFILTERED so the archive root remains the original pinned index
   # digest - that is what keeps the node record's target digest equal to the
   # immutable pin, so the tag+digest assertion below is unchanged. The platform
@@ -1635,10 +1834,9 @@ kargo_runtime_import_node_image() {
   {
     printf '== import %s (%s)\n' "${tag_ref}" "${digest}"
     docker image save "${tag_ref}" |
-      docker exec -i "${node}" ctr --namespace k8s.io images import \
-        --platform linux/amd64 -
+      namespace_ctr images import --platform linux/amd64 -
   } >>"${report}/kargo-runtime-image-imports.txt" 2>&1 ||
-    sit_fail "streaming the pinned image into the k3d node failed: ${tag_ref}"
+    sit_fail "streaming the pinned image into platform containerd failed: ${tag_ref}"
 }
 
 kargo_runtime_assert_import_transcript() {
@@ -1647,7 +1845,7 @@ kargo_runtime_assert_import_transcript() {
   [ -s "${transcript}" ] ||
     sit_fail "the node image import transcript is missing or empty: ${transcript}"
   # The transcript is now ours, so it is gated on BOTH sides. First: no
-  # error-shaped line may appear at all. The recorded k3d failure hid exactly
+  # error-shaped line may appear at all. A historical wrapper-import failure
   # such a line - `ctr: content digest sha256:...: not found` - inside an
   # exit-0 run, and that shape can never be accepted again.
   if grep -nEi 'ctr:|ERRO|error|failed|not found' "${transcript}" >&2; then
@@ -1690,7 +1888,7 @@ kargo_runtime_verify_node_image() {
       return 0
     fi
   done < <(sed '1d' "${inventory}")
-  sit_fail "the k3d node does not bind ${tag_ref} to pinned digest ${digest}"
+  sit_fail "platform containerd does not bind ${tag_ref} to pinned digest ${digest}"
 }
 
 # The name a `repo:tag@digest` reference actually resolves to inside the CRI.
@@ -1735,16 +1933,15 @@ kargo_runtime_image_slug() {
 # `ctr images tag` output is never parsed - it only echoes the new name - so the
 # proof rests on the exit status plus the state re-read below.
 kargo_runtime_alias_node_image() {
-  local node="$1"
-  local tag_ref="$2"
-  local digest="$3"
+  local tag_ref="$1"
+  local digest="$2"
   local alias_ref
   alias_ref="$(kargo_runtime_alias_image_ref "${tag_ref}" "${digest}")"
   {
     printf '== alias %s -> %s\n' "${tag_ref}" "${alias_ref}"
-    docker exec "${node}" ctr --namespace k8s.io images tag "${tag_ref}" "${alias_ref}"
+    namespace_ctr images tag "${tag_ref}" "${alias_ref}"
   } >>"${report}/kargo-runtime-image-aliases.txt" 2>&1 ||
-    sit_fail "could not bind the pinned digest alias inside the k3d node: ${alias_ref}"
+    sit_fail "could not bind the pinned digest alias in platform containerd: ${alias_ref}"
 }
 
 # The CRI must hold the canonical tag and the canonical `repo@pin` name on ONE
@@ -1777,22 +1974,21 @@ kargo_runtime_verify_cri_image() {
     (([ $rows[].digests ] | add) // 0) == 1 and
     ([ $rows[] | select(.tags == 1 and .digests == 1) ] | length) == 1
   ' "${inventory}" >/dev/null ||
-    sit_fail "the k3d CRI does not carry ${tag_ref} and ${alias_ref} exactly once each on one and the same image entry"
+    sit_fail "the built-in k3s CRI does not carry ${tag_ref} and ${alias_ref} exactly once each on one and the same image entry"
 }
 
 kargo_runtime_probe_cri_reference() {
-  local node="$1"
-  local combined_ref="$2"
-  local tag_ref="$3"
-  local alias_ref="$4"
-  local output="$5"
-  local stderr_log="$6"
+  local combined_ref="$1"
+  local tag_ref="$2"
+  local alias_ref="$3"
+  local output="$4"
+  local stderr_log="$5"
   # `crictl inspecti` reports not-found with a non-zero exit and version-varying
   # text, so the gate is the exit status plus `jq -e` predicates - never the
   # message bytes. Its stderr goes to a caller-owned TRANSIENT file outside the
   # report: a per-probe log inside ${report} would be an undeclared retained
   # artifact, and one that is empty whenever the first probe succeeds.
-  docker exec "${node}" crictl inspecti -o json "${combined_ref}" \
+  namespace_crictl inspecti -o json "${combined_ref}" \
     >"${output}" 2>>"${stderr_log}" || return 1
   # Counted for the same reason the inventory join is: the status the pinned
   # workload will be served must name its tag once and its pinned repoDigest
@@ -1814,9 +2010,8 @@ kargo_runtime_probe_cri_reference() {
 # the probe retries - bounded by a fixed attempt ceiling and fail-closed, never
 # open-ended.
 kargo_runtime_assert_cri_reference() {
-  local node="$1"
-  local combined_ref="$2"
-  local output="$3"
+  local combined_ref="$1"
+  local output="$2"
   local tag_ref="${combined_ref%@*}"
   local digest="${combined_ref##*@}"
   local alias_ref
@@ -1830,11 +2025,11 @@ kargo_runtime_assert_cri_reference() {
   stderr_log="$(mktemp "${sit_tmp_root%/}/fleet-sit-cri.XXXXXX")"
   local attempt=1
   while ! kargo_runtime_probe_cri_reference \
-    "${node}" "${combined_ref}" "${tag_ref}" "${alias_ref}" "${output}" "${stderr_log}"; do
+    "${combined_ref}" "${tag_ref}" "${alias_ref}" "${output}" "${stderr_log}"; do
     if [ "${attempt}" -ge 30 ]; then
       cat "${stderr_log}" >&2 || true
       rm -f "${stderr_log}"
-      sit_fail "the k3d CRI did not resolve the exact pinned workload reference to its tag and pinned repoDigest after ${attempt} attempts: ${combined_ref}"
+      sit_fail "the built-in k3s CRI did not resolve the exact pinned workload reference to its tag and pinned repoDigest after ${attempt} attempts: ${combined_ref}"
       return 1
     fi
     attempt=$((attempt + 1))
@@ -1854,8 +2049,6 @@ kargo_runtime_assert_cri_reference() {
 #   CRI join        - kills adoption failure and split brain
 #   CRI resolution  - kills a regression of the actual pod lookup
 kargo_runtime_bind_node_images() {
-  local node="$1"
-  shift
   local transcript="${report}/kargo-runtime-image-imports.txt"
   local inventory="${report}/kargo-runtime-node-ctr-images.txt"
   local cri_images="${report}/kargo-runtime-node-images.json"
@@ -1866,18 +2059,18 @@ kargo_runtime_bind_node_images() {
   : >"${report}/kargo-runtime-image-aliases.txt"
   local i tag_ref digest alias_ref evidence
   for ((i = 0; i < ${#pairs[@]}; i += 2)); do
-    kargo_runtime_import_node_image "${node}" "${pairs[i]}" "${pairs[i + 1]}"
+    kargo_runtime_import_node_image "${pairs[i]}" "${pairs[i + 1]}"
   done
   # Accept the transcript BEFORE anything reads node state, so a hidden
   # import-side error is reported at its own step rather than surfacing later as
   # an ambiguous absence.
   kargo_runtime_assert_import_transcript "${transcript}" "${pairs[@]}"
   for ((i = 0; i < ${#pairs[@]}; i += 2)); do
-    kargo_runtime_alias_node_image "${node}" "${pairs[i]}" "${pairs[i + 1]}"
+    kargo_runtime_alias_node_image "${pairs[i]}" "${pairs[i + 1]}"
   done
   # containerd's own store is updated synchronously by `ctr images tag`, so the
   # ctr inventory is race-free the moment the aliases exist.
-  docker exec "${node}" ctr --namespace k8s.io images list >"${inventory}"
+  namespace_ctr images list >"${inventory}"
   for ((i = 0; i < ${#pairs[@]}; i += 2)); do
     tag_ref="${pairs[i]}"
     digest="${pairs[i + 1]}"
@@ -1885,7 +2078,7 @@ kargo_runtime_bind_node_images() {
     evidence="${report}/kargo-runtime-cri-$(kargo_runtime_image_slug "${tag_ref}").json"
     kargo_runtime_verify_node_image "${inventory}" "${tag_ref}" "${digest}"
     kargo_runtime_verify_node_image "${inventory}" "${alias_ref}" "${digest}"
-    kargo_runtime_assert_cri_reference "${node}" "${tag_ref}@${digest}" "${evidence}"
+    kargo_runtime_assert_cri_reference "${tag_ref}@${digest}" "${evidence}"
   done
   # The CRI store, by contrast, is populated by an asynchronous event monitor.
   # Capturing and joining its inventory only AFTER every exact-reference
@@ -1895,7 +2088,7 @@ kargo_runtime_bind_node_images() {
   # resolution cannot see - that the tag and the pinned repoDigest live on
   # EXACTLY ONE entry, killing the split brain a stale tag plus a fresh alias
   # would otherwise present.
-  docker exec "${node}" crictl images -o json >"${cri_images}"
+  namespace_crictl images -o json >"${cri_images}"
   for ((i = 0; i < ${#pairs[@]}; i += 2)); do
     tag_ref="${pairs[i]}"
     digest="${pairs[i + 1]}"
@@ -1957,11 +2150,10 @@ kargo_runtime_prepare_artifacts() {
     "${KARGO_RUNTIME_DIR}/images/analysis-tag.json" \
     >"${report}/kargo-runtime-host-images.json"
 
-  local node="k3d-${cluster_name}-server-0"
   # The export input is the tag established by the verified digest pull: the
   # daemon exports by name, and the imported content is checked against the
-  # digest again inside the node.
-  kargo_runtime_bind_node_images "${node}" \
+  # digest again inside the platform containerd and built-in k3s CRI.
+  kargo_runtime_bind_node_images \
     "${KARGO_RUNTIME_IMAGE_REF%@*}" "${KARGO_IMAGE_DIGEST}" \
     "${ROLLOUTS_RUNTIME_IMAGE_REF%@*}" "${ROLLOUTS_IMAGE_DIGEST}" \
     "${ANALYSIS_RUNTIME_IMAGE_REF%@*}" "${ANALYSIS_IMAGE_DIGEST}"
@@ -3421,7 +3613,7 @@ kargo_manual_promotion_ordering_floor_reached() {
   [ "${controller_clock_ms}" -gt "${name_timestamp_ms}" ]
 }
 
-# The pinned controller runs inside this local k3d/Docker topology and shares
+# The pinned controller runs on this Namespace VM and shares
 # the host kernel's realtime clock with the harness. Kargo's ulid.Make() reads
 # that clock. Fail closed unless the shared realtime is strictly beyond the
 # manual name's timestamp before the Promotion can exist; any later Kargo name
@@ -4529,7 +4721,7 @@ run_kargo_runtime_leg() {
 }
 
 collect_final_evidence() {
-  [ "${cluster_created}" -eq 1 ] || return 0
+  [ "${namespace_platform_ready}" -eq 1 ] || return 0
   [ -n "${report}" ] || return 0
   [ "${final_evidence_collected}" -eq 0 ] || return 0
   final_evidence_collected=1
@@ -4654,9 +4846,8 @@ cleanup() {
   stop_pid "${PF_SERVER_PID}"
   stop_pid "${PF_APPSET_PID}"
   stop_pid "${GIT_SERVER_PID}"
-  if [ "${cluster_created}" -eq 1 ] && [ -n "${cluster_name}" ]; then
-    k3d cluster delete "${cluster_name}" >"${report}/cluster-delete.log" 2>&1 || true
-  fi
+  # The platform-managed k3s service is never stopped or restarted here. The
+  # outer proof wrapper owns exact-id instance destruction and absence proof.
   if [ "${report_active}" -eq 1 ] && [ -f "${SIT_REPORT_FILE}" ]; then
     if [ "$(jq -r '.status' "${SIT_REPORT_FILE}" 2>/dev/null)" = 'running' ]; then
       sit_report_finish fail || true
@@ -4699,7 +4890,15 @@ sit_pins_json() {
     --arg argocd "${ARGOCD_VERSION}" \
     --arg argocdSourceCommit "${ARGOCD_SOURCE_COMMIT}" \
     --arg manifestSha256 "${ARGOCD_MANIFEST_SHA256}" \
-    --arg k3s "${K3S_IMAGE}" \
+    --arg nscVersion "${NSC_CLI_VERSION}" \
+    --arg nscCommit "${NSC_CLI_COMMIT}" \
+    --arg duration "${NSC_DURATION}" \
+    --arg machineType "${NSC_MACHINE_TYPE}" \
+    --arg kubernetes "${NSC_KUBERNETES_VERSION}" \
+    --arg k3s "${NSC_K3S_VERSION}" \
+    --arg ctr "${NSC_CONTAINERD_CTR}" \
+    --arg containerdAddress "${NSC_CONTAINERD_ADDRESS}" \
+    --arg containerdNamespace "${NSC_CONTAINERD_NAMESPACE}" \
     --arg kargoVersion "${KARGO_VERSION}" \
     --arg kargoSourceCommit "${KARGO_SOURCE_COMMIT}" \
     --arg kargoCrdBaseURL "${KARGO_CRD_BASE_URL}" \
@@ -4721,7 +4920,11 @@ sit_pins_json() {
       argocd:$argocd,
       argocdSourceCommit:$argocdSourceCommit,
       argocdManifestSha256:$manifestSha256,
-      k3s:$k3s,
+      namespace:{
+        cliVersion:$nscVersion,cliCommit:$nscCommit,duration:$duration,
+        machineType:$machineType,kubernetes:$kubernetes,k3s:$k3s,
+        containerd:{ctr:$ctr,address:$containerdAddress,namespace:$containerdNamespace}
+      },
       kargo:{
         version:$kargoVersion,
         sourceCommit:$kargoSourceCommit,
@@ -4943,7 +5146,10 @@ prepare_only() {
   jq -n \
     --arg argocd "${ARGOCD_VERSION}" \
     --arg manifestSha256 "${ARGOCD_MANIFEST_SHA256}" \
-    --arg k3s "${K3S_IMAGE}" \
+    --arg nsc "${NSC_CLI_VERSION}" \
+    --arg machineType "${NSC_MACHINE_TYPE}" \
+    --arg kubernetes "${NSC_KUBERNETES_VERSION}" \
+    --arg k3s "${NSC_K3S_VERSION}" \
     --arg kargo "${KARGO_VERSION}" \
     --arg c1 "${C1_SHA}" \
     --arg commit "${SIT_SOURCE_HEAD}" \
@@ -4951,7 +5157,8 @@ prepare_only() {
     --argjson directInputFileCount "${DIRECT_INPUT_FILE_COUNT}" \
     --arg harnessSha256 "${HARNESS_SHA256}" \
     --argjson harnessFileCount "${HARNESS_FILE_COUNT}" \
-    '{status:"pass",argocd:$argocd,manifestSha256:$manifestSha256,k3s:$k3s,kargo:$kargo,
+    '{status:"pass",argocd:$argocd,manifestSha256:$manifestSha256,
+      namespace:{nsc:$nsc,machineType:$machineType,kubernetes:$kubernetes,k3s:$k3s},kargo:$kargo,
       fixtureHead:$c1,commit:$commit,
       directInputSha256:$directInputSha256,directInputFileCount:$directInputFileCount,
       harnessSha256:$harnessSha256,harnessFileCount:$harnessFileCount}' \
@@ -4960,8 +5167,6 @@ prepare_only() {
 }
 
 run_full() {
-  validate_inputs
-
   # Fail closed unless the wrapper handed us a verified snapshot. Reading the
   # live checkout would leave the transient-consumption route open: a direct
   # input could change after the inventory and be restored before the final
@@ -4978,6 +5183,13 @@ run_full() {
   assert_verified_snapshot "${SIT_SOURCE_HEAD}"
   assert_clean_unchanged_checkout "${SIT_CHECKOUT}" "${SIT_SOURCE_HEAD}"
 
+  # Only a verified wrapper handoff may mutate even the disposable instance's
+  # toolchain. Namespace preflight then installs the allowlisted missing tools
+  # and validate_inputs proves the complete driver surface before application
+  # mutation begins.
+  namespace_prepare_tools
+  validate_inputs
+
   report="${FLEET_SIT_REPORT:-${SIT_CHECKOUT}/sit-report}"
   case "${report}" in
   "${root}" | "${root}"/*)
@@ -4989,6 +5201,7 @@ run_full() {
   SIT_SCRATCH_ROOT="${work}"
   export SIT_SCRATCH_ROOT
   mkdir -p "${report}"
+  namespace_capture_platform
   write_harness_inventory "${report}/harness-inventory.sha256"
   write_direct_input_inventory "${report}/direct-input-inventory.sha256" "${SIT_SOURCE_HEAD}"
   sit_report_init "${report}" "$(sit_pins_json)" "$(sit_provenance_json true)"
@@ -5000,7 +5213,7 @@ run_full() {
   trap 'exit 130' INT
 
   sit_leg_begin 'L0-runtime-setup' \
-    'pins-verified.txt' 'manifest-contract.json' 'git-ls-remote.txt' \
+    'namespace-platform.json' 'pins-verified.txt' 'manifest-contract.json' 'git-ls-remote.txt' \
     'git-services-ls-remote.txt' 'git-services-alias.json' 'git-smart-http.headers' \
     'platforms-appset.authorized-diff.json' 'canary-appset.yaml' 'cluster-secret-inputs.json' \
     'cluster-fixture-substitution.json' \
@@ -5010,15 +5223,6 @@ run_full() {
   prepare_repositories
   cp "${work}/runtime-chart-schema-relaxation.diff" "${report}/runtime-chart-schema-relaxation.diff"
   start_git_server "${report}"
-
-  cluster_name="fleet-sit-$$"
-  export KUBECONFIG="${work}/kubeconfig"
-  k3d cluster create "${cluster_name}" \
-    --image "${K3S_IMAGE}" \
-    --servers 1 --agents 0 --no-lb --wait --timeout 180s \
-    --kubeconfig-update-default=false --kubeconfig-switch-context=false
-  cluster_created=1
-  k3d kubeconfig get "${cluster_name}" >"${KUBECONFIG}"
   kubectl wait --for=condition=Ready node --all --timeout=120s
 
   curl --fail --location --retry 3 --connect-timeout 15 --max-time 180 \
