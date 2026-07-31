@@ -1168,6 +1168,13 @@ sit-namespace-lifecycle | sit-proof-lifecycle)
     fail 'the inner preflight no longer binds hostname to exact instance id'
   rg -qF "NSC_INSTANCE_ID_PATTERN='^[a-z0-9]{13}$'" "${pins_source}" ||
     fail 'the Namespace instance-id pin is not the observed exact 13-character contract'
+  # Structural pins for the created-instance recovery seam. The behavioural
+  # regressions below are the real gate; these refuse a silent reversion to a
+  # first-nonempty-surface chain or a dropped cidfile check outright.
+  rg -qF 'for recovery_surface in cidfile receipt stdout; do' "${proof_source}" ||
+    fail 'created-instance recovery no longer tries the cidfile, receipt, and stdout surfaces independently'
+  rg -qF 'validate_create_cidfile' "${proof_source}" ||
+    fail 'the harness no longer validates the generated cidfile against the pinned instance id'
   rg -qF 'namespace_first_line_receipt apk info --who-owns "${path}"' "${sit_source}" ||
     fail 'Wolfi BusyBox tool receipts no longer use fail-closed package ownership'
   if rg -n '(sha256sum|tar|timeout)[[:space:]]+--version' "${sit_source}"; then
@@ -1297,7 +1304,13 @@ active_instance_json() {
     cpu=4
     memory=8192
   }
-  jq -n \
+  # -M is load-bearing, not cosmetic. This is the only shim branch the wrapper
+  # reads through `script -qec ... /dev/null`, which allocates a pty, and jq
+  # colorizes on a tty. Real `nsc --output json` never colorizes, so a colorized
+  # fixture is an unfaithful fixture: it injects ESC bytes that correctly trip
+  # the wrapper's residual-escape guard and make the gate unrunnable in an
+  # ordinary terminal. Keep the production guard strict and the fixture honest.
+  jq -nM \
     --arg id "${id}" \
     --argjson cpu "${cpu}" \
     --argjson memory "${memory}" \
@@ -1441,7 +1454,25 @@ create)
   /*) ;;
   *) exit 43 ;;
   esac
-  printf '%s\n' "${id}" >"${cid}"
+  # The generated cidfile, the full metadata receipt, and the minimal stdout are
+  # three separate surfaces the client writes. Each can be mutated on its own,
+  # so each is independently modelled here; the exact product audit observed the
+  # cidfile carrying the same 13-character id plus trailing whitespace.
+  case "${NSC_SHIM_CID_FORM:-exact}" in
+  exact) printf '%s\n' "${id}" >"${cid}" ;;
+  trailing-whitespace) printf '%s  \n' "${id}" >"${cid}" ;;
+  # A NUL suffix is the form no read-and-compare can catch: Bash command
+  # substitution drops the NUL, so these bytes read back as the exact id at a
+  # length an ordinary-newline allowance accepts.
+  trailing-nul) printf '%s\0' "${id}" >"${cid}" ;;
+  # Two terminal newlines: accepted by a `$`-anchored shape, since Oniguruma's
+  # `$` also matches before a final newline.
+  trailing-newlines) printf '%s\n\n' "${id}" >"${cid}" ;;
+  *)
+    echo "shim: unmodeled cidfile form ${NSC_SHIM_CID_FORM:-}" >&2
+    exit 45
+    ;;
+  esac
   cpu=16
   memory=32768
   kubernetes='1.33'
@@ -1460,11 +1491,19 @@ create)
         service_state:[{name:"ssh",status:"READY"},{name:"kubernetes",status:"READY"}]
       }
     ' >"${metadata}"
-  jq -n --arg id "${id}" '{
-    api_endpoint:"fixture.compute.namespaceapis.com",cluster_id:$id,
-    cluster_url:("https://cloud.namespace.so/fixture/instance/" + $id),
-    ingress_domain:"fixture.nscluster.cloud",instance_id:$id
-  }'
+  if [ "${NSC_SHIM_RECEIPT_ID:-}" = 'absent' ]; then
+    jq 'del(.cluster_id)' "${metadata}" >"${metadata}.without-id"
+    mv -- "${metadata}.without-id" "${metadata}"
+  fi
+  if [ "${NSC_SHIM_STDOUT_FORM:-}" = 'unparseable' ]; then
+    printf 'nsc: instance ready (progress stream, not a JSON document)\n'
+  else
+    jq -n --arg id "${id}" '{
+      api_endpoint:"fixture.compute.namespaceapis.com",cluster_id:$id,
+      cluster_url:("https://cloud.namespace.so/fixture/instance/" + $id),
+      ingress_domain:"fixture.nscluster.cloud",instance_id:$id
+    }'
+  fi
   if [ "${NSC_SHIM_FAIL_STAGE:-}" = 'create-signal' ]; then
     kill -TERM "${PPID}"
   fi
@@ -1623,6 +1662,7 @@ NSL_NSC_SHIM
   jq -e '
     .status == "pass" and
     .namespace.createdByHarness == true and
+    .namespace.recoveredIdSurface == "cidfile" and
     (.namespace.createArgvSha256 | test("^[0-9a-f]{64}$")) and
     (.namespace.createReceiptSha256 | test("^[0-9a-f]{64}$")) and
     .namespace.createReceipt == "lifecycle/create.json" and
@@ -1704,9 +1744,10 @@ NSL_NSC_SHIM
     .namespace.createReceipt == "lifecycle/create.json" and
     .namespace.createStdout == "" and .namespace.createStdoutSha256 == "" and
     .namespace.createStderr == "" and .namespace.createStderrSha256 == "" and
-    .namespace.createCid == "" and .namespace.createCidSha256 == ""
+    .namespace.createCid == "" and .namespace.createCidSha256 == "" and
+    .namespace.recoveredIdSurface == ""
   ' "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
-    fail 'pre-created Namespace handoff fabricated local create stdout, stderr, or cid evidence'
+    fail 'pre-created Namespace handoff fabricated local create stdout, stderr, cid, or recovery evidence'
   nsl_assert_exact_destroy precreated
 
   # A lead handoff is accepted only after the supplied id satisfies the pinned
@@ -1758,6 +1799,91 @@ NSL_NSC_SHIM
     fail 'wrong-length nsc cid was not refused by the exact 13-character contract'
   nsl_assert_exact_destroy wrong-length-created-id "${nsl_wrong_length_id}"
   nsl_assert_failed_lifecycle wrong-length-created-id
+
+  # RECOVERY-SURFACE INDEPENDENCE. The exact product audit mutated the generated
+  # cidfile to the same 13-character id plus trailing whitespace. A recovery that
+  # consults only the first NONEMPTY surface then rejects that literal as
+  # selector-unsafe, never reads the still-valid receipt or stdout, fails the
+  # registration guard with a live instance, and repeats the same dead recovery
+  # from the EXIT trap — a leak with no exact selector left to destroy it.
+  #
+  # The three cases below each leave exactly ONE surface able to yield the id, so
+  # dropping any single surface turns one of them red. A tolerant read that
+  # trimmed the mutated cidfile instead would make all three pass the run and be
+  # caught by the expected-refusal contract plus the recovered-surface assertion.
+  nsl_assert_cid_recovery_case() {
+    local name="$1" surface="$2"
+    nsl_assert_exact_destroy "${name}"
+    nsl_assert_failed_lifecycle "${name}"
+    grep -qF 'the generated Namespace cidfile is not exactly the pinned instance id' \
+      "${nsl_root}/cases/${name}/stderr.txt" ||
+      fail "Namespace lifecycle ${name}: a malformed generated cidfile was not refused on its own bytes"
+    # Positive control on the fixture itself, compared as bytes so a NUL-bearing
+    # mutation cannot look identical to the exact literal: the cidfile must be
+    # nonempty (the audited shape is malformed-but-NONEMPTY, which is what makes
+    # a first-nonempty-surface chain stop there) and must NOT be the exact id.
+    test -s "${nsl_report}/lifecycle/create.cid" ||
+      fail "Namespace lifecycle ${name}: the fixture left no nonempty cidfile to recover past"
+    nsl_cid_sha="$(sha256sum -- "${nsl_report}/lifecycle/create.cid")"
+    nsl_exact_cid_sha="$(printf '%s\n' "${nsl_id}" | sha256sum)"
+    if [ "${nsl_cid_sha%% *}" = "${nsl_exact_cid_sha%% *}" ]; then
+      fail "Namespace lifecycle ${name}: the mutated cidfile fixture degenerated to the exact literal"
+    fi
+    if grep -q -- $'destroy\t'"${nsl_id} " "${nsl_state}/calls.log"; then
+      fail "Namespace lifecycle ${name}: the malformed cidfile literal reached a destructive selector"
+    fi
+    jq -e --arg id "${nsl_id}" --arg surface "${surface}" '
+      .status == "fail" and
+      .namespace.createdByHarness == true and
+      .namespace.instanceId == $id and
+      .namespace.recoveredIdSurface == $surface and
+      .cleanup.destroySucceeded == true and
+      .cleanup.exactIdAbsenceProven == true and
+      .innerReport.collected == false and .innerReport.validated == false
+    ' "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+      fail "Namespace lifecycle ${name}: recovery surface, exact-id destroy, or absence was not proven"
+  }
+
+  # The blocking gate: malformed-but-nonempty cidfile, otherwise valid receipt
+  # and stdout. Recovery must reach the receipt, and the proof must still refuse.
+  nsl_run malformed-cid fail NSC_SHIM_CID_FORM=trailing-whitespace
+  nsl_assert_cid_recovery_case malformed-cid receipt
+  # Pin the exact audited bytes: the pinned id plus trailing whitespace.
+  grep -qxF "${nsl_id}  " "${nsl_report}/lifecycle/create.cid" ||
+    fail 'the malformed-cid fixture no longer reproduces the audited trailing-whitespace bytes'
+  # Only the full metadata receipt can supply the id here.
+  nsl_run malformed-cid-receipt-only fail \
+    NSC_SHIM_CID_FORM=trailing-whitespace NSC_SHIM_STDOUT_FORM=unparseable
+  nsl_assert_cid_recovery_case malformed-cid-receipt-only receipt
+  # Only the minimal stdout can supply the id here, proving the third surface is
+  # a real fallback and not dead code behind the receipt.
+  nsl_run malformed-cid-stdout-only fail \
+    NSC_SHIM_CID_FORM=trailing-whitespace NSC_SHIM_RECEIPT_ID=absent
+  nsl_assert_cid_recovery_case malformed-cid-stdout-only stdout
+
+  # A NUL-suffixed cidfile is the form a read-and-compare cannot refuse: Bash
+  # command substitution silently drops the NUL, so `$(<cidfile)` returns a clean
+  # exact id and both the cidfile surface and any length-tolerant acceptance
+  # check would treat these malformed bytes as authoritative. The cidfile surface
+  # must therefore reject them on the raw bytes and hand off to the receipt, and
+  # the byte-exact acceptance guard must still refuse the run.
+  nsl_run malformed-cid-trailing-nul fail NSC_SHIM_CID_FORM=trailing-nul
+  nsl_assert_cid_recovery_case malformed-cid-trailing-nul receipt
+  [ "$(wc -c <"${nsl_report}/lifecycle/create.cid" | tr -d ' ')" -eq "$((${#nsl_id} + 1))" ] ||
+    fail 'the NUL-suffixed cidfile fixture is not the pinned id plus exactly one extra byte'
+  # Positive control on the hazard itself: a tolerant read of these bytes really
+  # does yield the exact id, which is why only a byte-level check can refuse them.
+  # The group redirect drops Bash's own ignored-null-byte warning.
+  { nsl_cid_read="$(<"${nsl_report}/lifecycle/create.cid")"; } 2>/dev/null
+  [ "${nsl_cid_read}" = "${nsl_id}" ] ||
+    fail 'the NUL-suffixed cidfile fixture no longer reads back as the exact id, so it proves nothing'
+
+  # A repeated terminal newline pins the cidfile matcher's ABSOLUTE anchors.
+  # Oniguruma's `$` also matches before a final newline, so a `\A...\n?$` shape
+  # accepts these bytes and stages from the cidfile as though they were exact;
+  # only `\z` hands off to the receipt as this asserts.
+  nsl_run malformed-cid-extra-newline fail NSC_SHIM_CID_FORM=trailing-newlines
+  nsl_assert_cid_recovery_case malformed-cid-extra-newline receipt
 
   nsl_run wrong-receipt-shape fail NSC_SHIM_RECEIPT_SHAPE=wrong
   nsl_assert_exact_destroy wrong-receipt-shape

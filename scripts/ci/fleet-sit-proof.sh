@@ -114,6 +114,7 @@ lifecycle_dir=''
 instance_id=''
 instance_registered=0
 created_by_harness=0
+recovered_id_surface=''
 destroy_attempts=0
 destroy_succeeded=0
 absence_proven=0
@@ -349,17 +350,58 @@ destroy_instance_and_prove_absent() {
   [ "${destroy_succeeded}" -eq 1 ] && [ "${list_status}" -eq 0 ]
 }
 
+# The generated cidfile is examined as bytes and deliberately NOT repaired. A
+# tolerant read is how unreviewed bytes become a destructive selector: an unsafe
+# cidfile must be rejected here and superseded by a later surface, never trimmed
+# into a candidate.
+#
+# `$(<file)` cannot do this. Bash command substitution silently drops NUL bytes,
+# so a cidfile holding the pinned id followed by a NUL would read back as a
+# clean exact id and the malformed surface would look authoritative. jq compares
+# the raw bytes instead, and the anchors are absolute: Oniguruma's `$` also
+# matches before a final newline, so `^...\n?$` would accept two trailing
+# newlines, whereas `\A...\n?\z` admits only the exact 13/14-character
+# lowercase-alphanumeric literal plus at most the one ordinary terminal newline.
+recovery_candidate_from_cidfile() {
+  local cid="${lifecycle_dir}/create.cid"
+  [ -s "${cid}" ] || return 0
+  jq -Rrs 'select(test("\\A[a-z0-9]{13,14}\\n?\\z")) | sub("\\n\\z"; "")' \
+    "${cid}" 2>/dev/null || true
+}
+
+recovery_candidate_from_json() {
+  local document="$1"
+  [ -s "${document}" ] || return 0
+  jq -r '.cluster_id // empty' "${document}" 2>/dev/null || true
+}
+
+# nsc leaves three independent surfaces behind for an instance this harness
+# created: the generated cidfile, the full metadata receipt, and the minimal
+# stdout. Each is consulted on its own in reviewed priority order.
+#
+# A first-NONEMPTY-surface chain is a leak. The exact product audit mutated the
+# cidfile to the same 13-character id plus trailing whitespace: the chain saw a
+# nonempty cidfile, rejected that literal as selector-unsafe, never read the
+# still-valid receipt or stdout, failed the registration guard with a live
+# instance, and repeated the same dead recovery from the EXIT trap — leaving no
+# exact selector with which to destroy it. A nonempty but unsafe or unparseable
+# earlier surface must therefore never suppress a later safe one.
 recover_created_instance_id() {
   [ "${created_by_harness}" -eq 1 ] && [ "${instance_registered}" -ne 1 ] || return 0
-  local candidate=''
-  if [ -s "${lifecycle_dir}/create.cid" ]; then
-    candidate="$(<"${lifecycle_dir}/create.cid")"
-  elif [ -s "${lifecycle_dir}/create.json" ]; then
-    candidate="$(jq -r '.cluster_id // empty' "${lifecycle_dir}/create.json" 2>/dev/null || true)"
-  elif [ -s "${lifecycle_dir}/create.stdout" ]; then
-    candidate="$(jq -r '.cluster_id // empty' "${lifecycle_dir}/create.stdout" 2>/dev/null || true)"
-  fi
-  stage_instance_id_for_cleanup "${candidate}" || return 1
+  local recovery_surface candidate
+  for recovery_surface in cidfile receipt stdout; do
+    candidate=''
+    case "${recovery_surface}" in
+    cidfile) candidate="$(recovery_candidate_from_cidfile)" ;;
+    receipt) candidate="$(recovery_candidate_from_json "${lifecycle_dir}/create.json")" ;;
+    stdout) candidate="$(recovery_candidate_from_json "${lifecycle_dir}/create.stdout")" ;;
+    esac
+    if stage_instance_id_for_cleanup "${candidate}"; then
+      recovered_id_surface="${recovery_surface}"
+      return 0
+    fi
+  done
+  return 1
 }
 
 write_lifecycle_report() {
@@ -406,6 +448,7 @@ write_lifecycle_report() {
     --arg directInputSha256 "${expected_digest}" \
     --argjson directInputFileCount "${expected_count:-0}" \
     --arg instanceId "${instance_id}" \
+    --arg recoveredIdSurface "${recovered_id_surface}" \
     --arg createReceipt "${receipt_path}" \
     --arg createReceiptSha256 "${receipt_sha}" \
     --arg createStdout "${create_stdout_path}" \
@@ -446,6 +489,7 @@ write_lifecycle_report() {
         source:{commit:$commit,tree:$tree,directInputSha256:$directInputSha256,directInputFileCount:$directInputFileCount},
         namespace:{
           instanceId:$instanceId,createdByHarness:($createdByHarness == 1),
+          recoveredIdSurface:$recoveredIdSurface,
           createReceipt:$createReceipt,createReceiptSha256:$createReceiptSha256,
           createStdout:$createStdout,createStdoutSha256:$createStdoutSha256,
           createStderr:$createStderr,createStderrSha256:$createStderrSha256,
@@ -477,10 +521,11 @@ cleanup() {
   local rc=$?
   trap - EXIT HUP INT TERM
   set +e
-  # A signal may arrive after nsc has written the exact cidfile but before the
+  # A signal may arrive after nsc has written its output but before the
   # foreground create call returns to acquire_instance. Recover only that
-  # freshly scoped exact id so the signal path still destroys and proves
-  # absence; malformed or missing output can never become a selector.
+  # freshly scoped exact id, trying each create surface independently, so the
+  # signal path still destroys and proves absence even when one surface is
+  # malformed; no unsafe or unparseable literal can ever become a selector.
   if [ "${mode}" = 'full' ] && [ -n "${lifecycle_dir}" ]; then
     recover_created_instance_id
   fi
@@ -514,6 +559,30 @@ stage_precreated_instance_for_cleanup() {
   validate_instance_id "${provided_id}"
   instance_id="${provided_id}"
   instance_registered=1
+}
+
+# Falling back past a malformed cidfile keeps the instance destroyable; it must
+# not also make the malformed cidfile acceptable. Once an exact id is pinned, the
+# generated cidfile must itself be exactly that id, plus at most the ordinary
+# terminal newline that Bash command substitution removes.
+#
+# This is a byte-exact digest comparison because no read-and-compare can do the
+# job: command substitution silently drops NUL bytes, so the pinned id followed
+# by a NUL reads back as the pinned id at a length any newline allowance
+# accepts. Digest the retained bytes and admit only the two literals nsc may
+# legitimately have written.
+validate_create_cidfile() {
+  local cid="${lifecycle_dir}/create.cid"
+  [ -s "${cid}" ] || fail 'the generated Namespace cidfile is missing or empty'
+  local actual bare_expected newline_expected
+  actual="$(sha256sum -- "${cid}")"
+  actual="${actual%% *}"
+  bare_expected="$(printf '%s' "${instance_id}" | sha256sum)"
+  bare_expected="${bare_expected%% *}"
+  newline_expected="$(printf '%s\n' "${instance_id}" | sha256sum)"
+  newline_expected="${newline_expected%% *}"
+  [ "${actual}" = "${bare_expected}" ] || [ "${actual}" = "${newline_expected}" ] ||
+    fail 'the generated Namespace cidfile is not exactly the pinned instance id'
 }
 
 validate_create_stdout() {
@@ -630,6 +699,7 @@ acquire_instance() {
     [ "${create_status}" -eq 0 ] || fail "nsc create exited ${create_status}"
     [ "${instance_registered}" -eq 1 ] || fail 'nsc create returned no exact instance id'
     validate_instance_id "${instance_id}"
+    validate_create_cidfile
     validate_create_stdout
   fi
   validate_create_receipt
