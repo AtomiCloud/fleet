@@ -77,6 +77,24 @@ validate_instance_id() {
     fail "invalid Namespace instance id: ${value:-<missing>}"
 }
 
+# Cleanup recovery is deliberately independent from the current proof pin. A
+# newly created id must satisfy the exact 13-character contract before first
+# use, but a future 13<->14 service drift must still stage the literal cid and
+# destroy that exact instance rather than leak it. Limit this emergency seam to
+# the two plausible lowercase-alphanumeric shapes; it is never a prefix or a
+# name-wide selector.
+selector_safe_cleanup_id() {
+  local value="$1"
+  [ -n "${value}" ] && [[ ${value} =~ ^[a-z0-9]{13,14}$ ]]
+}
+
+stage_instance_id_for_cleanup() {
+  local value="$1"
+  selector_safe_cleanup_id "${value}" || return 1
+  instance_id="${value}"
+  instance_registered=1
+}
+
 proof_tmp_root="${TMPDIR:-/tmp}"
 case "${proof_tmp_root}" in
 /*) ;;
@@ -301,7 +319,10 @@ instance_absent_from() {
 destroy_instance_and_prove_absent() {
   [ "${instance_registered}" -eq 1 ] || return 0
   [ "${destroy_succeeded}" -eq 1 ] && [ "${absence_proven}" -eq 1 ] && return 0
-  validate_instance_id "${instance_id}"
+  selector_safe_cleanup_id "${instance_id}" || {
+    echo "fleet SIT proof failed: refusing unsafe Namespace cleanup id: ${instance_id:-<missing>}" >&2
+    return 1
+  }
   destroy_attempts=$((destroy_attempts + 1))
   destroy_started_epoch="$(date +%s)"
   local attempt_dir="${lifecycle_dir}/destroy-attempt-${destroy_attempts}"
@@ -332,14 +353,13 @@ recover_created_instance_id() {
   [ "${created_by_harness}" -eq 1 ] && [ "${instance_registered}" -ne 1 ] || return 0
   local candidate=''
   if [ -s "${lifecycle_dir}/create.cid" ]; then
-    candidate="$(tr -d '[:space:]' <"${lifecycle_dir}/create.cid")"
+    candidate="$(<"${lifecycle_dir}/create.cid")"
   elif [ -s "${lifecycle_dir}/create.json" ]; then
     candidate="$(jq -r '.cluster_id // empty' "${lifecycle_dir}/create.json" 2>/dev/null || true)"
+  elif [ -s "${lifecycle_dir}/create.stdout" ]; then
+    candidate="$(jq -r '.cluster_id // empty' "${lifecycle_dir}/create.stdout" 2>/dev/null || true)"
   fi
-  if [ -n "${candidate}" ] && [[ ${candidate} =~ ${NSC_INSTANCE_ID_PATTERN} ]]; then
-    instance_id="${candidate}"
-    instance_registered=1
-  fi
+  stage_instance_id_for_cleanup "${candidate}" || return 1
 }
 
 write_lifecycle_report() {
@@ -351,11 +371,31 @@ write_lifecycle_report() {
     [ "${destroy_succeeded}" -eq 1 ] && [ "${absence_proven}" -eq 1 ]; then
     actual_status='pass'
   fi
-  local receipt_sha='' create_argv_sha='' report_sha=''
-  [ -s "${lifecycle_dir}/create.json" ] &&
+  local receipt_path='' receipt_sha=''
+  local create_stdout_path='' create_stdout_sha=''
+  local create_stderr_path='' create_stderr_sha=''
+  local create_cid_path='' create_cid_sha=''
+  local create_argv_path='' create_argv_sha='' report_sha=''
+  if [ -e "${lifecycle_dir}/create.json" ]; then
+    receipt_path='lifecycle/create.json'
     receipt_sha="$(sha256sum -- "${lifecycle_dir}/create.json" | awk '{print $1}')"
-  [ -s "${lifecycle_dir}/create-argv.json" ] &&
+  fi
+  if [ -e "${lifecycle_dir}/create.stdout" ]; then
+    create_stdout_path='lifecycle/create.stdout'
+    create_stdout_sha="$(sha256sum -- "${lifecycle_dir}/create.stdout" | awk '{print $1}')"
+  fi
+  if [ -e "${lifecycle_dir}/create.stderr" ]; then
+    create_stderr_path='lifecycle/create.stderr'
+    create_stderr_sha="$(sha256sum -- "${lifecycle_dir}/create.stderr" | awk '{print $1}')"
+  fi
+  if [ -e "${lifecycle_dir}/create.cid" ]; then
+    create_cid_path='lifecycle/create.cid'
+    create_cid_sha="$(sha256sum -- "${lifecycle_dir}/create.cid" | awk '{print $1}')"
+  fi
+  if [ -e "${lifecycle_dir}/create-argv.json" ]; then
+    create_argv_path='lifecycle/create-argv.json'
     create_argv_sha="$(sha256sum -- "${lifecycle_dir}/create-argv.json" | awk '{print $1}')"
+  fi
   [ -s "${report}/sit-report.json" ] &&
     report_sha="$(sha256sum -- "${report}/sit-report.json" | awk '{print $1}')"
   jq -n \
@@ -366,9 +406,15 @@ write_lifecycle_report() {
     --arg directInputSha256 "${expected_digest}" \
     --argjson directInputFileCount "${expected_count:-0}" \
     --arg instanceId "${instance_id}" \
-    --arg createReceipt 'lifecycle/create.json' \
+    --arg createReceipt "${receipt_path}" \
     --arg createReceiptSha256 "${receipt_sha}" \
-    --arg createArgv 'lifecycle/create-argv.json' \
+    --arg createStdout "${create_stdout_path}" \
+    --arg createStdoutSha256 "${create_stdout_sha}" \
+    --arg createStderr "${create_stderr_path}" \
+    --arg createStderrSha256 "${create_stderr_sha}" \
+    --arg createCid "${create_cid_path}" \
+    --arg createCidSha256 "${create_cid_sha}" \
+    --arg createArgv "${create_argv_path}" \
     --arg createArgvSha256 "${create_argv_sha}" \
     --arg transferSha256 "${transfer_sha}" \
     --arg remoteReportArchiveSha256 "${remote_report_sha}" \
@@ -401,6 +447,9 @@ write_lifecycle_report() {
         namespace:{
           instanceId:$instanceId,createdByHarness:($createdByHarness == 1),
           createReceipt:$createReceipt,createReceiptSha256:$createReceiptSha256,
+          createStdout:$createStdout,createStdoutSha256:$createStdoutSha256,
+          createStderr:$createStderr,createStderrSha256:$createStderrSha256,
+          createCid:$createCid,createCidSha256:$createCidSha256,
           createArgv:$createArgv,createArgvSha256:$createArgvSha256,
           nscVersion:$nscVersion,
           platformEvidence:$platformEvidence
@@ -465,6 +514,15 @@ stage_precreated_instance_for_cleanup() {
   validate_instance_id "${provided_id}"
   instance_id="${provided_id}"
   instance_registered=1
+}
+
+validate_create_stdout() {
+  local stdout="${lifecycle_dir}/create.stdout"
+  [ -s "${stdout}" ] || fail 'Namespace create stdout is missing or empty'
+  jq -e --arg id "${instance_id}" '
+    .cluster_id == $id and .instance_id == $id
+  ' "${stdout}" >/dev/null ||
+    fail 'Namespace create stdout disagrees with the exact created instance id'
 }
 
 validate_create_receipt() {
@@ -543,6 +601,7 @@ acquire_instance() {
   else
     created_by_harness=1
     local cid="${lifecycle_dir}/create.cid"
+    local receipt="${lifecycle_dir}/create.json"
     local -a create_args=(
       --ephemeral
       --duration "${NSC_DURATION}"
@@ -554,6 +613,7 @@ acquire_instance() {
       --purpose "${NSC_PURPOSE}"
       --cidfile "${cid}"
       --output json
+      --output_json_to "${receipt}"
     )
     printf '%s\n' "${create_args[@]}" | jq -Rsc '{
       executable:"nsc",subcommand:"create",argv:(split("\n")[:-1]),source:"outer-wrapper"
@@ -561,20 +621,16 @@ acquire_instance() {
       >"${lifecycle_dir}/create-argv.json"
     create_started_epoch="$(date +%s)"
     local create_status=0
-    nsc create "${create_args[@]}" >"${lifecycle_dir}/create.json" \
+    nsc create "${create_args[@]}" >"${lifecycle_dir}/create.stdout" \
       2>"${lifecycle_dir}/create.stderr" || create_status=$?
     create_finished_epoch="$(date +%s)"
-    if [ -s "${cid}" ]; then
-      instance_id="$(tr -d '[:space:]' <"${cid}")"
-    elif [ -s "${lifecycle_dir}/create.json" ]; then
-      instance_id="$(jq -r '.cluster_id // empty' "${lifecycle_dir}/create.json" 2>/dev/null || true)"
-    fi
-    if [ -n "${instance_id}" ]; then
-      validate_instance_id "${instance_id}"
-      instance_registered=1
-    fi
+    # Stage a conservative literal for exact cleanup before either the command
+    # status or the pinned proof contract can refuse this create.
+    recover_created_instance_id || true
     [ "${create_status}" -eq 0 ] || fail "nsc create exited ${create_status}"
     [ "${instance_registered}" -eq 1 ] || fail 'nsc create returned no exact instance id'
+    validate_instance_id "${instance_id}"
+    validate_create_stdout
   fi
   validate_create_receipt
   validate_live_instance

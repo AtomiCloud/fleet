@@ -133,6 +133,8 @@ validate_inputs() {
   [[ ${ARGOCD_MANIFEST_SHA256} =~ ^[0-9a-f]{64}$ ]] || sit_fail 'invalid Argo CD install-manifest checksum'
   [ "${NSC_CLI_VERSION}" = 'v0.0.532' ] || sit_fail 'nsc client version pin must remain v0.0.532'
   [[ ${NSC_CLI_COMMIT} =~ ^[0-9a-f]{40}$ ]] || sit_fail 'invalid nsc client commit pin'
+  [ "${NSC_INSTANCE_ID_PATTERN}" = '^[a-z0-9]{13}$' ] ||
+    sit_fail 'Namespace instance ids must remain exactly 13 lowercase alphanumeric characters'
   [ "${NSC_DURATION}" = '2h' ] && [ "${NSC_DURATION_SECONDS}" -eq 7200 ] ||
     sit_fail 'Namespace duration pin must remain exactly 2h'
   [ "${NSC_MACHINE_TYPE}" = '16x32' ] &&

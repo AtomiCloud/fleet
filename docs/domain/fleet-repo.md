@@ -372,17 +372,24 @@ nix develop .#ci -c ./scripts/ci/fleet-sit-proof.sh --full
 
 The cold-first creation contract is exactly `nsc create --ephemeral --duration
 2h --machine_type 16x32 --enable=kubernetes:1.33 --wait_kube_system` with the
-reviewed fleet/generation labels. The two-hour TTL is a cost fence and incident
-backstop, never the normal cleanup mechanism. A ratchet lead that must register
-the venue before first SSH may provide both `FLEET_SIT_NSC_INSTANCE_ID` and an
-absolute `FLEET_SIT_NSC_CREATE_RECEIPT`; the wrapper refuses a missing or
-mismatched half, revalidates the exact receipt/id, labels, shape, Kubernetes
-line and hostname before transfer, then still owns exact-id destroy and absence
-on every success, failure, and signal path. It never accepts a prefix or
-name-wide destructive selector. That cleanup ownership starts before source
-snapshot and pinned-nsc preflight once the invocation has reserved an empty
-evidence directory and syntactically staged the exact provided id; either
-preflight refusing still takes the same destroy-and-absence path.
+reviewed fleet/generation labels. The observed instance-id contract is exactly
+13 lowercase alphanumeric characters. Harness creation adds an exact cidfile,
+`--output json` for separately retained minimal stdout, and `--output_json_to
+<absolute-lifecycle/create.json>` for the full metadata receipt; stderr and the
+exact structured argv are retained independently too. The two-hour TTL is a
+cost fence and incident backstop, never the normal cleanup mechanism. A ratchet
+lead that must register the venue before first SSH may provide both
+`FLEET_SIT_NSC_INSTANCE_ID` and an absolute
+`FLEET_SIT_NSC_CREATE_RECEIPT`. The receipt must be the full metadata file
+written by `nsc create --output_json_to /absolute/path`, not the minimal
+`--output json` stdout. The wrapper refuses a missing or mismatched half,
+revalidates the exact receipt/id, labels, shape, Kubernetes line and hostname
+before transfer, then still owns exact-id destroy and absence on every success,
+failure, and signal path. It never accepts a prefix or name-wide destructive
+selector. That cleanup ownership starts before source snapshot and pinned-nsc
+preflight once the invocation has reserved an empty evidence directory and
+validated the exact 13-character provided id; either preflight refusing still
+takes the same destroy-and-absence path.
 
 The inner worker verifies hostname equals the exact instance id, Wolfi, pinned
 k3s `v1.33.1+k3s1`, a Ready one-node topology, and every required tool before
@@ -398,9 +405,10 @@ or restarts platform-managed k3s.
 The structured inner result is `sit-report/sit-report.json`, with raw snapshots
 and HTTP/controller evidence beside it. `sit-report/namespace-platform.json`
 records the substrate/topology/toolchain preflight. The outer lifecycle evidence
-lives under `sit-report/lifecycle/`: exact create argv and receipt, nsc version,
-hostname, upload/setup/inner/download transcripts, per-attempt destroy/list
-receipts, and `lifecycle.json`. That lifecycle document binds the exact
+lives under `sit-report/lifecycle/`: exact create argv, cidfile, minimal stdout,
+stderr, full metadata receipt, nsc version, hostname,
+upload/setup/inner/download transcripts, per-attempt destroy/list receipts, and
+`lifecycle.json`. That lifecycle document binds the exact
 commit/tree and direct-input digest, transferred archive digest, downloaded
 report-archive and inner-report digests, timings, explicit destroy, and exact-id
 absence. It cannot say `pass` until report collection and independent validation

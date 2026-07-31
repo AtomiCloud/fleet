@@ -1166,6 +1166,8 @@ sit-namespace-lifecycle | sit-proof-lifecycle)
     fail 'the inner preflight no longer refuses a drifted k3s version'
   rg -qF '[ "$(hostname)" = "${namespace_instance_id}" ]' "${sit_source}" ||
     fail 'the inner preflight no longer binds hostname to exact instance id'
+  rg -qF "NSC_INSTANCE_ID_PATTERN='^[a-z0-9]{13}$'" "${pins_source}" ||
+    fail 'the Namespace instance-id pin is not the observed exact 13-character contract'
   rg -qF 'namespace_first_line_receipt apk info --who-owns "${path}"' "${sit_source}" ||
     fail 'Wolfi BusyBox tool receipts no longer use fail-closed package ownership'
   if rg -n '(sha256sum|tar|timeout)[[:space:]]+--version' "${sit_source}"; then
@@ -1412,15 +1414,17 @@ VERSION
 create)
   log "create"$'\t'"$(printf '%q ' "$@")"
   cid=''
+  metadata=''
   args=("$@")
   for ((i = 0; i < ${#args[@]}; i++)); do
     [ "${args[i]}" != '--cidfile' ] || cid="${args[i + 1]:-}"
+    [ "${args[i]}" != '--output_json_to' ] || metadata="${args[i + 1]:-}"
   done
   expected=(
     --ephemeral --duration 2h --machine_type 16x32 --enable=kubernetes:1.33
     --wait_kube_system --label ratchet-node=fleet --label ratchet-generation=7
     --purpose 'fleet full L0-L9 Namespace built-in-k3s proof'
-    --cidfile "${cid}" --output json
+    --cidfile "${cid}" --output json --output_json_to "${metadata}"
   )
   [ "${#args[@]}" -eq "${#expected[@]}" ] || {
     echo 'shim: create argv length drifted' >&2
@@ -1432,7 +1436,11 @@ create)
       exit 41
     }
   done
-  [ -n "${cid}" ] || exit 42
+  [ -n "${cid}" ] && [ -n "${metadata}" ] || exit 42
+  case "${metadata}" in
+  /*) ;;
+  *) exit 43 ;;
+  esac
   printf '%s\n' "${id}" >"${cid}"
   cpu=16
   memory=32768
@@ -1451,10 +1459,16 @@ create)
         kubernetes_distribution:"k3s",label:[{name:"nsc.kubernetes",value:$kubernetes}],
         service_state:[{name:"ssh",status:"READY"},{name:"kubernetes",status:"READY"}]
       }
-    '
+    ' >"${metadata}"
+  jq -n --arg id "${id}" '{
+    api_endpoint:"fixture.compute.namespaceapis.com",cluster_id:$id,
+    cluster_url:("https://cloud.namespace.so/fixture/instance/" + $id),
+    ingress_domain:"fixture.nscluster.cloud",instance_id:$id
+  }'
   if [ "${NSC_SHIM_FAIL_STAGE:-}" = 'create-signal' ]; then
     kill -TERM "${PPID}"
   fi
+  [ "${NSC_SHIM_FAIL_STAGE:-}" != 'create-nonzero' ] || exit 44
   ;;
 list)
   log 'list'
@@ -1543,7 +1557,7 @@ esac
 NSL_NSC_SHIM
   chmod +x "${nsl_bin}/nsc"
 
-  nsl_id='abcdefghijklmn'
+  nsl_id='abcdefghijklm'
   nsl_status=0
   nsl_report=''
   nsl_state=''
@@ -1573,9 +1587,10 @@ NSL_NSC_SHIM
 
   nsl_assert_exact_destroy() {
     local name="$1"
-    grep -qxF $'destroy\t'"${nsl_id}"$'\t--force' "${nsl_state}/calls.log" ||
+    local expected_id="${2:-${nsl_id}}"
+    grep -qxF $'destroy\t'"${expected_id}"$'\t--force' "${nsl_state}/calls.log" ||
       fail "Namespace lifecycle ${name}: no exact-id destroy --force attempt was recorded"
-    if grep '^destroy' "${nsl_state}/calls.log" | grep -vFx $'destroy\t'"${nsl_id}"$'\t--force' >/dev/null; then
+    if grep '^destroy' "${nsl_state}/calls.log" | grep -vFx $'destroy\t'"${expected_id}"$'\t--force' >/dev/null; then
       fail "Namespace lifecycle ${name}: a non-exact destructive selector was attempted"
     fi
   }
@@ -1610,21 +1625,60 @@ NSL_NSC_SHIM
     .namespace.createdByHarness == true and
     (.namespace.createArgvSha256 | test("^[0-9a-f]{64}$")) and
     (.namespace.createReceiptSha256 | test("^[0-9a-f]{64}$")) and
+    .namespace.createReceipt == "lifecycle/create.json" and
+    .namespace.createStdout == "lifecycle/create.stdout" and
+    (.namespace.createStdoutSha256 | test("^[0-9a-f]{64}$")) and
+    .namespace.createStderr == "lifecycle/create.stderr" and
+    (.namespace.createStderrSha256 | test("^[0-9a-f]{64}$")) and
+    .namespace.createCid == "lifecycle/create.cid" and
+    (.namespace.createCidSha256 | test("^[0-9a-f]{64}$")) and
+    .namespace.createArgv == "lifecycle/create-argv.json" and
     .innerReport.collected == true and .innerReport.validated == true and
     .cleanup.destroySucceeded == true and .cleanup.exactIdAbsenceProven == true and
     .timings.setup.startedEpoch > 0 and .timings.setup.finishedEpoch >= .timings.setup.startedEpoch and
     .failureStage == "complete"
   ' "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
     fail 'successful Namespace lifecycle receipt is not bound through report validation, setup, destroy, and absence'
-  jq -e '
+  for nsl_artifact in createReceipt createStdout createStderr createCid createArgv; do
+    nsl_artifact_path="$(jq -r --arg field "${nsl_artifact}" '.namespace[$field]' \
+      "${nsl_report}/lifecycle/lifecycle.json")"
+    nsl_artifact_sha="$(jq -r --arg field "${nsl_artifact}Sha256" '.namespace[$field]' \
+      "${nsl_report}/lifecycle/lifecycle.json")"
+    [ -e "${nsl_report}/${nsl_artifact_path}" ] &&
+      [ "$(sha256sum -- "${nsl_report}/${nsl_artifact_path}" | awk '{print $1}')" = "${nsl_artifact_sha}" ] ||
+      fail "successful Namespace lifecycle ${nsl_artifact} hash does not bind its retained bytes"
+  done
+  jq -e --arg cid "${nsl_report}/lifecycle/create.cid" \
+    --arg metadata "${nsl_report}/lifecycle/create.json" '
     .executable == "nsc" and .subcommand == "create" and
     .source == "outer-wrapper" and
-    (.argv | index("--ephemeral")) != null and
-    (.argv | index("2h")) != null and
-    (.argv | index("16x32")) != null and
-    (.argv | index("--enable=kubernetes:1.33")) != null
+    .argv == [
+      "--ephemeral","--duration","2h","--machine_type","16x32",
+      "--enable=kubernetes:1.33","--wait_kube_system",
+      "--label","ratchet-node=fleet","--label","ratchet-generation=7",
+      "--purpose","fleet full L0-L9 Namespace built-in-k3s proof",
+      "--cidfile",$cid,"--output","json","--output_json_to",$metadata
+    ]
   ' "${nsl_report}/lifecycle/create-argv.json" >/dev/null ||
     fail 'successful Namespace lifecycle did not retain its exact structured create argv'
+  grep -qxF "${nsl_id}" "${nsl_report}/lifecycle/create.cid" ||
+    fail 'successful Namespace lifecycle did not retain the exact cidfile bytes'
+  test -e "${nsl_report}/lifecycle/create.stderr" ||
+    fail 'successful Namespace lifecycle did not retain create stderr'
+  jq -e --arg id "${nsl_id}" '
+    .cluster_id == $id and .instance_id == $id and
+    has("shape") == false and has("service_state") == false
+  ' "${nsl_report}/lifecycle/create.stdout" >/dev/null ||
+    fail 'successful Namespace lifecycle did not retain the minimal create stdout separately'
+  jq -e --arg id "${nsl_id}" '
+    .cluster_id == $id and .shape.virtual_cpu == 16 and
+    .shape.memory_megabytes == 32768 and
+    .kubernetes_distribution == "k3s" and
+    any(.label[]?; .name == "nsc.kubernetes" and .value == "1.33") and
+    any(.service_state[]?; .name == "ssh" and .status == "READY") and
+    any(.service_state[]?; .name == "kubernetes" and .status == "READY")
+  ' "${nsl_report}/lifecycle/create.json" >/dev/null ||
+    fail 'successful Namespace lifecycle did not retain the full metadata receipt separately'
   nsl_assert_exact_destroy success
 
   # A lead-provided instance/receipt skips create, is still fully validated,
@@ -1646,7 +1700,27 @@ NSL_NSC_SHIM
     .subcommand == null and .argv == null
   ' "${nsl_report}/lifecycle/create-argv.json" >/dev/null ||
     fail 'pre-created Namespace handoff did not record the honest no-local-create marker'
+  jq -e '
+    .namespace.createReceipt == "lifecycle/create.json" and
+    .namespace.createStdout == "" and .namespace.createStdoutSha256 == "" and
+    .namespace.createStderr == "" and .namespace.createStderrSha256 == "" and
+    .namespace.createCid == "" and .namespace.createCidSha256 == ""
+  ' "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+    fail 'pre-created Namespace handoff fabricated local create stdout, stderr, or cid evidence'
   nsl_assert_exact_destroy precreated
+
+  # A lead handoff is accepted only after the supplied id satisfies the pinned
+  # exact contract. Unlike a cid produced by this harness, a non-contract env
+  # value is not owned and must never become a destructive selector.
+  nsl_wrong_length_id='abcdefghijklmn'
+  nsl_wrong_length_receipt="${nsl_root}/precreated-wrong-length.json"
+  jq --arg id "${nsl_wrong_length_id}" '.cluster_id = $id' \
+    "${nsl_precreated_receipt}" >"${nsl_wrong_length_receipt}"
+  nsl_run precreated-wrong-length-id fail \
+    FLEET_SIT_NSC_INSTANCE_ID="${nsl_wrong_length_id}" \
+    FLEET_SIT_NSC_CREATE_RECEIPT="${nsl_wrong_length_receipt}"
+  ! grep -q '^destroy' "${nsl_state}/calls.log" 2>/dev/null ||
+    fail 'wrong-length pre-created Namespace id produced a destructive selector'
 
   # Cleanup ownership starts before source and pinned-CLI preflight once the
   # empty lifecycle evidence path and syntactically exact provided id are
@@ -1669,11 +1743,21 @@ NSL_NSC_SHIM
   # exact-id destroy path. The report-validation case proves outer bytes do not
   # trust an inner success claim; destroy/absence cases prove pass is ordered
   # after cleanup, never before it.
-  for nsl_stage in create-signal upload setup inner wrong-k3s archive download report-validation destroy absence hostname; do
+  for nsl_stage in create-signal create-nonzero upload setup inner wrong-k3s archive download report-validation destroy absence hostname; do
     nsl_run "failure-${nsl_stage}" fail "NSC_SHIM_FAIL_STAGE=${nsl_stage}"
     nsl_assert_exact_destroy "failure-${nsl_stage}"
     nsl_assert_failed_lifecycle "failure-${nsl_stage}"
   done
+
+  # nsc-produced ids are staged through the narrow selector-safe cleanup seam
+  # before the pinned contract is enforced. This must refuse a future 13<->14
+  # identity drift yet still destroy exactly the resource that create emitted.
+  nsl_run wrong-length-created-id fail NSC_SHIM_ID="${nsl_wrong_length_id}"
+  grep -qF "invalid Namespace instance id: ${nsl_wrong_length_id}" \
+    "${nsl_root}/cases/wrong-length-created-id/stderr.txt" ||
+    fail 'wrong-length nsc cid was not refused by the exact 13-character contract'
+  nsl_assert_exact_destroy wrong-length-created-id "${nsl_wrong_length_id}"
+  nsl_assert_failed_lifecycle wrong-length-created-id
 
   nsl_run wrong-receipt-shape fail NSC_SHIM_RECEIPT_SHAPE=wrong
   nsl_assert_exact_destroy wrong-receipt-shape
@@ -1689,7 +1773,7 @@ NSL_NSC_SHIM
   nsl_assert_exact_destroy missing-receipt
   nsl_assert_failed_lifecycle missing-receipt
   nsl_mismatched_receipt="${nsl_root}/mismatched-create.json"
-  jq '.cluster_id = "zzzzzzzzzzzzzz"' "${nsl_precreated_receipt}" >"${nsl_mismatched_receipt}"
+  jq '.cluster_id = "zzzzzzzzzzzzz"' "${nsl_precreated_receipt}" >"${nsl_mismatched_receipt}"
   nsl_run mismatched-receipt-id fail \
     FLEET_SIT_NSC_INSTANCE_ID="${nsl_id}" \
     FLEET_SIT_NSC_CREATE_RECEIPT="${nsl_mismatched_receipt}"
