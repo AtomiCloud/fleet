@@ -1200,6 +1200,7 @@ output="$7"
 source "${assert_lib}"
 # shellcheck source=/dev/null
 source "${fn_file}"
+export LC_ALL=C
 
 # A digest-qualified reference resolves by digest whether or not it also
 # carries a tag, so both forms normalize to the same stored key.
@@ -2442,6 +2443,772 @@ NIIBASE
   nii_expect 'N3b stale tag in the CRI' 1 \
     "does not carry ${nii_kargo_tag} and ${nii_kargo_alias} exactly once each on one and the same image entry" n3b
   echo "  N3 a stale tag beside a correct alias is rejected by the ctr predicate and by the same-entry join that kills split brain ✓"
+  ;;
+sit-post-promotion-verification)
+  # Daemon-free model of the L9 post-Promotion edge. Every function under test
+  # is extracted from scripts/ci/fleet-sit.sh; the shim supplies only observed
+  # Kubernetes objects and a monotonic clock, never a second implementation of
+  # the controller-facing predicates.
+  ppv_source='scripts/ci/fleet-sit.sh'
+  ppv_promotion_fixture='scripts/validate/fleet-sit/fixtures/kargo-runtime/promotion.yaml'
+  ppv_assert="${PWD}/scripts/validate/fleet-sit/assert.sh"
+  ppv_fns="${tmp}/post-promotion-fns.sh"
+  test -s "${ppv_assert}" || fail "the SIT assertion library is missing: ${ppv_assert}"
+  : >"${ppv_fns}"
+  sed -n "/^KARGO_STAGE_PREDICATE_PREAMBLE='/,/^'$/p" "${ppv_source}" >>"${ppv_fns}"
+  sed -n "/^KARGO_POST_PROMOTION_PREDICATE_PREAMBLE='/,/^'$/p" \
+    "${ppv_source}" >>"${ppv_fns}"
+  for ppv_fn in \
+    kargo_check_refresh_handled \
+    kargo_monotonic_now \
+    kargo_driver_request_timeout \
+    kargo_check_refresh_handled_bounded \
+    kargo_refresh_stage_quiet \
+    kargo_capture_json_evidence \
+    kargo_capture_stage_failure_diagnostics \
+    kargo_sleep_before_deadline \
+    kargo_post_promotion_deadline_reason \
+    kargo_capture_post_promotion_observation \
+    kargo_write_post_promotion_record \
+    _kargo_drive_post_promotion_verification \
+    kargo_drive_post_promotion_verification \
+    kargo_promotion_ulid \
+    kargo_promotion_name_timestamp_ms \
+    kargo_manual_promotion_ordering_floor_reached \
+    kargo_wait_manual_promotion_ordering_floor \
+    kargo_validate_manual_promotion_name \
+    kargo_generate_manual_promotion_name \
+    kargo_next_manual_promotion_timestamp \
+    kargo_set_analysis_outcome \
+    sit_prepare_failure_evidence; do
+    sed -n "/^${ppv_fn}() {$/,/^}$/p" "${ppv_source}" >"${tmp}/ppv-fn.sh"
+    [ "$(tail -n 1 "${tmp}/ppv-fn.sh")" = '}' ] ||
+      fail "the extracted ${ppv_fn}() body is unterminated"
+    cat "${tmp}/ppv-fn.sh" >>"${ppv_fns}"
+  done
+  # Literal production source, deliberately not expanded here.
+  # shellcheck disable=SC2016
+  grep -qF 'overall_deadline=$((started_seconds + 180))' "${ppv_fns}" ||
+    fail 'the extracted public driver no longer owns one literal 180-second deadline'
+  ! grep -qF 'SECONDS + 300' "${ppv_fns}" ||
+    fail 'the extracted post-Promotion driver retained the additive 300-second window'
+  ! rg -q 'generateName:[[:space:]]*fleet-sit-' "${ppv_promotion_fixture}" ||
+    fail 'the manual Promotion fixture still delegates ordering to a random Kubernetes suffix'
+  yq -e '.metadata.name == "<name>" and (.metadata | has("generateName") | not)' \
+    "${ppv_promotion_fixture}" >/dev/null ||
+    fail 'the manual Promotion fixture does not require an explicit ordered name'
+  sed -n '/^kargo_next_manual_promotion_timestamp() {$/,/^}$/p' "${ppv_source}" \
+    >"${tmp}/ppv-promotion-clock.sh"
+  rg -qF 'date -u +%s%3N' "${tmp}/ppv-promotion-clock.sh" ||
+    fail 'manual Promotion ULIDs are no longer sourced from the real millisecond clock'
+  rg -qF 'candidate_ms=$((now_ms - 1))' "${tmp}/ppv-promotion-clock.sh" ||
+    fail 'manual Promotion ULIDs no longer carry the one-millisecond realtime ordering floor'
+  sed -n '/^kargo_write_promotion_manifest() {$/,/^}$/p' "${ppv_source}" \
+    >"${tmp}/ppv-promotion-writer.sh"
+  if ! rg -q 'kargo_next_manual_promotion_timestamp' "${tmp}/ppv-promotion-writer.sh" ||
+    ! rg -q 'kargo_generate_manual_promotion_name' "${tmp}/ppv-promotion-writer.sh" ||
+    ! rg -qF '.metadata.name = strenv(NAME)' "${tmp}/ppv-promotion-writer.sh"; then
+    fail 'the manual Promotion manifest writer is not bound to the ordered generated name'
+  fi
+  sed -n '/^kargo_create_manual_promotion() {$/,/^}$/p' "${ppv_source}" \
+    >"${tmp}/ppv-promotion-create.sh"
+  [ "$(tail -n 1 "${tmp}/ppv-promotion-create.sh")" = '}' ] ||
+    fail 'the extracted kargo_create_manual_promotion() body is unterminated'
+  ppv_floor_line="$(rg -n '^[[:space:]]*kargo_wait_manual_promotion_ordering_floor ' \
+    "${tmp}/ppv-promotion-create.sh" | cut -d: -f1)"
+  ppv_create_line="$(rg -n '^[[:space:]]*kubectl create -f ' \
+    "${tmp}/ppv-promotion-create.sh" | cut -d: -f1)"
+  if ! [[ ${ppv_floor_line} =~ ^[0-9]+$ && ${ppv_create_line} =~ ^[0-9]+$ ]] ||
+    [ "${ppv_floor_line}" -ge "${ppv_create_line}" ]; then
+    fail 'the manual Promotion ordering floor is not enforced immediately before kubectl create'
+  fi
+  sed -n '/^_kargo_drive_post_promotion_verification() {$/,/^}$/p' "${ppv_source}" \
+    >"${tmp}/ppv-worker.sh"
+  ! rg -q 'overall_deadline.*\+ (60|300)|sit_wait_for (60|300)' "${ppv_fns}" ||
+    fail 'the worker reintroduced an additive 60/300-second window'
+
+  cat >"${tmp}/post-promotion-driver.sh" <<'POSTPROMOTIONDRIVER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+assert_lib="$1"
+fn_file="$2"
+test_root="$3"
+# shellcheck source=/dev/null
+source "${assert_lib}"
+# shellcheck source=/dev/null
+source "${fn_file}"
+
+TEST_PROJECT='canary'
+TEST_STAGE='canary-dummy-pikachu'
+TEST_FREIGHT='freight-f2'
+TEST_PROMOTION='promotion-f2'
+TEST_COLLECTION='collection-f2'
+case_dir=''
+report=''
+KARGO_RUNTIME_DIR=''
+STAGE_LAST=''
+FREIGHT_PROJECT_AFTER=999999
+SLEEP_JUMP=0
+FAKE_CLOCK_FILE=''
+STAGE_READ_ADVANCE=0
+CROSS_AFTER_DECISION=0
+SIT_LEG_EVIDENCE=()
+
+die() {
+  echo "post-Promotion gate failed: $*" >&2
+  exit 1
+}
+
+sleep() {
+  local delta="$1"
+  local now
+  if [ "${SLEEP_JUMP:-0}" -gt 0 ]; then
+    delta="${SLEEP_JUMP}"
+  fi
+  now="$(<"${FAKE_CLOCK_FILE}")"
+  printf '%s\n' "$((now + delta))" >"${FAKE_CLOCK_FILE}"
+}
+
+# Override the extracted production clock with a file-backed fake. Real CPU
+# time and scheduler load therefore cannot change a deadline assertion.
+kargo_monotonic_now() {
+  printf '%s\n' "$(<"${FAKE_CLOCK_FILE}")"
+}
+
+cp() {
+  local now
+  command cp "$@"
+  if [ "${CROSS_AFTER_DECISION:-0}" -eq 1 ]; then
+    now="$(<"${FAKE_CLOCK_FILE}")"
+    printf '%s\n' "$((now + 1))" >"${FAKE_CLOCK_FILE}"
+    CROSS_AFTER_DECISION=0
+  fi
+}
+
+make_stage() {
+  local output="$1"
+  local phase="$2"
+  local with_analysis="$3"
+  local include_exact="${4:-true}"
+  jq -n \
+    --arg freight "${TEST_FREIGHT}" \
+    --arg promotion "${TEST_PROMOTION}" \
+    --arg collection "${TEST_COLLECTION}" \
+    --arg phase "${phase}" \
+    --argjson withAnalysis "${with_analysis}" \
+    --argjson includeExact "${include_exact}" '
+      def item($name): {"Warehouse/dummy":{name:$name}};
+      def verification($id;$phase;$message;$analysis):
+        {id:$id,phase:$phase,message:$message,
+         startTime:"2026-07-31T00:00:01Z",finishTime:"2026-07-31T00:00:02Z",
+         analysisRun:$analysis};
+      {
+        metadata:{name:"canary-dummy-pikachu",namespace:"canary"},
+        status:{
+          currentPromotion:null,
+          lastPromotion:{
+            name:$promotion,freight:{name:$freight},
+            status:{phase:"Succeeded",freightCollection:{id:$collection}}
+          },
+          health:{status:"Healthy"},
+          freightHistory:([
+            {id:"stale-collection",items:item($freight),verificationHistory:[
+              verification("stale-verification";"Failed";"stale F1 result";
+                {name:"stale-run",namespace:"canary",phase:"Failed"})
+            ]}
+          ] + (if $includeExact then [
+            {id:$collection,items:item($freight),verificationHistory:
+              (if $phase == "" then [] else [
+                verification("exact-verification";$phase;(if $phase == "Error" then "provider exploded" else "exact result" end);
+                  (if $withAnalysis then
+                    {name:"exact-run",namespace:"canary",phase:$phase}
+                   else null end))
+              ] end)}
+          ] else [] end))
+        }
+      }
+    ' >"${output}"
+}
+
+reset_case() {
+  local name="$1"
+  case_dir="${test_root}/${name}"
+  report="${case_dir}/report"
+  KARGO_RUNTIME_DIR="${case_dir}/runtime"
+  mkdir -p "${report}" "${KARGO_RUNTIME_DIR}"
+  printf '0\n' >"${case_dir}/stage-index"
+  printf '0\n' >"${case_dir}/freight-index"
+  printf '0\n' >"${case_dir}/annotate-count"
+  : >"${case_dir}/handled-token"
+  : >"${case_dir}/kubectl-calls.log"
+  FAKE_CLOCK_FILE="${case_dir}/clock"
+  printf '0\n' >"${FAKE_CLOCK_FILE}"
+  SIT_LEG_EVIDENCE=()
+  FREIGHT_PROJECT_AFTER=999999
+  SLEEP_JUMP=0
+  STAGE_READ_ADVANCE=0
+  CROSS_AFTER_DECISION=0
+  jq -n \
+    --arg stage "${TEST_STAGE}" \
+    --arg freight "${TEST_FREIGHT}" \
+    --arg promotion "${TEST_PROMOTION}" \
+    --arg collection "${TEST_COLLECTION}" '
+      [{metadata:{name:$promotion,creationTimestamp:"2026-07-31T00:00:00Z"},
+        spec:{stage:$stage,freight:$freight},
+        status:{phase:"Succeeded",freight:{name:$freight},
+          freightCollection:{id:$collection}}}]
+    ' >"${case_dir}/promotion.json"
+}
+
+stage_snapshot() {
+  local index file token
+  index="$(<"${case_dir}/stage-index")"
+  file="${case_dir}/stage-${index}.json"
+  [ -s "${file}" ] || file="${STAGE_LAST}"
+  printf '%s\n' "$((index + 1))" >"${case_dir}/stage-index"
+  token="$(<"${case_dir}/handled-token")"
+  jq --arg token "${token}" \
+    '.status.lastHandledRefresh = (if $token == "" then null else $token end)' \
+    "${file}"
+}
+
+freight_snapshot() {
+  local index
+  index="$(<"${case_dir}/freight-index")"
+  index=$((index + 1))
+  printf '%s\n' "${index}" >"${case_dir}/freight-index"
+  if [ "${index}" -ge "${FREIGHT_PROJECT_AFTER}" ]; then
+    jq -n --arg stage "${TEST_STAGE}" \
+      '{status:{verifiedIn:{($stage):{verifiedAt:"2026-07-31T00:00:03Z"}}}}'
+  else
+    jq -n '{status:{verifiedIn:{}}}'
+  fi
+}
+
+kubectl() {
+  local namespace=''
+  printf '%s\n' "$*" >>"${case_dir}/kubectl-calls.log"
+  if [ "${1:-}" = '-n' ]; then
+    namespace="$2"
+    shift 2
+  fi
+  case "${1:-}:${2:-}" in
+  annotate:stage)
+    local token="${4#*=}"
+    printf '%s\n' "${token}" >"${case_dir}/handled-token"
+    local count
+    count="$(<"${case_dir}/annotate-count")"
+    printf '%s\n' "$((count + 1))" >"${case_dir}/annotate-count"
+    return 0
+    ;;
+  get:stage | get:stage/*)
+    if [[ $* == *jsonpath* ]]; then
+      printf '%s' "$(<"${case_dir}/handled-token")"
+    else
+      if [ "${STAGE_READ_ADVANCE:-0}" -gt 0 ]; then
+        local now
+        now="$(<"${FAKE_CLOCK_FILE}")"
+        printf '%s\n' "$((now + STAGE_READ_ADVANCE))" >"${FAKE_CLOCK_FILE}"
+        STAGE_READ_ADVANCE=0
+      fi
+      stage_snapshot
+    fi
+    return 0
+    ;;
+  get:freight | get:freight/*)
+    freight_snapshot
+    return 0
+    ;;
+  get:promotions.kargo.akuity.io)
+    jq -n \
+      --arg stage "${TEST_STAGE}" --arg freight "${TEST_FREIGHT}" \
+      --arg promotion "${TEST_PROMOTION}" --arg collection "${TEST_COLLECTION}" '
+        {items:[{metadata:{name:$promotion,creationTimestamp:"2026-07-31T00:00:00Z"},
+          spec:{stage:$stage,freight:$freight},status:{phase:"Succeeded",
+            freight:{name:$freight},freightCollection:{id:$collection}}}]}
+      '
+    return 0
+    ;;
+  get:analysisruns | get:analysisruns.argoproj.io)
+    jq -n \
+      --arg stage "${TEST_STAGE}" --arg collection "${TEST_COLLECTION}" '
+        {items:[
+          {metadata:{name:"stale-run",creationTimestamp:"2026-07-30T00:00:00Z",
+            labels:{"kargo.akuity.io/stage":$stage,
+              "kargo.akuity.io/freight-collection":"stale-collection"}}},
+          {metadata:{name:"exact-run",creationTimestamp:"2026-07-31T00:00:01Z",
+            labels:{"kargo.akuity.io/stage":$stage,
+              "kargo.akuity.io/freight-collection":$collection}}}
+        ]}
+      '
+    return 0
+    ;;
+  patch:configmap)
+    local payload='{}'
+    shift 3
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+      -p) payload="$2"; shift 2 ;;
+      *) shift ;;
+      esac
+    done
+    jq -n --argjson patch "${payload}" \
+      --arg name 'kargo-analysis-outcomes' \
+      '{metadata:{name:$name},data:$patch.data}'
+    return 0
+    ;;
+  *)
+    echo "unmodeled kubectl call in ${namespace}: $*" >&2
+    return 1
+    ;;
+  esac
+}
+
+drive() {
+  local expected="$1"
+  kargo_drive_post_promotion_verification \
+    "${TEST_PROJECT}" "${TEST_STAGE}" "${TEST_FREIGHT}" \
+    "${case_dir}/promotion.json" "${expected}" \
+    "${report}/stage.json" "${report}/reconciliation.json"
+}
+
+expect_drive_failure() {
+  local expected="$1"
+  if drive "${expected}" >"${case_dir}/stdout.txt" 2>"${case_dir}/stderr.txt"; then
+    die "${case_dir}: expected ${expected} driver failure"
+  fi
+}
+
+# N1: reproduce the rejected equal-millisecond entropy hole, then prove the
+# real-time floor makes even a maximal-entropy manual name sort below a later
+# minimal-entropy Kargo-style name. All helpers are extracted production bytes.
+naming_stage='canary-dummy-pikachu'
+naming_freight='0123456789abcdef'
+naming_wall_ms=1700000000002
+naming_safe_manual_ms=$((naming_wall_ms - 1))
+naming_earlier_manual_ms=$((naming_wall_ms - 2))
+naming_earlier=''
+naming_later_manual=''
+naming_wall_ulid=''
+naming_safe_ulid=''
+kargo_generate_manual_promotion_name \
+  "${naming_stage}" "${naming_freight}" "${naming_earlier_manual_ms}" naming_earlier
+kargo_generate_manual_promotion_name \
+  "${naming_stage}" "${naming_freight}" "${naming_safe_manual_ms}" naming_later_manual
+[[ "${naming_earlier}" < "${naming_later_manual}" ]] ||
+  die 'N1 a later manual ULID name did not sort above the earlier manual name'
+
+kargo_promotion_ulid "${naming_wall_ms}" naming_wall_ulid
+kargo_promotion_ulid "${naming_safe_manual_ms}" naming_safe_ulid
+naming_wall_prefix="${naming_wall_ulid:0:10}"
+naming_safe_prefix="${naming_safe_ulid:0:10}"
+naming_unsafe_manual="${naming_stage}.${naming_wall_prefix}zzzzzzzzzzzzzzzz.${naming_freight:0:7}"
+naming_same_time_auto="${naming_stage}.${naming_wall_prefix}0000000000000000.${naming_freight:0:7}"
+naming_safe_manual="${naming_stage}.${naming_safe_prefix}zzzzzzzzzzzzzzzz.${naming_freight:0:7}"
+kargo_validate_manual_promotion_name \
+  "${naming_unsafe_manual}" "${naming_stage}" "${naming_freight}"
+kargo_validate_manual_promotion_name \
+  "${naming_same_time_auto}" "${naming_stage}" "${naming_freight}"
+kargo_validate_manual_promotion_name \
+  "${naming_safe_manual}" "${naming_stage}" "${naming_freight}"
+[[ "${naming_same_time_auto}" < "${naming_unsafe_manual}" ]] ||
+  die 'N1 did not reproduce the equal-timestamp independent-entropy ordering hole'
+[[ "${naming_safe_manual}" < "${naming_same_time_auto}" ]] ||
+  die 'N1 the floored maximal-entropy manual name did not sort below the minimal-entropy auto name'
+if kargo_manual_promotion_ordering_floor_reached \
+  "${naming_safe_manual}" "${naming_safe_manual_ms}"; then
+  die 'N1 accepted a controller clock equal to the embedded manual timestamp'
+fi
+kargo_manual_promotion_ordering_floor_reached \
+  "${naming_safe_manual}" "${naming_wall_ms}" ||
+  die 'N1 rejected a controller clock strictly beyond the embedded manual timestamp'
+kargo_promotion_name_timestamp_ms "${naming_safe_manual}" naming_decoded_ms
+[ "${naming_decoded_ms}" = "${naming_safe_manual_ms}" ] ||
+  die 'N1 the encoded ULID timestamp was not the supplied real millisecond value'
+[ "${#naming_safe_manual}" -le 253 ] || die 'N1 generated a name beyond the DNS limit'
+naming_invalid=''
+if kargo_promotion_ulid 281474976710656 naming_invalid >/dev/null 2>&1; then
+  die 'N1 accepted a timestamp outside the ULID 48-bit range'
+fi
+naming_overflow="${naming_stage}.zzzzzzzzzzzzzzzzzzzzzzzzzz.${naming_freight:0:7}"
+if kargo_validate_manual_promotion_name \
+  "${naming_overflow}" "${naming_stage}" "${naming_freight}" >/dev/null 2>&1; then
+  die 'N1 accepted a Promotion name with an overflowing 48-bit timestamp'
+fi
+naming_long_label="$(printf '%064d' 0)"
+if kargo_generate_manual_promotion_name \
+  "${naming_long_label}" "${naming_freight}" "${naming_earlier_manual_ms}" \
+  naming_invalid >/dev/null 2>&1; then
+  die 'N1 accepted a Promotion name with a DNS label beyond 63 characters'
+fi
+
+# P1: the recorded missing-scheduling shape is repaired by one handled refresh;
+# once Pending exists, Running and Failed are observed without another write.
+reset_case pending-running-failed
+make_stage "${case_dir}/stage-0.json" '' true
+make_stage "${case_dir}/stage-1.json" Pending true
+make_stage "${case_dir}/stage-2.json" Running true
+make_stage "${case_dir}/stage-3.json" Failed true
+STAGE_LAST="${case_dir}/stage-3.json"
+drive Failed
+[ "$(<"${case_dir}/annotate-count")" -eq 1 ] ||
+  die 'P1 refreshed again after exact verification scheduling'
+rg -q 'get stage .* -o json --request-timeout=[0-9][0-9]*s' \
+  "${case_dir}/kubectl-calls.log" || die 'P1 Stage observation was not request-bounded'
+rg -q 'annotate stage .* --request-timeout=[0-9][0-9]*s' \
+  "${case_dir}/kubectl-calls.log" || die 'P1 refresh annotation was not request-bounded'
+rg -q 'get stage .*jsonpath.* --request-timeout=[0-9][0-9]*s' \
+  "${case_dir}/kubectl-calls.log" || die 'P1 refresh acknowledgement was not request-bounded'
+jq -e '
+  .result == "success" and .budget_s == 180 and .elapsed_s <= 180 and
+  .promotionName == "promotion-f2" and .freightCollectionId == "collection-f2" and
+  .firstObservedScheduledPhase == "Pending" and .finalPhase == "Failed" and
+  (.refreshes | length) == 1 and .refreshes[0].handled == true
+' "${report}/reconciliation.json" >/dev/null || die 'P1 reconciliation record is incomplete'
+
+# P2: a fast terminal result is legal and requires no synthetic refresh.
+reset_case direct-failed
+make_stage "${case_dir}/stage-0.json" Failed true
+STAGE_LAST="${case_dir}/stage-0.json"
+drive Failed
+[ "$(<"${case_dir}/annotate-count")" -eq 0 ] || die 'P2 refreshed a direct Failed result'
+
+# P3: direct no-AnalysisRun success still waits for the exact Freight projection
+# inside the same deadline.
+reset_case direct-success-projection
+make_stage "${case_dir}/stage-0.json" Successful false
+STAGE_LAST="${case_dir}/stage-0.json"
+FREIGHT_PROJECT_AFTER=2
+drive Successful
+[ "$(<"${case_dir}/annotate-count")" -eq 0 ] || die 'P3 refreshed a direct Successful result'
+rg -q 'get freight .* -o json --request-timeout=[0-9][0-9]*s' \
+  "${case_dir}/kubectl-calls.log" || die 'P3 Freight projection read was not request-bounded'
+jq -e '
+  .verification.analysisRunName == null and .freightVerifiedAt != null and
+  .finalPhase == "Successful"
+' "${report}/reconciliation.json" >/dev/null || die 'P3 did not require the Freight projection'
+
+# P3b: accept an exact terminal controller outcome at the inclusive deadline.
+# Crossing the next second during the subsequent Stage copy must not rewrite
+# that accepted decision as an evidence-contract failure.
+reset_case success-at-deadline
+make_stage "${case_dir}/stage-0.json" Failed true
+STAGE_LAST="${case_dir}/stage-0.json"
+STAGE_READ_ADVANCE=180
+CROSS_AFTER_DECISION=1
+drive Failed
+jq -e '
+  .result == "success" and .budget_s == 180 and .elapsed_s == 180 and
+  .decisionMonotonic_s == 180 and .finalPhase == "Failed"
+' "${report}/reconciliation.json" >/dev/null ||
+  die 'P3b post-decision evidence work converted an at-deadline success into failure'
+[ "$(<"${FAKE_CLOCK_FILE}")" -eq 181 ] ||
+  die 'P3b did not cross the deadline after the controller decision as intended'
+
+# P4: stale same-Freight history is first on purpose. It cannot satisfy the
+# exact terminal Promotion collection; the driver must refresh for the new one.
+reset_case stale-history
+make_stage "${case_dir}/stage-0.json" '' true
+make_stage "${case_dir}/stage-1.json" Failed true
+STAGE_LAST="${case_dir}/stage-1.json"
+drive Failed
+[ "$(<"${case_dir}/annotate-count")" -eq 1 ] || die 'P4 accepted stale collection history'
+
+# P5: non-asserted terminal/unknown outcomes fail immediately, retain the actual phase,
+# and never stimulate an already terminal attempt.
+for actual in Error Aborted Inconclusive Successful Mystery; do
+  reset_case "unexpected-${actual}"
+  make_stage "${case_dir}/stage-0.json" "${actual}" true
+  STAGE_LAST="${case_dir}/stage-0.json"
+  expect_drive_failure Failed
+  [ "$(<"${case_dir}/annotate-count")" -eq 0 ] || die "P5 refreshed terminal ${actual}"
+  jq -e --arg actual "${actual}" '
+    .result == "failure" and .finalPhase == $actual and
+    (.failureReason | contains($actual))
+  ' "${report}/reconciliation.json" >/dev/null || die "P5 erased terminal ${actual}"
+done
+reset_case opposite-failed
+make_stage "${case_dir}/stage-0.json" Failed true
+STAGE_LAST="${case_dir}/stage-0.json"
+expect_drive_failure Successful
+
+# P6: invalid public input fails before annotate.
+reset_case invalid-expected-phase
+make_stage "${case_dir}/stage-0.json" '' true
+STAGE_LAST="${case_dir}/stage-0.json"
+expect_drive_failure Error
+[ "$(<"${case_dir}/annotate-count")" -eq 0 ] || die 'P6 annotated for invalid expected phase'
+jq -e '.trigger == "none" and .refreshAttempts == 0' \
+  "${report}/reconciliation.json" >/dev/null || die 'P6 invalid-input record is misleading'
+
+# P7: force the monotonic clock to the public deadline after one observation.
+# Diagnostics must still use the Promotion collection even though the Stage has
+# no exact history collection and all six dynamic artifacts must be declared.
+reset_case expired
+make_stage "${case_dir}/stage-0.json" '' true false
+STAGE_LAST="${case_dir}/stage-0.json"
+SLEEP_JUMP=180
+expect_drive_failure Failed
+jq -e '.budget_s == 180 and .elapsed_s == 180 and .refreshAttempts == 1' \
+  "${report}/reconciliation.json" >/dev/null || die 'P7 exceeded or replaced the shared deadline'
+[ "${#SIT_LEG_EVIDENCE[@]}" -eq 6 ] ||
+  die "P7 expected six dynamic artifacts, got ${#SIT_LEG_EVIDENCE[@]}"
+for evidence in "${SIT_LEG_EVIDENCE[@]}"; do
+  [ -s "${report}/${evidence}" ] || die "P7 declared missing evidence ${evidence}"
+done
+jq -e '
+  (. | length) == 1 and
+  .[0].metadata.labels["kargo.akuity.io/freight-collection"] == "collection-f2"
+' "${report}/reconciliation-failure-analysisruns.json" >/dev/null ||
+  die 'P7 diagnostics joined a stale AnalysisRun or lost the Promotion collection'
+jq -e '
+  .collectionId == "collection-f2" and .collectionSource == "supplied" and
+  .analysisRunCapture.captureAvailable == true
+' "${report}/reconciliation-failure-analysisruns-join.json" >/dev/null ||
+  die 'P7 did not record the supplied exact diagnostics join'
+jq -e '
+  .coherentStage.collectionMatchCount == 0 and
+  (.failureReason | contains("absent from Stage freightHistory"))
+' "${report}/reconciliation.json" >/dev/null ||
+  die 'P7 did not model or report the terminal Promotion collection missing from Stage history'
+
+# P8: terminal Stage success without Freight projection consumes the same
+# deadline and never opens the removed additive projection window.
+reset_case projection-timeout
+make_stage "${case_dir}/stage-0.json" Successful false
+STAGE_LAST="${case_dir}/stage-0.json"
+SLEEP_JUMP=180
+expect_drive_failure Successful
+jq -e '
+  .elapsed_s == 180 and .finalPhase == "Successful" and
+  (.failureReason | contains("not projected verified"))
+' "${report}/reconciliation.json" >/dev/null || die 'P8 did not fail the shared projection deadline'
+
+# P8a: a failed Stage read after a real observed phase retains that phase and
+# message instead of rewriting the attempt as never scheduled.
+reset_case capture-loss-after-phase
+make_stage "${case_dir}/stage-0.json" Pending true
+STAGE_LAST="${case_dir}/stage-unavailable.json"
+SLEEP_JUMP=90
+expect_drive_failure Failed
+jq -e '
+  .finalPhase == "Pending" and .verification.message == "exact result" and
+  .coherentStage.captureAvailable == false and
+  (.failureReason | contains("Stage capture became unavailable after observing Pending"))
+' "${report}/reconciliation.json" >/dev/null ||
+  die 'P8a erased the observed phase/message after Stage capture loss'
+
+# P8b: duplicate exact collection entries are reported as ambiguity, not as an
+# unscheduled verification.
+reset_case ambiguous-collection
+make_stage "${case_dir}/stage-0.json" '' true
+jq '.status.freightHistory += [.status.freightHistory[-1]]' \
+  "${case_dir}/stage-0.json" >"${case_dir}/stage-duplicate.json"
+STAGE_LAST="${case_dir}/stage-duplicate.json"
+mv "${case_dir}/stage-duplicate.json" "${case_dir}/stage-0.json"
+STAGE_LAST="${case_dir}/stage-0.json"
+SLEEP_JUMP=180
+expect_drive_failure Failed
+jq -e '
+  .coherentStage.collectionMatchCount == 2 and
+  (.failureReason | contains("ambiguous entries"))
+' "${report}/reconciliation.json" >/dev/null ||
+  die 'P8b misreported duplicate exact collections as never scheduled'
+
+# P8c: a terminal exact verification on an incoherent Stage names coherence as
+# the blocker and retains the controller-owned terminal message.
+reset_case terminal-incoherent
+make_stage "${case_dir}/stage-0.json" Failed true
+jq '.status.lastPromotion.name = "different-promotion"' \
+  "${case_dir}/stage-0.json" >"${case_dir}/stage-incoherent.json"
+mv "${case_dir}/stage-incoherent.json" "${case_dir}/stage-0.json"
+STAGE_LAST="${case_dir}/stage-0.json"
+SLEEP_JUMP=180
+expect_drive_failure Failed
+jq -e '
+  .finalPhase == "Failed" and .verification.message == "exact result" and
+  .coherentStage.coherent == false and
+  (.failureReason | contains("terminal Failed verification")) and
+  (.failureReason | contains("remained incoherent"))
+' "${report}/reconciliation.json" >/dev/null ||
+  die 'P8c misreported a terminal-but-incoherent Stage'
+
+# P8d: the no-ID diagnostics path used by the distinct reverify wait records a
+# derived join when possible and an explicit unavailable join otherwise. Its
+# AnalysisRun evidence is always a valid array.
+reset_case diagnostics-derived-join
+make_stage "${case_dir}/stage-0.json" Failed true
+jq --arg collection "${TEST_COLLECTION}" \
+  '.status.freightHistory |= map(select(.id == $collection))' \
+  "${case_dir}/stage-0.json" >"${case_dir}/stage-derived.json"
+mv "${case_dir}/stage-derived.json" "${case_dir}/stage-0.json"
+STAGE_LAST="${case_dir}/stage-0.json"
+kargo_capture_stage_failure_diagnostics \
+  "${TEST_PROJECT}" "${TEST_STAGE}" "${TEST_FREIGHT}" \
+  "${report}/derived" ''
+jq -e '
+  .collectionId == "collection-f2" and .collectionSource == "derived" and
+  .analysisRunCapture.captureAvailable == true
+' "${report}/derived-analysisruns-join.json" >/dev/null ||
+  die 'P8d did not record the derived reverify diagnostics join'
+jq -e 'type == "array" and length == 1' \
+  "${report}/derived-analysisruns.json" >/dev/null ||
+  die 'P8d derived join did not emit valid exact AnalysisRun evidence'
+
+reset_case diagnostics-unavailable-join
+make_stage "${case_dir}/stage-0.json" '' true false
+jq '.status.freightHistory = []' \
+  "${case_dir}/stage-0.json" >"${case_dir}/stage-unavailable.json"
+mv "${case_dir}/stage-unavailable.json" "${case_dir}/stage-0.json"
+STAGE_LAST="${case_dir}/stage-0.json"
+kargo_capture_stage_failure_diagnostics \
+  "${TEST_PROJECT}" "${TEST_STAGE}" "${TEST_FREIGHT}" \
+  "${report}/unavailable" ''
+jq -e '
+  .collectionId == null and .collectionSource == "unavailable" and
+  .analysisRunCapture.attempted == false
+' "${report}/unavailable-analysisruns-join.json" >/dev/null ||
+  die 'P8d did not record the unavailable reverify diagnostics join'
+jq -e 'type == "array" and length == 0' \
+  "${report}/unavailable-analysisruns.json" >/dev/null ||
+  die 'P8d unavailable join did not emit valid empty AnalysisRun evidence'
+
+# P9: ConfigMap responses are persisted, asserted, and declared.
+reset_case outcome-capture
+kargo_set_analysis_outcome "${TEST_PROJECT}" canary-smoke fail \
+  "${report}/analysis-outcome.json"
+jq -e '.data["canary-smoke"] == "fail"' "${report}/analysis-outcome.json" >/dev/null ||
+  die 'P9 analysis outcome response was not preserved'
+[ "${SIT_LEG_EVIDENCE[0]}" = 'analysis-outcome.json' ] ||
+  die 'P9 analysis outcome response was not dynamically declared'
+
+# P10: failed-leg declarations are truthful even when pass-only files were not
+# reached. Missing expectations survive in a real gap artifact, never evidence[].
+reset_case failure-evidence
+printf '{}\n' >"${report}/present.json"
+SIT_LEG_EVIDENCE=('present.json' 'not-created.json')
+sit_prepare_failure_evidence
+[ "${#SIT_LEG_EVIDENCE[@]}" -eq 2 ] || die 'P10 failure evidence was not partitioned'
+[ "${SIT_LEG_EVIDENCE[0]}" = 'present.json' ] || die 'P10 dropped existing evidence'
+[ "${SIT_LEG_EVIDENCE[1]}" = 'failure-evidence-gaps.json' ] || die 'P10 did not declare its gap record'
+jq -e '.missingEvidence == ["not-created.json"] and .invalidEvidence == []' \
+  "${report}/failure-evidence-gaps.json" >/dev/null || die 'P10 gap record is inaccurate'
+
+echo '  exact post-Promotion driver passes production-byte scheduling, terminal, identity, deadline, projection, diagnostics, outcome, and evidence regressions ✓'
+POSTPROMOTIONDRIVER
+  chmod +x "${tmp}/post-promotion-driver.sh"
+  bash "${tmp}/post-promotion-driver.sh" "${ppv_assert}" "${ppv_fns}" \
+    "${tmp}/post-promotion-model"
+
+  # Source-level invariant: join each continued shell command, pair every
+  # Promotion wait with its immediate driver, and compare the exact
+  # (Stage, Promotion capture, expected phase) tuple. The shared helper owns
+  # eight runtime edges and the other seven tuples own one each: fifteen total.
+  awk '
+    {
+      line = $0
+      sub(/[[:space:]]*\\[[:space:]]*$/, "", line)
+      logical = (logical == "" ? line : logical " " line)
+      if ($0 ~ /\\[[:space:]]*$/) next
+      print logical
+      logical = ""
+    }
+  ' "${ppv_source}" >"${tmp}/ppv-logical-commands.sh"
+  awk -F '"' '
+    /^[[:space:]]+kargo_wait_promotion_succeeded / {
+      if (pending) exit 1
+      pending = 1
+      wait_stage = $4
+      wait_capture = $8
+      waits++
+      next
+    }
+    /^[[:space:]]+kargo_drive_post_promotion_verification / {
+      if (!pending || $4 != wait_stage || $8 != wait_capture) exit 1
+      phase = $9
+      gsub(/^[[:space:]]+|[[:space:]]+$/, "", phase)
+      split(phase, tokens, /[[:space:]]+/)
+      print $4 "\t" $8 "\t" tokens[1]
+      pending = 0
+      drivers++
+    }
+    END {
+      if (pending || waits != 8 || drivers != 8) exit 1
+    }
+  ' "${tmp}/ppv-logical-commands.sh" >"${tmp}/ppv-actual-tuples.tsv" ||
+    fail 'not every lexical Promotion wait flows directly through its identity-matched driver'
+  cat >"${tmp}/ppv-expected-tuples.tsv" <<'PPVTUPLES'
+${stage}	${report}/${prefix}-promotion.json	Successful
+${pikachu}	${report}/kargo-runtime-f1-pikachu-promotion.json	Successful
+${ampharos}	${report}/kargo-runtime-f1-ampharos-promotion.json	Successful
+${pikachu}	${report}/kargo-runtime-f2-pikachu-promotion.json	Failed
+${ampharos}	${report}/kargo-runtime-f2-ampharos-promotion.json	Successful
+${pikachu}	${report}/kargo-runtime-f3-pikachu-auto-promotion.json	Successful
+${pikachu}	${report}/kargo-runtime-soak-pikachu-promotion.json	Successful
+${ampharos}	${report}/kargo-runtime-soak-ampharos-promotion.json	Successful
+PPVTUPLES
+  if ! cmp -s "${tmp}/ppv-expected-tuples.tsv" "${tmp}/ppv-actual-tuples.tsv"; then
+    diff -u "${tmp}/ppv-expected-tuples.tsv" "${tmp}/ppv-actual-tuples.tsv" >&2 || true
+    fail 'the eight post-Promotion Stage/capture/expected-phase tuples drifted'
+  fi
+  ppv_shared_edges="$(rg -c '^  kargo_auto_promote_and_verify ' "${ppv_source}")"
+  ppv_direct_edges=$(($(wc -l <"${tmp}/ppv-actual-tuples.tsv") - 1))
+  [ "$((ppv_shared_edges + ppv_direct_edges))" -eq 15 ] ||
+    fail 'the exact post-Promotion tuple guard no longer covers all fifteen runtime edges'
+  sed -n '/^kargo_runtime_trace_wall_clock_soak() {$/,/^}$/p' "${ppv_source}" \
+    >"${tmp}/ppv-soak-function.sh"
+  awk '
+    /real wall-clock lower bound before 90s/ { unrefreshed = 1; next }
+    unrefreshed && /kargo_refresh_stage/ { exit 1 }
+    unrefreshed && /kargo_wait_promotion_succeeded/ {
+      wait = NR
+      unrefreshed = 0
+    }
+    wait && /promotion_epoch.*-ge.*lower_bound/ { lower = NR }
+    lower && /elapsed.*-le 180/ { upper = NR }
+    upper && /kargo_drive_post_promotion_verification/ { driver = NR }
+    END {
+      if (!wait || !lower || !upper || !driver || !(wait < lower && lower < upper && upper < driver)) exit 1
+    }
+  ' "${tmp}/ppv-soak-function.sh" ||
+    fail 'the soak path refreshes before eligibility or drives verification before both wall-clock bounds'
+  ! rg -q '\.status\.freightHistory\[0\]' "${ppv_source}" ||
+    fail 'the F2 reverify path still uses freightHistory[0] identity'
+  ! rg -q 'kargo_wait_verification_phase|kargo_drive_stage_reconciliation' "${ppv_source}" ||
+    fail 'an obsolete post-Promotion wait/driver remains reachable'
+  rg -q 'reverify_succeeded_epoch=.*reverify_finished_at' "${ppv_source}" ||
+    fail 'F2 immediate eligibility is not based on observed re-verification success'
+  if ! rg -q 'kargo-runtime-f2-analysis-outcome-fail.json' "${ppv_source}" ||
+    ! rg -q 'kargo-runtime-f2-analysis-outcome-pass.json' "${ppv_source}"; then
+    fail 'F2 does not retain both analysis-outcome API responses'
+  fi
+  for fallback in \
+    kargo-runtime-canary-stages-final.json \
+    kargo-runtime-canary-freight-final.json \
+    kargo-runtime-canary-promotions-final.json \
+    kargo-runtime-canary-analysisruns-final.json \
+    kargo-runtime-canary-events-final.json \
+    kargo-runtime-canary-analysis-outcomes-final.json; do
+    rg -qF "${fallback}" "${ppv_source}" ||
+      fail "final failure fallback omits ${fallback}"
+  done
+  sed -n '/^on_error() {$/,/^}$/p' "${ppv_source}" >"${tmp}/ppv-on-error.sh"
+  awk '
+    /collect_final_evidence/ { collect = NR }
+    /sit_prepare_failure_evidence/ { prepare = NR }
+    /sit_leg_fail/ { fail = NR }
+    END {
+      if (!collect || !prepare || !fail || !(collect < prepare && prepare < fail)) exit 1
+    }
+  ' "${tmp}/ppv-on-error.sh" ||
+    fail 'failure evidence is serialized before final capture/filtering'
+  if ! rg -q 'error_functions=.*FUNCNAME' "${ppv_source}" ||
+    ! rg -q 'error_sources=.*BASH_SOURCE' "${ppv_source}" ||
+    ! rg -q 'error_lines=.*BASH_LINENO' "${ppv_source}"; then
+    fail 'last-error diagnostics do not retain the Bash call stack'
+  fi
+  echo '  all 15 runtime edges, distinct reverify, unrefreshed soak ordering, outcome captures, and final fallbacks are source-guarded ✓'
   ;;
 guard)
   bash ./scripts/validate/registry-guard.sh

@@ -45,6 +45,10 @@ bash ./scripts/validate/fleet.sh sit-host-image-binding
 # binding are regression-guarded in ordinary CI instead of only in a live SIT
 # venue — and k3d's recorded false-success shape can never be accepted again.
 bash ./scripts/validate/fleet.sh sit-node-image-import
+# Offline production-byte model of every L9 Promotion-to-verification edge.
+# It guards the fixed shared deadline, exact Promotion/Freight/collection join,
+# refresh-to-schedule transition, terminal outcomes, and failure evidence.
+bash ./scripts/validate/fleet.sh sit-post-promotion-verification
 bash ./scripts/validate/fleet.sh guard
 bash ./scripts/validate/fleet.sh presence
 
