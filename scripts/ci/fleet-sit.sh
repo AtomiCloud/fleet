@@ -2227,7 +2227,8 @@ kargo_runtime_render_and_apply_primary() {
     --source 'objects admitted through the live pinned Kargo webhooks and read back' \
     --image-repo "${KARGO_RUNTIME_IMAGE_REPO}" \
     --chart-repo "${KARGO_RUNTIME_CHART_REPO}" \
-    --fleet-repo "${FLEET_REPO_URL}"
+    --fleet-repo "${FLEET_REPO_URL}" \
+    --kargo-webhook-persisted
   jq -e '
     .ok == true and
     .expectedRepositories == {

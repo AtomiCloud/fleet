@@ -32,6 +32,7 @@ type Config = {
   imageRepo: string;
   chartRepo: string;
   fleetRepo: string;
+  kargoWebhookPersisted: boolean;
   selfTest: boolean;
 };
 
@@ -41,6 +42,7 @@ const API_VERSION = 'kargo.akuity.io/v1alpha1';
 const DEFAULT_IMAGE_REPO = 'registry.atomi.cloud/canary/dummy';
 const DEFAULT_CHART_REPO = 'oci://registry.atomi.cloud/canary-dummy';
 const DEFAULT_FLEET_REPO = 'https://github.com/AtomiCloud/fleet';
+const KARGO_WEBHOOK_CANONICAL_SOAK_TIME = '15m0s';
 const DEFAULT_REPOSITORIES = {
   image: DEFAULT_IMAGE_REPO,
   chart: DEFAULT_CHART_REPO,
@@ -156,6 +158,7 @@ const usage = (): never => {
   console.error(
     'usage: bun kargo-contract.ts --objects <json> --out <json> [--crds <json>] [--source <label>]\n' +
       '       [--image-repo <repo>] [--chart-repo <repo>] [--fleet-repo <repo>]\n' +
+      '       [--kargo-webhook-persisted]\n' +
       '       bun kargo-contract.ts --self-test',
   );
   process.exit(2);
@@ -164,10 +167,13 @@ const usage = (): never => {
 const parseArgs = (argv: string[]): Config => {
   const values = new Map<string, string>();
   let selfTest = false;
+  let kargoWebhookPersisted = false;
   for (let index = 0; index < argv.length; index += 1) {
     const arg = argv[index];
     if (arg === '--self-test') {
       selfTest = true;
+    } else if (arg === '--kargo-webhook-persisted') {
+      kargoWebhookPersisted = true;
     } else if (
       ['--objects', '--crds', '--out', '--source', '--image-repo', '--chart-repo', '--fleet-repo'].includes(arg)
     ) {
@@ -188,6 +194,7 @@ const parseArgs = (argv: string[]): Config => {
       imageRepo: DEFAULT_IMAGE_REPO,
       chartRepo: DEFAULT_CHART_REPO,
       fleetRepo: DEFAULT_FLEET_REPO,
+      kargoWebhookPersisted,
       selfTest,
     };
   const objectsPath = values.get('--objects') ?? '';
@@ -201,6 +208,7 @@ const parseArgs = (argv: string[]): Config => {
     imageRepo: values.get('--image-repo') ?? DEFAULT_IMAGE_REPO,
     chartRepo: values.get('--chart-repo') ?? DEFAULT_CHART_REPO,
     fleetRepo: values.get('--fleet-repo') ?? DEFAULT_FLEET_REPO,
+    kargoWebhookPersisted,
     selfTest,
   };
 };
@@ -263,6 +271,7 @@ const checkContract = (
   checker: Checker,
   objects: JsonObject[],
   repositories: { image: string; chart: string; fleet: string },
+  kargoWebhookPersisted: boolean,
 ): void => {
   const projects = byKind(objects, 'Project');
   const projectConfigs = byKind(objects, 'ProjectConfig');
@@ -350,7 +359,9 @@ const checkContract = (
     checker.equal(
       `kargo.stage.${contract.landscape}.sources.requiredSoakTime`,
       at(first, 'sources.requiredSoakTime'),
-      contract.requiredSoakTime,
+      kargoWebhookPersisted && contract.requiredSoakTime === '15m'
+        ? KARGO_WEBHOOK_CANONICAL_SOAK_TIME
+        : contract.requiredSoakTime,
     );
     const templates = at(stage, 'spec.verification.analysisTemplates');
     checker.equal(
@@ -568,14 +579,22 @@ const evaluate = (
   crds: JsonObject[] | null,
   source: string,
   repositories: { image: string; chart: string; fleet: string },
+  kargoWebhookPersisted: boolean,
 ): JsonObject => {
   const checker = new Checker();
-  checkContract(checker, objects, repositories);
+  checkContract(checker, objects, repositories, kargoWebhookPersisted);
   const conformance = crds === null ? null : checkConformance(checker, objects, crds);
   return {
     source,
     kargoApiVersion: API_VERSION,
     expectedRepositories: repositories,
+    requiredSoakTimeRepresentation: kargoWebhookPersisted
+      ? {
+          mode: 'kargo-webhook-canonical',
+          source: '15m',
+          expected: KARGO_WEBHOOK_CANONICAL_SOAK_TIME,
+        }
+      : { mode: 'source', expected: '15m' },
     ok: checker.ok,
     checkedObjects: objects.length,
     crdConformance: crds === null ? null : 'checked against the pinned Kargo CRDs',
@@ -667,18 +686,40 @@ if (config.selfTest) {
   const mutate = (label: string, mutator: (objects: JsonObject[]) => void): void => {
     const objects = good();
     mutator(objects);
-    const result = evaluate(objects, null, `self-test:${label}`, DEFAULT_REPOSITORIES);
+    const result = evaluate(objects, null, `self-test:${label}`, DEFAULT_REPOSITORIES, false);
     if (result.ok === true) throw new Error(`kargo-contract self-test did not reject mutation: ${label}`);
     executedMutations.push(label);
   };
 
-  const baseline = evaluate(good(), null, 'self-test:baseline', DEFAULT_REPOSITORIES);
+  const baseline = evaluate(good(), null, 'self-test:baseline', DEFAULT_REPOSITORIES, false);
   if (baseline.ok !== true) {
     throw new Error(`kargo-contract self-test baseline failed: ${JSON.stringify(baseline.failed)}`);
   }
 
   const stageOf = (objects: JsonObject[], landscape: string): JsonObject =>
     objects.find(object => at(object, 'metadata.name') === stageName(landscape)) as JsonObject;
+
+  const webhookPersisted = good();
+  const persistedAmpharos = (at(stageOf(webhookPersisted, 'ampharos'), 'spec.requestedFreight') as JsonObject[])[0];
+  (persistedAmpharos.sources as JsonObject).requiredSoakTime = KARGO_WEBHOOK_CANONICAL_SOAK_TIME;
+  const persistedBaseline = evaluate(
+    webhookPersisted,
+    null,
+    'self-test:kargo-webhook-persisted',
+    DEFAULT_REPOSITORIES,
+    true,
+  );
+  if (persistedBaseline.ok !== true) {
+    throw new Error(`kargo-contract persisted self-test baseline failed: ${JSON.stringify(persistedBaseline.failed)}`);
+  }
+  if (
+    evaluate(webhookPersisted, null, 'self-test:canonical-render-negative', DEFAULT_REPOSITORIES, false).ok === true
+  ) {
+    throw new Error('kargo-contract source mode accepted the webhook-canonical duration spelling');
+  }
+  if (evaluate(good(), null, 'self-test:source-persisted-negative', DEFAULT_REPOSITORIES, true).ok === true) {
+    throw new Error('kargo-contract webhook-persisted mode accepted the source duration spelling');
+  }
 
   mutate('drop-availabilityStrategy', objects => {
     const sources = (at(stageOf(objects, 'ampharos'), 'spec.requestedFreight') as JsonObject[])[0] as JsonObject;
@@ -912,6 +953,7 @@ if (config.selfTest) {
       status: 'pass',
       check: 'kargo-v1-field-contract',
       baselineChecks: (baseline.checks as unknown as Check[]).length,
+      persistedBaselineChecks: (persistedBaseline.checks as unknown as Check[]).length,
       rejectedMutations: executedMutations.length,
       conformanceRejections: pruned.length + badEnum.length,
       semanticClaims: semanticKeys.length,
@@ -923,11 +965,17 @@ if (config.selfTest) {
 
 const objects = asObjects(await readJson(config.objectsPath));
 const crds = config.crdsPath ? asObjects(await readJson(config.crdsPath)) : null;
-const result = evaluate(objects, crds, config.source, {
-  image: config.imageRepo,
-  chart: config.chartRepo,
-  fleet: config.fleetRepo,
-});
+const result = evaluate(
+  objects,
+  crds,
+  config.source,
+  {
+    image: config.imageRepo,
+    chart: config.chartRepo,
+    fleet: config.fleetRepo,
+  },
+  config.kargoWebhookPersisted,
+);
 await Bun.write(config.outPath, `${JSON.stringify(result, null, 2)}\n`);
 if (result.ok !== true) {
   console.error(`kargo contract failed for ${config.source}:`);
