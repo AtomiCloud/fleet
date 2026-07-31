@@ -1,0 +1,15 @@
+# Minimal source-B fixture proving mercury rides the ordinary service rail.
+infisical:
+  projectSlug: mercury
+  serviceFolders: true
+sos:
+  register: true
+landscapes:
+  - pichu
+stages:
+  - pichu
+dependencies: {}
+virtualLandscapeServices: []
+webhookEngine: {}
+cloudflareDeploy: []
+problems: []

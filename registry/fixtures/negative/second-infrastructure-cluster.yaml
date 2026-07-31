@@ -1,0 +1,19 @@
+# NEGATIVE/EXCLUSION FIXTURE — the cluster half of the second, differently
+# named infrastructure-only pair (see second-infrastructure-landscape.yaml).
+#
+# Carries the same `hostRole: anonymous-vcluster-host` + `traffic: false`
+# invariant as the ENTEI cluster fixture, under a name that is not `entei`.
+# The exclusion assertions must treat it identically; a gate that matches on the
+# name rather than on `hostRole`/`purpose` fails here and only here.
+apiVersion: fleet.atomi.cloud/v1alpha1
+kind: ClusterRegistration
+metadata:
+  name: 'suicune-<mark>'
+  labels:
+    atomi.cloud/landscape: suicune
+spec:
+  landscape: suicune
+  mark: '<mark>'
+  provider: '<provider>'
+  hostRole: anonymous-vcluster-host
+  traffic: false

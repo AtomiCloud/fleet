@@ -1,0 +1,11 @@
+# Landscape CR — FK anchor (T3-DESIGN.md §2). No reconciler; region immutable;
+# tier is metadata only. Human-PR-gated (registry/**, CODEOWNERS fleet-admin).
+apiVersion: fleet.atomi.cloud/v1alpha1
+kind: Landscape
+metadata:
+  name: pichu
+  labels:
+    atomi.cloud/landscape: pichu
+spec:
+  region: ap-southeast-1
+  tier: dev

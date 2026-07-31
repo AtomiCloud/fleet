@@ -1,0 +1,30 @@
+{{- $platform := include "diene-platform.platform" . -}}
+{{- with .Values.webhookEngine }}
+{{- if .home }}
+apiVersion: {{ $.Values.apiVersions.fleet }}
+kind: WebhookEngine
+metadata:
+  # ONE fleet-wide mercury deployment (Q-MT1): the platform declares config
+  # only. There is NO engine-version field — the mercury-stable pin rides
+  # Kargo on mercury's own service rows, not here.
+  name: mercury
+  namespace: {{ $platform }}
+  labels:
+    {{- include "diene-platform.labels" $ | nindent 4 }}
+spec:
+  home:
+    vlandscape: {{ required "webhookEngine.home.vlandscape is required" .home.vlandscape }}
+  retention:
+    {{- toYaml .retention | nindent 4 }}
+  retryWindow: {{ .retryWindow | quote }}
+  backoff:
+    {{- toYaml .backoff | nindent 4 }}
+  circuitBreaker:
+    {{- toYaml .circuitBreaker | nindent 4 }}
+  dedupWindow: {{ .dedupWindow | quote }}
+  quotas:
+    {{- toYaml .quotas | nindent 4 }}
+  customDomains:
+    {{- toYaml (.customDomains | default list) | nindent 4 }}
+{{- end }}
+{{- end }}

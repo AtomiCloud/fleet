@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "type": "string" },
+    "kind": { "const": "ClusterRegistration" },
+    "metadata": { "type": "object", "required": ["name"] },
+    "spec": {
+      "type": "object",
+      "required": ["landscape", "mark", "provider", "traffic"],
+      "properties": {
+        "landscape": { "type": "string", "minLength": 1 },
+        "mark": { "type": "string", "minLength": 1 },
+        "provider": { "type": "string", "minLength": 1 },
+        "originMode": { "type": "string" },
+        "hostRole": { "type": "string" },
+        "traffic": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

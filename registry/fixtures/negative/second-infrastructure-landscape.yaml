@@ -1,0 +1,29 @@
+# NEGATIVE/EXCLUSION FIXTURE — a SECOND, differently named infrastructure-only
+# landscape.
+#
+# `suicune` is a synthetic name that appears in no ratified topology. Its only
+# job is to prove that the infrastructure-only exclusion keys on
+# `purpose: infrastructure-only` (and, for the cluster half,
+# `hostRole: anonymous-vcluster-host`) and NOT on the literal string `entei`
+# (host-pool §1).
+#
+# A gate that special-cased the name `entei` would pass every ENTEI assertion
+# and still let a second infrastructure-only landscape receive platform rows,
+# dependency fan-out, or a canary stage. This fixture is what makes that
+# impossible: the registry-manifest gate must exclude it IDENTICALLY to `entei`
+# — same platform-materialization exclusion, same canary-landscape-set
+# exclusion, same traffic invariant.
+#
+# It is ALSO rejected as a live registry row: the accepted live landscape set is
+# exactly the four workload rows plus `entei`, so `suicune` never becomes real
+# topology. Both properties are asserted.
+apiVersion: fleet.atomi.cloud/v1alpha1
+kind: Landscape
+metadata:
+  name: suicune
+  labels:
+    atomi.cloud/landscape: suicune
+spec:
+  region: '<RATIFIED-HOST-REGION>'
+  tier: infra
+  purpose: infrastructure-only

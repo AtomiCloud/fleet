@@ -1,0 +1,39 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "type": "string" },
+    "kind": { "const": "Problem" },
+    "metadata": { "type": "object", "required": ["name"] },
+    "spec": {
+      "type": "object",
+      "required": ["platform", "service", "landscape", "version", "problems"],
+      "properties": {
+        "platform": { "type": "string" },
+        "service": { "type": "string" },
+        "landscape": { "type": "string" },
+        "version": { "type": "string" },
+        "problems": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["id", "type", "title", "status", "recoverable", "schema", "endpoints"],
+            "properties": {
+              "id": { "type": "string" },
+              "type": { "type": "string" },
+              "title": { "type": "string" },
+              "status": { "type": "integer", "minimum": 100, "maximum": 599 },
+              "recoverable": { "type": "boolean" },
+              "schema": { "type": "object" },
+              "endpoints": { "type": "array", "items": { "type": "object" } }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

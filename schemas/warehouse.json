@@ -1,0 +1,101 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Fleet-owned frozen validation slice of the Kargo v1.9.10 Warehouse CRD (kargo.akuity.io_warehouses.yaml), upstream commit 07183012e350cf8c3921574c26aeda8e6dd944ec.",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "kargo.akuity.io/v1alpha1" },
+    "kind": { "const": "Warehouse" },
+    "metadata": {
+      "type": "object",
+      "required": ["name", "namespace"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "namespace": { "type": "string", "minLength": 1 },
+        "labels": { "type": "object" }
+      },
+      "additionalProperties": true
+    },
+    "spec": {
+      "type": "object",
+      "required": ["interval", "freightCreationPolicy", "freightCreationCriteria", "subscriptions"],
+      "properties": {
+        "interval": {
+          "type": "string",
+          "pattern": "^([0-9]+(\\.[0-9]+)?(s|m|h))+$"
+        },
+        "freightCreationPolicy": {
+          "enum": ["Automatic", "Manual"]
+        },
+        "freightCreationCriteria": {
+          "type": "object",
+          "required": ["expression"],
+          "properties": {
+            "expression": { "type": "string", "minLength": 1 }
+          },
+          "additionalProperties": false
+        },
+        "subscriptions": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "oneOf": [
+              {
+                "type": "object",
+                "required": ["image"],
+                "properties": {
+                  "image": {
+                    "type": "object",
+                    "required": ["repoURL", "imageSelectionStrategy", "constraint", "strictSemvers", "discoveryLimit"],
+                    "properties": {
+                      "repoURL": { "type": "string", "minLength": 1 },
+                      "imageSelectionStrategy": { "const": "SemVer" },
+                      "constraint": { "type": "string", "minLength": 1 },
+                      "strictSemvers": { "const": true },
+                      "discoveryLimit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                },
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "required": ["chart"],
+                "properties": {
+                  "chart": {
+                    "type": "object",
+                    "required": ["repoURL", "semverConstraint", "discoveryLimit"],
+                    "properties": {
+                      "repoURL": {
+                        "type": "string",
+                        "pattern": "^oci://"
+                      },
+                      "semverConstraint": {
+                        "type": "string",
+                        "minLength": 1
+                      },
+                      "discoveryLimit": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 100
+                      }
+                    },
+                    "additionalProperties": false
+                  }
+                },
+                "additionalProperties": false
+              }
+            ]
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

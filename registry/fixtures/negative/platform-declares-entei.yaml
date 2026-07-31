@@ -1,0 +1,30 @@
+# NEGATIVE FIXTURE — a platform.yaml that declares an infrastructure-only
+# landscape in its `landscapes:` and `stages:`.
+#
+# The compiler chart MUST reject this before rendering anything: the registered
+# WORKLOAD landscape set — what "every registered landscape" means for canary
+# and for `stages:` DAG steps — is exactly pichu, pikachu, raichu, ampharos.
+# `entei` never receives platform rows, dependency fan-out, fleet Logto, or
+# workload seeds (exclusion law, ENV-SPEC §0.3).
+#
+# The rejection is enforced by `registeredLandscape` in
+# values.schema.source.json, which is a closed enum over the four workload
+# landscapes. That makes the exclusion structural: it holds for EVERY
+# infrastructure-only or Garden/hosted/retired identity at once, not just for
+# the two names this fixture happens to use.
+#
+# Rendered against the canary services roster, `helm lint`/`helm template` must
+# fail. A render that succeeds is a gate defect, not a permissive input.
+infisical:
+  projectSlug: canary
+  serviceFolders: true
+sos:
+  register: true
+
+landscapes:
+  - pichu
+  - entei
+
+stages:
+  - pichu
+  - entei

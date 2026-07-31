@@ -1,0 +1,84 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "type": "string" },
+    "kind": { "const": "PlatformDependency" },
+    "metadata": { "$ref": "#/$defs/metadata" },
+    "spec": {
+      "type": "object",
+      "required": ["platform", "landscape", "placement", "deletionPolicy"],
+      "properties": {
+        "platform": { "type": "string", "minLength": 1 },
+        "landscape": { "type": "string", "minLength": 1 },
+        "placement": {
+          "type": "object",
+          "required": ["preferredHost"],
+          "properties": { "preferredHost": { "type": "string", "minLength": 1 } },
+          "additionalProperties": false
+        },
+        "database": { "$ref": "#/$defs/modules" },
+        "kv": { "$ref": "#/$defs/modules" },
+        "cache": { "$ref": "#/$defs/modules" },
+        "store": { "$ref": "#/$defs/modules" },
+        "deletionPolicy": {
+          "type": "object",
+          "required": ["retainSecret"],
+          "properties": { "retainSecret": { "type": "string" } },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "metadata": {
+      "type": "object",
+      "required": ["name"],
+      "properties": {
+        "name": { "type": "string", "pattern": "^[a-z0-9]+-[a-z0-9]+$" },
+        "labels": { "type": "object" },
+        "annotations": { "type": "object" }
+      },
+      "additionalProperties": true
+    },
+    "modules": {
+      "type": "object",
+      "additionalProperties": { "$ref": "#/$defs/module" }
+    },
+    "module": {
+      "type": "object",
+      "required": ["type", "delivery", "credentialMode", "rotation", "engine"],
+      "properties": {
+        "type": {
+          "enum": [
+            "neon",
+            "neon-fork",
+            "cnpg",
+            "upstash",
+            "upstash-fork",
+            "dragonfly",
+            "tigris",
+            "tigris-fork",
+            "r2",
+            "s3",
+            "minio"
+          ]
+        },
+        "delivery": { "enum": ["external", "local", "replicated"] },
+        "providerAccountRef": { "type": "string" },
+        "credentialMode": { "enum": ["standard", "none"] },
+        "rotation": { "enum": ["on", "off"] },
+        "cpu": { "type": ["string", "integer", "number"] },
+        "ram": { "type": "string" },
+        "storage": { "type": "string" },
+        "version": { "type": "string" },
+        "backup": { "type": "object" },
+        "engine": { "type": "object", "minProperties": 1, "maxProperties": 1 }
+      },
+      "additionalProperties": false
+    }
+  }
+}

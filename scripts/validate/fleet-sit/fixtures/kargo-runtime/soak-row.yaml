@@ -1,0 +1,6 @@
+# SIT-only machine row copied once for each landscape in canary-sitsoak.
+platform: canary-sitsoak
+service: dummy
+landscape: <landscape>
+pin:
+  tag: 0.1.0

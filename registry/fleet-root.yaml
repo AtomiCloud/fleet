@@ -1,0 +1,44 @@
+# fleet-root Application — the L0/T4 seed act (T3-DESIGN.md §7 step 0–1).
+#
+# HAND-APPLIED ONCE on Primordial by the bootstrap operator; it lives OUTSIDE
+# its own sync (it does not manage itself — that is why registry/**'s include
+# glob below deliberately excludes this file and the compiler chart). Once
+# applied, ArgoCD reads this repo directly: fleet-root syncs the registry
+# topology CRs (Landscape / ClusterRegistration / VirtualLandscape), the
+# authenticated ArgoCD webhook secret contract, and the platforms ApplicationSet;
+# from there the platforms AppSet materializes one platform-<p> Application per
+# AtomiCloud/*.carbon repo.
+#
+# The compiler chart under registry/charts/diene-platform is NOT applied here —
+# it is consumed as source A of every per-platform Application, pinned to the
+# machinery-stable git tag (canary: main). Keeping charts/** out of this sync is
+# what preserves that tag-versioned boundary.
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: fleet-root
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: diene-fleet
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/AtomiCloud/fleet
+    targetRevision: HEAD
+    path: registry
+    directory:
+      recurse: true
+      # Only the registry topology CRs + the platforms AppSet. fleet-root.yaml
+      # itself and charts/** (the compiler chart) are intentionally excluded.
+      include: '{landscapes/*.yaml,clusters/*.yaml,virtual-landscapes/*.yaml,argocd-webhook-secret.yaml,platforms-appset.yaml}'
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+    syncOptions:
+      - CreateNamespace=false

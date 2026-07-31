@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "type": "string" },
+    "kind": { "const": "VirtualLandscapeService" },
+    "metadata": { "type": "object", "required": ["name"] },
+    "spec": {
+      "type": "object",
+      "required": ["platform", "vlandscape", "service", "module", "landscape", "serve"],
+      "properties": {
+        "platform": { "type": "string" },
+        "vlandscape": { "type": "string" },
+        "service": { "type": "string" },
+        "module": { "type": "string" },
+        "landscape": { "type": "string" },
+        "serve": { "type": "boolean" }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

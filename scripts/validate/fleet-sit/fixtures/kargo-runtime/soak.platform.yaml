@@ -1,0 +1,31 @@
+# SIT-only strengthener for the released controller's real wall clock. This is
+# the production canary DAG with only the literal soak shortened from 15m to
+# 90s; it is rendered into the throwaway project canary-sitsoak.
+platform: canary-sitsoak
+services:
+  - name: dummy
+    repo: AtomiCloud/canary-sitsoak.dummy
+infisical:
+  projectSlug: canary-sitsoak
+  serviceFolders: true
+sos:
+  register: false
+landscapes:
+  - pichu
+  - pikachu
+  - raichu
+  - ampharos
+stages:
+  - pichu
+  - - landscape: pikachu
+      gate: manual
+      verification:
+        analysisTemplates:
+          - canary-smoke
+    - raichu
+  - landscape: ampharos
+    gate: auto
+    soak: 90s
+    verification:
+      analysisTemplates:
+        - canary-analysis

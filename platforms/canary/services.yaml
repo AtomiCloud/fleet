@@ -1,0 +1,10 @@
+# platforms/canary/services.yaml — MACHINE-WRITTEN (T3 materializer).
+# Do not hand-edit: the platform controller lists AtomiCloud/canary.* repos and
+# writes this roster. It is source C of the three-source compiler Application.
+#
+# platform: is the explicit S16 source of truth — never inferred from the
+# containing platforms/<p>/ directory.
+platform: canary
+services:
+  - name: dummy
+    repo: AtomiCloud/canary.dummy

@@ -1,0 +1,70 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: kargo-analysis-outcomes
+  namespace: <namespace>
+data:
+  canary-smoke: pass
+  canary-analysis: pass
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: canary-smoke
+  namespace: <namespace>
+spec:
+  metrics:
+    - name: canary-smoke
+      count: 1
+      failureLimit: 0
+      provider:
+        job:
+          spec:
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: canary-smoke
+                    image: <analysis-image>
+                    imagePullPolicy: Never
+                    command: [sh, -ceu]
+                    args:
+                      - test "${OUTCOME}" = pass
+                    env:
+                      - name: OUTCOME
+                        valueFrom:
+                          configMapKeyRef:
+                            name: kargo-analysis-outcomes
+                            key: canary-smoke
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AnalysisTemplate
+metadata:
+  name: canary-analysis
+  namespace: <namespace>
+spec:
+  metrics:
+    - name: canary-analysis
+      count: 1
+      failureLimit: 0
+      provider:
+        job:
+          spec:
+            backoffLimit: 0
+            template:
+              spec:
+                restartPolicy: Never
+                containers:
+                  - name: canary-analysis
+                    image: <analysis-image>
+                    imagePullPolicy: Never
+                    command: [sh, -ceu]
+                    args:
+                      - test "${OUTCOME}" = pass
+                    env:
+                      - name: OUTCOME
+                        valueFrom:
+                          configMapKeyRef:
+                            name: kargo-analysis-outcomes
+                            key: canary-analysis

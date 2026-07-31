@@ -1,0 +1,57 @@
+{{- $platform := include "diene-platform.platform" . -}}
+{{- $deps := .Values.dependencies -}}
+{{- if $deps -}}
+{{/*
+  Delivery-mode render split (Q-L10). fleet asserts only the split; the
+  type/delivery validity itself lives in dependency-operator.
+    external   → declared, fulfilled from Primordial, NOT on the AppSet rail
+    replicated → rides the g2 per-cluster rail on EVERY landscape cluster
+    local      → Garden/local-operator owned; NEVER rendered on Primordial
+
+  WAL Q-L8(c)/Q-L9 forbid central lapras dependency materialization. A local
+  module in this fleet-core compiler is therefore rejected instead of being
+  silently stripped or centrally rendered. Garden owns the later local path.
+*/}}
+{{- $external := list -}}
+{{- $replicated := list -}}
+apiVersion: {{ .Values.apiVersions.fleet }}
+kind: PlatformDependency
+metadata:
+  name: {{ printf "%s-%s" $platform $deps.landscape }}
+  namespace: {{ $platform }}
+  labels:
+    {{- include "diene-platform.labels" . | nindent 4 }}
+  annotations:
+    {{- $prefix := include "diene-platform.labelPrefix" . }}
+    {{ $prefix }}/profile: "registered-fleet"
+spec:
+  platform: {{ $platform }}
+  landscape: {{ required "dependencies.landscape is required" $deps.landscape }}
+  placement:
+    preferredHost: {{ required "dependencies.placement.preferredHost is required" $deps.placement.preferredHost }}
+{{- range $class := list "database" "kv" "cache" "store" }}
+{{- $modules := index $deps $class }}
+{{- if $modules }}
+{{- $kept := dict }}
+{{- range $name, $module := $modules }}
+{{- $delivery := include "diene-platform.deliveryRail" $module }}
+{{- if eq $delivery "external" }}{{- $external = append $external $name }}{{- end }}
+{{- if eq $delivery "replicated" }}{{- $replicated = append $replicated $name }}{{- end }}
+{{- if eq $delivery "local" }}
+{{- fail (printf "dependency module %s.%s uses delivery: local; Garden/local-operator owns local materialization and fleet-core must not render it on Primordial" $class $name) }}
+{{- end }}
+{{- $_ := set $kept $name $module }}
+{{- end }}
+{{- if $kept }}
+  {{ $class }}:
+    {{- toYaml $kept | nindent 4 }}
+{{- end }}
+{{- end }}
+{{- end }}
+  deletionPolicy:
+    retainSecret: 168h
+{{- $prefix := include "diene-platform.labelPrefix" . }}
+  # render-split summary (compiler assertion surface):
+  # externalOffRail: {{ $external | sortAlpha | join "," | default "-" }}
+  # replicatedOnRail: {{ $replicated | sortAlpha | join "," | default "-" }}
+{{- end -}}

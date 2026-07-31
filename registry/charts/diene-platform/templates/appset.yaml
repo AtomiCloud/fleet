@@ -1,0 +1,124 @@
+{{- $platform := include "diene-platform.platform" . -}}
+{{- $registry := .Values.oci.registry -}}
+{{- $fleet := .Values.fleet -}}
+{{- $prefix := include "diene-platform.labelPrefix" . -}}
+{{- $files := printf "platforms/%s/landscapes/*/*.yaml" $platform -}}
+{{- $serviceNames := list -}}
+{{- range $svc := .Values.services -}}
+{{- $serviceNames = append $serviceNames (required "each services[] entry needs a name" $svc.name) -}}
+{{- end -}}
+{{- $rosterCSV := join "," $serviceNames -}}
+{{/*
+  ArgoCD ApplicationSet template placeholders below are Helm literal blocks
+  (`{{`...`}}`) emitted verbatim for ArgoCD to evaluate at refresh time; the
+  Helm-substituted constants (registry and the expected roster identity) are
+  baked in beside them. Every placeholder-bearing scalar is quoted so Helm's
+  own YAML parse does not read a leading `{{` as a flow mapping.
+
+  The row's explicit platform/service/landscape fields are the generator source
+  of truth. templatePatch rejects a row unless those fields match the containing
+  roster + release namespace, service roster, landscape path, and filename.
+  path.segments and path.filename are used only for that validation, never to
+  construct generated names, OCI paths, selectors, or destinations. The row
+  `values:` override is passed through as a JSON values string (layered LAST by
+  ArgoCD/Helm).
+*/}}
+apiVersion: {{ .Values.apiVersions.applicationSet }}
+kind: ApplicationSet
+metadata:
+  name: {{ $platform }}
+  namespace: {{ .Values.argocd.namespace }}
+  labels:
+    {{- include "diene-platform.labels" . | nindent 4 }}
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    # g1 — git-files over landscapes/<l>/<svc>.yaml → one primordial Application
+    # per row, destined for the Primordial central cluster.
+    - git:
+        repoURL: {{ $fleet.repoURL }}
+        revision: {{ $fleet.revision }}
+        files:
+          - path: {{ $files }}
+        template:
+          metadata:
+            name: '{{`{{ .platform }}`}}-{{`{{ .landscape }}`}}-{{`{{ .service }}`}}-primordial'
+          spec:
+            project: {{ .Values.argocd.project }}
+            destination:
+              server: {{ .Values.primordial.server }}
+              namespace: '{{`{{ .platform }}`}}'
+            sources:
+              - repoURL: 'oci://{{ $registry }}/{{`{{ .platform }}`}}-{{`{{ .service }}`}}-primordial'
+                targetRevision: '{{`{{ .pin.tag }}`}}'
+                helm:
+                  values: '{{`{{ get . "values" | default dict | toRawJson }}`}}'
+    # g2 — g1 × cluster generator (label-selected by landscape) → one per-cluster
+    # Application per row per matching cluster. This is the SOLE membership
+    # mechanism, so delivery: replicated modules land on EVERY landscape cluster.
+    - matrix:
+        generators:
+          - git:
+              repoURL: {{ $fleet.repoURL }}
+              revision: {{ $fleet.revision }}
+              files:
+                - path: {{ $files }}
+          - clusters:
+              selector:
+                matchLabels:
+                  {{ $prefix }}/landscape: '{{`{{ .landscape }}`}}'
+                matchExpressions:
+                  - key: {{ $prefix }}/cluster-role
+                    operator: NotIn
+                    values:
+                      - infrastructure-only
+        template:
+          metadata:
+            name: '{{`{{ .platform }}`}}-{{`{{ .landscape }}`}}-{{`{{ .service }}`}}-{{`{{ .name }}`}}'
+          spec:
+            project: {{ .Values.argocd.project }}
+            destination:
+              server: '{{`{{ .server }}`}}'
+              namespace: '{{`{{ .platform }}`}}'
+            sources:
+              - repoURL: 'oci://{{ $registry }}/{{`{{ .platform }}`}}-{{`{{ .service }}`}}'
+                targetRevision: '{{`{{ .pin.tag }}`}}'
+                helm:
+                  values: '{{`{{ get . "values" | default dict | toRawJson }}`}}'
+  # Runtime guard for machine-written rows. A malformed row fails generation
+  # before either Application is rendered; explicit row fields remain the only
+  # identity values consumed downstream.
+  templatePatch: |
+    {{`{{- $pathLandscape := index .path.segments 3 -}}`}}
+    {{`{{- $filenameService := trimSuffix ".yaml" .path.filename -}}`}}
+    {{`{{- if ne .platform "`}}{{ $platform }}{{`" -}}`}}
+    {{`{{- fail (printf "row platform %q must equal containing roster and release namespace `}}{{ $platform }}{{`" .platform) -}}`}}
+    {{`{{- end -}}`}}
+    {{`{{- if not (has .service (splitList "," "`}}{{ $rosterCSV }}{{`")) -}}`}}
+    {{`{{- fail (printf "row service %q is absent from the containing services roster" .service) -}}`}}
+    {{`{{- end -}}`}}
+    {{`{{- if ne .service $filenameService -}}`}}
+    {{`{{- fail (printf "row service %q must equal filename service %q" .service $filenameService) -}}`}}
+    {{`{{- end -}}`}}
+    {{`{{- if ne .landscape $pathLandscape -}}`}}
+    {{`{{- fail (printf "row landscape %q must equal path landscape %q" .landscape $pathLandscape) -}}`}}
+    {{`{{- end -}}`}}
+    {}
+  # Base template: the two generator-level templates above override per row.
+  template:
+    metadata:
+      name: '{{`{{ .platform }}`}}-row'
+      labels:
+        {{ $prefix }}/platform: '{{`{{ .platform }}`}}'
+    spec:
+      project: {{ .Values.argocd.project }}
+      destination:
+        server: {{ .Values.primordial.server }}
+        namespace: '{{`{{ .platform }}`}}'
+      source:
+        repoURL: {{ $fleet.repoURL }}
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true

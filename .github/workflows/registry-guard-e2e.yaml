@@ -1,0 +1,336 @@
+# ### fleet-registry-guard-e2e
+# #### source: fleet
+name: Registry Guard Sandbox E2E
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Weekly, outside the normal promotion window. Never a pull_request job:
+    # the authorization probes require protected sandbox credentials.
+    - cron: '17 4 * * 1'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: registry-guard-sandbox-e2e
+  cancel-in-progress: false
+
+env:
+  FLEET_GUARD_SANDBOX_REPOSITORY: AtomiCloud/fleet-guard-sandbox
+  FLEET_GUARD_BACKTRACK_SHA: ${{ vars.FLEET_GUARD_SANDBOX_BACKTRACK_SHA }}
+  FLEET_GUARD_FORWARD_SHA: ${{ vars.FLEET_GUARD_SANDBOX_FORWARD_SHA }}
+
+jobs:
+  static-fixed-workflow:
+    if: github.repository == 'AtomiCloud/fleet'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - name: Prove the production workflow has no ref input or alternate write endpoint
+        shell: bash
+        run: bash ./scripts/validate/registry-guard.sh
+
+  tag-actor-denials:
+    needs: static-fixed-workflow
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    environment:
+      name: fleet-guard-sandbox
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Mint sandbox A19 materializer token
+        id: a19-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.FLEET_GUARD_SANDBOX_A19_APP_ID }}
+          private-key: ${{ secrets.FLEET_GUARD_SANDBOX_A19_PRIVATE_KEY }}
+          owner: AtomiCloud
+          repositories: fleet-guard-sandbox
+          permission-contents: write
+
+      - name: Mint sandbox A20 Kargo token
+        id: a20-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.FLEET_GUARD_SANDBOX_A20_APP_ID }}
+          private-key: ${{ secrets.FLEET_GUARD_SANDBOX_A20_PRIVATE_KEY }}
+          owner: AtomiCloud
+          repositories: fleet-guard-sandbox
+          permission-contents: write
+
+      - name: Remove stable tag for create-denial probes
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_GUARD_SANDBOX_ADMIN_TOKEN }}
+        run: bash ./scripts/local/registry-guard-e2e.sh setup-absent
+
+      - name: A19 machinery-stable creation is rejected
+        env:
+          GH_TOKEN: ${{ steps.a19-token.outputs.token }}
+        run: bash ./scripts/local/registry-guard-e2e.sh create-denied
+
+      - name: A20 machinery-stable creation is rejected
+        env:
+          GH_TOKEN: ${{ steps.a20-token.outputs.token }}
+        run: bash ./scripts/local/registry-guard-e2e.sh create-denied
+
+      - name: Sandbox-native ordinary workflow token machinery-stable creation is rejected
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_GUARD_SANDBOX_ADMIN_TOKEN }}
+        run: bash ./scripts/local/registry-guard-e2e.sh ordinary-create-denied
+
+      - name: Restore the stable tag baseline
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_GUARD_SANDBOX_ADMIN_TOKEN }}
+        run: bash ./scripts/local/registry-guard-e2e.sh setup-base
+
+      - name: A19 machinery-stable update and deletion are rejected
+        env:
+          GH_TOKEN: ${{ steps.a19-token.outputs.token }}
+        run: bash ./scripts/local/registry-guard-e2e.sh update-delete-denied
+
+      - name: A20 machinery-stable update and deletion are rejected
+        env:
+          GH_TOKEN: ${{ steps.a20-token.outputs.token }}
+        run: bash ./scripts/local/registry-guard-e2e.sh update-delete-denied
+
+      - name: Sandbox-native ordinary workflow token update and deletion are rejected
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_GUARD_SANDBOX_ADMIN_TOKEN }}
+        run: bash ./scripts/local/registry-guard-e2e.sh ordinary-update-delete-denied
+
+      - name: Non-exempt human direct machinery-stable force move is rejected
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_GUARD_SANDBOX_HUMAN_TOKEN }}
+        run: bash ./scripts/local/registry-guard-e2e.sh force-update-denied
+
+      - name: Restore sandbox refs after actor denials
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_GUARD_SANDBOX_ADMIN_TOKEN }}
+        run: bash ./scripts/local/registry-guard-e2e.sh cleanup
+
+  a33-boundaries:
+    needs: tag-actor-denials
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: fleet-guard-sandbox
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Mint one-hour sandbox A33-equivalent token
+        id: a33-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.FLEET_GUARD_SANDBOX_A33_APP_ID }}
+          private-key: ${{ secrets.FLEET_GUARD_SANDBOX_A33_PRIVATE_KEY }}
+          owner: AtomiCloud
+          repositories: fleet-guard-sandbox
+          permission-contents: write
+
+      - name: Establish backward and forward main fixture commits
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_GUARD_SANDBOX_ADMIN_TOKEN }}
+        run: bash ./scripts/local/registry-guard-e2e.sh setup-base
+
+      - name: Prove A33 forward move, R7 backtrack denial, fixed-ref denials, and scratch-branch residual
+        env:
+          GH_TOKEN: ${{ steps.a33-token.outputs.token }}
+        run: bash ./scripts/local/registry-guard-e2e.sh a33-boundaries
+
+      - name: Restore sandbox refs after A33 probes
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_GUARD_SANDBOX_ADMIN_TOKEN }}
+        run: bash ./scripts/local/registry-guard-e2e.sh cleanup
+
+  human-main-and-codeowner:
+    needs: a33-boundaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    environment:
+      name: fleet-guard-sandbox
+    steps:
+      - name: Check out the reviewed guard source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          path: guard-source
+
+      - name: Check out sandbox main as the non-exempt human
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: AtomiCloud/fleet-guard-sandbox
+          ref: main
+          fetch-depth: 0
+          path: sandbox
+          token: ${{ secrets.FLEET_GUARD_SANDBOX_HUMAN_TOKEN }}
+
+      - name: Human direct main write is rejected
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_GUARD_SANDBOX_HUMAN_TOKEN }}
+        run: bash ./guard-source/scripts/local/registry-guard-e2e.sh main-denied
+
+      - name: Registry PR blocks before code-owner review and merges after approval
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_GUARD_SANDBOX_HUMAN_TOKEN }}
+          REVIEWER_TOKEN: ${{ secrets.FLEET_GUARD_SANDBOX_REVIEWER_TOKEN }}
+          SANDBOX_REPOSITORY: AtomiCloud/fleet-guard-sandbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd sandbox
+          run_key="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          proof_path="registry/.guard-e2e/codeowner-${run_key}.txt"
+          branch="guard-e2e-codeowner-${run_key}"
+          cleanup_branch="guard-e2e-codeowner-cleanup-${run_key}"
+          git config user.name 'Fleet Guard Human Fixture'
+          git config user.email 'fleet-guard-human@atomi.cloud'
+
+          git switch -c "${branch}"
+          mkdir -p "$(dirname "${proof_path}")"
+          printf '%s\n' 'temporary CODEOWNERS proof' >"${proof_path}"
+          git add "${proof_path}"
+          git commit -m 'test: add registry code-owner proof'
+          git push origin "HEAD:refs/heads/${branch}"
+          pr="$(gh pr create --repo "${SANDBOX_REPOSITORY}" --base main --head "${branch}" --title 'test: registry code-owner gate' --body 'Temporary periodic guard proof.')"
+          number="${pr##*/}"
+          review_decision=''
+          merge_state_status=''
+          for _ in $(seq 1 20); do
+            pr_state="$(gh pr view "${number}" --repo "${SANDBOX_REPOSITORY}" --json reviewDecision,mergeStateStatus)"
+            review_decision="$(jq -r '.reviewDecision // empty' <<<"${pr_state}")"
+            merge_state_status="$(jq -r '.mergeStateStatus // empty' <<<"${pr_state}")"
+            if [ "${review_decision}" = 'REVIEW_REQUIRED' ] && [ "${merge_state_status}" = 'BLOCKED' ]; then
+              break
+            fi
+            sleep 3
+          done
+          [ "${review_decision}" = 'REVIEW_REQUIRED' ] && [ "${merge_state_status}" = 'BLOCKED' ] || {
+            echo "expected REVIEW_REQUIRED/BLOCKED before approval; got ${review_decision:-empty}/${merge_state_status:-empty}" >&2
+            exit 1
+          }
+          if gh pr merge "${number}" --repo "${SANDBOX_REPOSITORY}" --squash; then
+            echo 'registry PR merged without code-owner approval' >&2
+            exit 1
+          fi
+          GH_TOKEN="${REVIEWER_TOKEN}" gh pr review "${number}" --repo "${SANDBOX_REPOSITORY}" --approve
+          gh pr merge "${number}" --repo "${SANDBOX_REPOSITORY}" --squash --delete-branch
+
+          git fetch origin main
+          git switch -C "${cleanup_branch}" origin/main
+          git rm "${proof_path}"
+          git commit -m 'test: remove registry code-owner proof'
+          git push origin "HEAD:refs/heads/${cleanup_branch}"
+          cleanup_pr="$(gh pr create --repo "${SANDBOX_REPOSITORY}" --base main --head "${cleanup_branch}" --title 'test: clean registry code-owner proof' --body 'Cleanup for periodic guard proof.')"
+          cleanup_number="${cleanup_pr##*/}"
+          GH_TOKEN="${REVIEWER_TOKEN}" gh pr review "${cleanup_number}" --repo "${SANDBOX_REPOSITORY}" --approve
+          gh pr merge "${cleanup_number}" --repo "${SANDBOX_REPOSITORY}" --squash --delete-branch
+
+      - name: Recover a partially merged code-owner proof
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.FLEET_GUARD_SANDBOX_HUMAN_TOKEN }}
+          REVIEWER_TOKEN: ${{ secrets.FLEET_GUARD_SANDBOX_REVIEWER_TOKEN }}
+          SANDBOX_REPOSITORY: AtomiCloud/fleet-guard-sandbox
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd sandbox
+          run_key="${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          proof_path="registry/.guard-e2e/codeowner-${run_key}.txt"
+          recovery_branch="guard-e2e-codeowner-recovery-${run_key}"
+          git config user.name 'Fleet Guard Human Fixture'
+          git config user.email 'fleet-guard-human@atomi.cloud'
+          git fetch origin main
+          if git cat-file -e "origin/main:${proof_path}" 2>/dev/null; then
+            git switch -C "${recovery_branch}" origin/main
+            git rm "${proof_path}"
+            git commit -m 'test: recover registry code-owner proof cleanup'
+            git push origin "HEAD:refs/heads/${recovery_branch}"
+            recovery_pr="$(gh pr create --repo "${SANDBOX_REPOSITORY}" --base main --head "${recovery_branch}" --title 'test: recover registry code-owner proof' --body 'Always-run cleanup for a partial periodic guard proof.')"
+            recovery_number="${recovery_pr##*/}"
+            GH_TOKEN="${REVIEWER_TOKEN}" gh pr review "${recovery_number}" --repo "${SANDBOX_REPOSITORY}" --approve
+            gh pr merge "${recovery_number}" --repo "${SANDBOX_REPOSITORY}" --squash --delete-branch
+          fi
+          for head in \
+            "guard-e2e-codeowner-${run_key}" \
+            "guard-e2e-codeowner-cleanup-${run_key}" \
+            "${recovery_branch}"; do
+            number="$(gh pr list --repo "${SANDBOX_REPOSITORY}" --state open --head "${head}" --json number --jq '.[0].number // empty')"
+            if test -n "${number}"; then
+              gh pr close "${number}" --repo "${SANDBOX_REPOSITORY}" --delete-branch
+            else
+              gh api --method DELETE "repos/${SANDBOX_REPOSITORY}/git/refs/heads/${head}" >/dev/null 2>&1 || true
+            fi
+          done
+
+  platforms-only-bypass:
+    needs: human-main-and-codeowner
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    environment:
+      name: fleet-guard-sandbox
+    steps:
+      - name: Mint sandbox A20 Kargo token
+        id: a20-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          app-id: ${{ secrets.FLEET_GUARD_SANDBOX_A20_APP_ID }}
+          private-key: ${{ secrets.FLEET_GUARD_SANDBOX_A20_PRIVATE_KEY }}
+          owner: AtomiCloud
+          repositories: fleet-guard-sandbox
+          permission-contents: write
+
+      - name: Check out sandbox main with the Kargo token
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          repository: AtomiCloud/fleet-guard-sandbox
+          fetch-depth: 0
+          ref: main
+          token: ${{ steps.a20-token.outputs.token }}
+
+      - name: Prove platforms-only direct push
+        env:
+          PROOF_PATH: platforms/.guard-e2e/kargo-bypass-check.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'Fleet Guard A20 Fixture'
+          git config user.email 'fleet-guard-a20@atomi.cloud'
+          mkdir -p "$(dirname "${PROOF_PATH}")"
+          printf '%s\n' 'temporary Kargo-bypass proof' >"${PROOF_PATH}"
+          git add "${PROOF_PATH}"
+          test "$(git diff --cached --name-only)" = "${PROOF_PATH}"
+          git commit -m 'test: prove Kargo platforms bypass'
+          git push origin HEAD:main
+
+      - name: Always clean platforms-only proof
+        if: always()
+        env:
+          GH_TOKEN: ${{ steps.a20-token.outputs.token }}
+          PROOF_PATH: platforms/.guard-e2e/kargo-bypass-check.txt
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'Fleet Guard A20 Fixture'
+          git config user.email 'fleet-guard-a20@atomi.cloud'
+          cleanup_branch="guard-e2e-a20-cleanup-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          for _ in $(seq 1 5); do
+            git fetch origin main
+            git switch -C "${cleanup_branch}" origin/main
+            if ! git cat-file -e "HEAD:${PROOF_PATH}" 2>/dev/null; then
+              exit 0
+            fi
+            git rm "${PROOF_PATH}"
+            test "$(git diff --cached --name-only)" = "${PROOF_PATH}"
+            git commit -m 'test: clean Kargo bypass proof'
+            if git push origin HEAD:main; then
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "failed to clean ${PROOF_PATH} after repeated concurrent main updates" >&2
+          exit 1

@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "source": "github:NixOS/nixpkgs",
+  "channel": "nixos-26.05",
+  "release": "Yarara",
+  "rev": "4382ed2b7a6839d4280a9b386db49cbc5907414d",
+  "selectedAt": "2026-07-17T02:47:00Z",
+  "upstream": {
+    "commitDate": "2026-07-16T00:11:27Z",
+    "subject": "[Backport release-26.05] webkitgtk_6_0: 2.52.4 → 2.52.5 (#540618)"
+  },
+  "selection": {
+    "method": "Pinned the verified nixos-26.05 branch head at workspace replay time.",
+    "rationale": [
+      "The checked-in Bun/shared and Dotnet family locks disagreed, so no existing family lock was authoritative.",
+      "Selecting the current release-branch head keeps the new replay current while creating one immutable direct nixpkgs identity for every descendant.",
+      "All later diene branches must copy this revision exactly; family-local lock history is evidence only."
+    ],
+    "observedDisagreement": [
+      {
+        "family": "bun",
+        "directRev": "4062d36ebeae843c750011eef6b61ec9a9dbc9a9"
+      },
+      {
+        "family": "shared",
+        "directRev": "4062d36ebeae843c750011eef6b61ec9a9dbc9a9",
+        "note": "The input was also misnamed nixpkgs-2511."
+      },
+      {
+        "family": "dotnet",
+        "directRev": "1f01958ffb5b3545c96d9ef2f4e24c5e5e1eb846"
+      }
+    ],
+    "s2": "The atomipkgs/nix-registry v3 nested nixpkgs pin remains registry-owned and deferred under S2; direct diene inputs use this file's revision now."
+  }
+}

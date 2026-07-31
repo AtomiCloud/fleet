@@ -1,0 +1,19 @@
+# ### fleet-root
+# #### source: fleet
+version: '3'
+
+tasks:
+  lint:
+    desc: Run all repository gates
+    cmds:
+      - pre-commit run --all-files
+
+  test:
+    desc: Run the fleet product CI pyramid
+    cmds:
+      - ./scripts/ci/fleet.sh
+
+  test:fleet:
+    desc: Run the fleet product CI pyramid (contract tier)
+    cmds:
+      - ./scripts/ci/fleet.sh

@@ -1,0 +1,7 @@
+# SIT-only generator row copied into a throwaway git repo. It deliberately
+# mirrors the closed machine-written row shape without registering topology.
+platform: sitother
+service: dummy
+landscape: pichu
+pin:
+  tag: 0.1.0

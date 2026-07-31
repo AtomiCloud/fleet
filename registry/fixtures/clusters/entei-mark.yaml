@@ -1,0 +1,31 @@
+# ClusterRegistration FIXTURE — the single ENTEI v1 cluster.
+#
+# NOT A LIVE ROW; the live commit is `host-pool`'s deliverable (mark/provider
+# owner-unratified, guessing forbidden).
+#
+# Exactly ONE cluster in v1, carrying three load-bearing fields:
+#   hostRole: anonymous-vcluster-host   — it hosts anonymous eevee/castform
+#                                         vclusters, not platform workloads;
+#   originMode: loadbalancer             — it is the authoritative public-edge
+#                                         registration shape;
+#   traffic: false                      — an INVARIANT, not a default. ENTEI
+#     never joins the registered-fleet gray-zone A-set nor its S8 R53 backup
+#     mirror (T3's traffic controller excludes infrastructure-only rows). Its
+#     public LoadBalancer is reached ONLY through the hosted-development
+#     exposure materializer (goals/exposure-materializer.md).
+#
+# Flipping `traffic` to true is a rejected manifest — proven by
+# fixtures/negative/entei-traffic-true.yaml.
+apiVersion: fleet.atomi.cloud/v1alpha1
+kind: ClusterRegistration
+metadata:
+  name: 'entei-<mark>'
+  labels:
+    atomi.cloud/landscape: entei
+spec:
+  landscape: entei
+  mark: '<mark>'
+  provider: '<provider>'
+  hostRole: anonymous-vcluster-host
+  originMode: loadbalancer
+  traffic: false

@@ -1,0 +1,23 @@
+# ### workspace-ci
+# #### source: fleet
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  precommit:
+    name: Pre-Commit
+    permissions:
+      contents: read
+    uses: ./.github/workflows/⚡reusable-precommit.yaml
+    secrets: inherit
+
+  fleet:
+    name: Fleet
+    permissions:
+      contents: read
+    uses: ./.github/workflows/⚡reusable-fleet.yaml
+    secrets: inherit

@@ -1,0 +1,17 @@
+# MACHINE-WRITTEN row (stub: T3 materializer · pin: Kargo). platform: explicit (S16).
+# This row also carries a HUMAN ops-override `values:` block — the only
+# human-writable field under platforms/**. It is layered LAST over chart base +
+# landscape + cluster overlays, must survive Kargo promotion byte-for-byte, and
+# is a short-lived knob (folded back into the chart within 7 days — see
+# valuesMeta.addedAt; the persistence guardrail flags older un-folded blocks).
+platform: canary
+service: dummy
+landscape: raichu
+pin:
+  tag: 0.1.0
+valuesMeta:
+  addedAt: '2026-07-17T00:00:00Z'
+  reason: canary render exercise — scale knob demonstrating the ops-override path
+values:
+  workload:
+    replicas: 3

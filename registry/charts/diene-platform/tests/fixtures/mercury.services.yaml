@@ -1,0 +1,5 @@
+# Minimal source-C fixture for the fleet-wide webhook service Warehouse.
+platform: mercury
+services:
+  - name: webhook
+    repo: AtomiCloud/mercury.webhook

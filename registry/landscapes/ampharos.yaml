@@ -1,0 +1,25 @@
+# Landscape CR — FK anchor (T3-DESIGN.md §2). No reconciler; region immutable;
+# tier is metadata only. Human-PR-gated (registry/**, CODEOWNERS fleet-admin).
+#
+# CANONICAL SPELLING (ruled, load-bearing): `ampharos`. The segment authority
+# goals/environments.md §1 and step5-work/fold-platform/PROPAGATE-PLAN.md v4
+# both spell it `ampharos` and the segment authority overrides; ARCHITECTURE.md
+# §2 / T3-DESIGN §4's `amphoros` is a historical variant of the SAME landscape.
+# The registry-manifest gate REJECTS the stale variant in any row, envelope
+# host, cluster name, label, or path.
+#
+# USER-RULED (2026-07-29): `spec.region` is `us-west-2`. The owner first chose
+# N. California, then knowingly changed to US West (Oregon) after the caveat
+# check proved Neon does not serve `us-west-1`. This preserves future Neon
+# availability for Ampharos and supersedes the pre-ruling `eu-central-1`, which
+# was both an unsupported guess and inconsistent with the ratified production-US
+# identity. The field is immutable; never change it by inference.
+apiVersion: fleet.atomi.cloud/v1alpha1
+kind: Landscape
+metadata:
+  name: ampharos
+  labels:
+    atomi.cloud/landscape: ampharos
+spec:
+  region: us-west-2
+  tier: prod

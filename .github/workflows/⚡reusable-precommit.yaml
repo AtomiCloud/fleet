@@ -1,0 +1,18 @@
+# ### workspace-reusable-precommit
+# #### source: workspace
+name: ⚡ Reusable Pre-Commit
+
+on:
+  workflow_call:
+
+jobs:
+  precommit:
+    name: Pre-Commit
+    runs-on:
+      - nscloud-ubuntu-22.04-amd64-4x8-with-cache
+      - nscloud-cache-size-50gb
+      - nscloud-cache-tag-atomi-nix-store-cache-linux-amd64
+    steps:
+      - uses: AtomiCloud/actions.setup-nix@v3
+      - name: Run pre-commit
+        run: nix develop .#ci -c ./scripts/ci/pre-commit.sh

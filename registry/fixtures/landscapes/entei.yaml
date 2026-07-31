@@ -1,0 +1,31 @@
+# Landscape FIXTURE — the ONE registered infrastructure-only HOST landscape.
+#
+# NOT A LIVE ROW, and fleet must never commit one. Ownership is split:
+#   * fleet   defines the row SHAPE (this fixture) + the review gate + the
+#             exclusion negatives;
+#   * host-pool owns the LIVE registry/landscapes/entei.yaml commit.
+# ENTEI's concrete `spec.region` is owner-unratified and the recorded topology
+# ruling FORBIDS guessing it (goals/host-pool.md; the 2026-07-28 ruling settled
+# the eight-landscape MODEL, not ENTEI's provider coordinates).
+#
+# `purpose: infrastructure-only` is the load-bearing field: it is the shared
+# substrate for eevee and castform vclusters, registered for provisioning,
+# inventory, upgrade and recovery ONLY — never a workload target
+# (ARCHITECTURE.md §2, ENV-SPEC §0.3). Platform materialization, replicated
+# delivery membership, and the canary platform's declared landscape set all
+# EXCLUDE rows carrying it, so `entei` never receives platform rows, dependency
+# fan-out, fleet Logto, or workload seeds.
+#
+# The exclusion is asserted on `purpose`/`hostRole`, NEVER on the literal name
+# `entei` — see fixtures/negative/second-infrastructure-*.yaml, which must be
+# excluded identically under a different name.
+apiVersion: fleet.atomi.cloud/v1alpha1
+kind: Landscape
+metadata:
+  name: entei
+  labels:
+    atomi.cloud/landscape: entei
+spec:
+  region: '<RATIFIED-HOST-REGION>'
+  tier: dev
+  purpose: infrastructure-only

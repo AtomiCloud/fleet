@@ -1,0 +1,31 @@
+{
+  "name": "machinery-stable-create-update",
+  "target": "tag",
+  "enforcement": "active",
+  "bypass_actors": [
+    {
+      "actor_id": ${FLEET_ADMIN_TEAM_ACTOR_ID},
+      "actor_type": "Team",
+      "bypass_mode": "always"
+    },
+    {
+      "actor_id": ${MACHINERY_TAG_MOVER_APP_ID},
+      "actor_type": "Integration",
+      "bypass_mode": "always"
+    }
+  ],
+  "conditions": {
+    "ref_name": {
+      "include": ["refs/tags/machinery-stable"],
+      "exclude": []
+    }
+  },
+  "rules": [
+    {
+      "type": "creation"
+    },
+    {
+      "type": "update"
+    }
+  ]
+}

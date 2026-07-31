@@ -1,0 +1,16 @@
+# SIT-only discriminating cluster fixture. Its landscape has a real canary row,
+# so the ApplicationSet would target it if the cluster-role exclusion vanished.
+# It is copied only into an ephemeral Argo cluster Secret; it is not registry
+# topology and never reaches a live registry path.
+apiVersion: fleet.atomi.cloud/v1alpha1
+kind: ClusterRegistration
+metadata:
+  name: ampharos-infrastructure-sit
+  labels:
+    atomi.cloud/landscape: ampharos
+spec:
+  landscape: ampharos
+  mark: infrastructure-sit
+  provider: sit-provider
+  hostRole: anonymous-vcluster-host
+  traffic: false

@@ -1,0 +1,8 @@
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Promotion
+metadata:
+  generateName: fleet-sit-
+  namespace: <namespace>
+spec:
+  stage: <stage>
+  freight: <freight>
