@@ -3158,21 +3158,307 @@ PPVTUPLES
     fail 'the exact post-Promotion tuple guard no longer covers all fifteen runtime edges'
   sed -n '/^kargo_runtime_trace_wall_clock_soak() {$/,/^}$/p' "${ppv_source}" \
     >"${tmp}/ppv-soak-function.sh"
+  [ "$(tail -n 1 "${tmp}/ppv-soak-function.sh")" = '}' ] ||
+    fail 'the extracted wall-clock soak function is unterminated'
   awk '
-    /real wall-clock lower bound before 90s/ { unrefreshed = 1; next }
-    unrefreshed && /kargo_refresh_stage/ { exit 1 }
-    unrefreshed && /kargo_wait_promotion_succeeded/ {
-      wait = NR
-      unrefreshed = 0
+    {
+      line = $0
+      sub(/[[:space:]]*\\[[:space:]]*$/, "", line)
+      logical = (logical == "" ? line : logical " " line)
+      if ($0 ~ /\\[[:space:]]*$/) next
+      print logical
+      logical = ""
     }
-    wait && /promotion_epoch.*-ge.*lower_bound/ { lower = NR }
-    lower && /elapsed.*-le 180/ { upper = NR }
-    upper && /kargo_drive_post_promotion_verification/ { driver = NR }
+  ' "${tmp}/ppv-soak-function.sh" >"${tmp}/ppv-soak-logical.sh"
+
+  ppv_soak_ordering_contract() {
+    awk '
+      index($0, "lower_bound=$((since_epoch + 90))") { lower_bound = NR; lower_count++ }
+      /^[[:space:]]+kargo_seed_freight / { seed_count++ }
+      /^[[:space:]]+kargo_create_manual_promotion / { manual = NR; manual_count++ }
+      /^[[:space:]]+kargo_refresh_stage(_recorded)? / &&
+          index($0, "\"${ampharos}\"") {
+        refresh_count++
+        if (index($0, "kargo-runtime-soak-pre-boundary-refresh.json")) {
+          pre_refresh = NR
+          pre_refresh_count++
+        } else if (index($0, "kargo-runtime-soak-post-boundary-refresh.json")) {
+          post_refresh = NR
+          post_refresh_count++
+        } else {
+          unexpected_refresh = 1
+        }
+      }
+      /^[[:space:]]+kargo_assert_no_promotion_for 12 / &&
+          index($0, "kargo-runtime-soak-early-hold.json") { hold = NR; hold_count++ }
+      /^[[:space:]]+kargo_capture_promotion_denial / &&
+          index($0, "kargo-runtime-soak-early-denial.json") { denial = NR; denial_count++ }
+      /^[[:space:]]+kargo_wait_wall_clock_boundary / &&
+          index($0, "kargo-runtime-soak-boundary-wait.json") { boundary = NR; boundary_count++ }
+      /^[[:space:]]+kargo_capture_soak_pre_stimulus / &&
+          index($0, "kargo-runtime-soak-pre-stimulus.json") { snapshot = NR; snapshot_count++ }
+      /^[[:space:]]+kargo_capture_promotion_dry_run_acceptance / &&
+          index($0, "kargo-runtime-soak-ampharos-available-dry-run.json") {
+        dry_run = NR
+        dry_run_count++
+      }
+      /^[[:space:]]+kargo_wait_promotion_succeeded / &&
+          index($0, "kargo-runtime-soak-ampharos-promotion.json") { wait = NR; wait_count++ }
+      /promotion_epoch.*-ge.*lower_bound/ { lower_assertion = NR; lower_assertion_count++ }
+      /elapsed.*-le 180/ { upper_assertion = NR; upper_assertion_count++ }
+      /^[[:space:]]+kargo_drive_post_promotion_verification / &&
+          index($0, "kargo-runtime-soak-ampharos-promotion.json") { driver = NR; driver_count++ }
+      /^[[:space:]]+kargo_wait_git_tag / && index($0, "ampharos") { git_oracle = NR; git_count++ }
+      /^[[:space:]]+kargo_capture_current_analysis_run / &&
+          index($0, "${ampharos}") { analysis = NR; analysis_count++ }
+      END {
+        if (lower_count != 1 || seed_count != 1 || manual_count != 1 ||
+            refresh_count != 2 || pre_refresh_count != 1 || post_refresh_count != 1 ||
+            hold_count != 1 || denial_count != 1 || boundary_count != 1 ||
+            snapshot_count != 1 || dry_run_count != 1 || wait_count != 1 ||
+            lower_assertion_count != 1 || upper_assertion_count != 1 ||
+            driver_count != 1 || git_count != 1 || analysis_count != 1 ||
+            unexpected_refresh) exit 1
+        if (!(manual < lower_bound && lower_bound < pre_refresh &&
+              pre_refresh < hold && hold < denial && denial < boundary &&
+              boundary < snapshot && snapshot < dry_run && dry_run < post_refresh &&
+              post_refresh < wait && wait < lower_assertion &&
+              lower_assertion < upper_assertion && upper_assertion < driver &&
+              driver < git_oracle && git_oracle < analysis)) exit 1
+      }
+    ' "$1"
+  }
+  ppv_soak_ordering_contract "${tmp}/ppv-soak-logical.sh" ||
+    fail 'the soak path lost its strict deny-boundary-snapshot-admit-refresh-wait ordering'
+
+  # Controlled negative: the previous no-post-boundary-stimulus shape must be
+  # rejected by the same production-byte ordering contract.
+  sed '/^[[:space:]]*kargo_refresh_stage_recorded .*kargo-runtime-soak-post-boundary-refresh.json/d' \
+    "${tmp}/ppv-soak-logical.sh" >"${tmp}/ppv-soak-no-post-refresh.sh"
+  ! cmp -s "${tmp}/ppv-soak-logical.sh" "${tmp}/ppv-soak-no-post-refresh.sh" ||
+    fail 'the no-post-boundary-refresh negative did not mutate the controlled source'
+  if ppv_soak_ordering_contract "${tmp}/ppv-soak-no-post-refresh.sh"; then
+    fail 'the soak ordering contract accepted the old no-post-boundary-refresh sequence'
+  fi
+
+  # The soak function may only observe state and invoke the named helpers. It
+  # must never manufacture eligibility, status, policy, Freight, or Promotion
+  # state, nor replace the boundary predicate with an in-function sleep.
+  if rg -qi '^[[:space:]]*sleep([[:space:]]|$)|kargo_backdate_freight_stage|--subresource[= ]status|kubectl .*\b(apply|create|delete|patch|replace)\b|projectconfig|promotionpolicies' \
+    "${tmp}/ppv-soak-logical.sh"; then
+    fail 'the wall-clock soak function fabricates state or sleeps instead of using the persisted boundary'
+  fi
+  # shellcheck disable=SC2016 # literal shell/jq bytes from the extracted source
+  for ppv_persisted_boundary_contract in \
+    'since="$(kubectl -n "${project}" get freight "${freight}" -o json |' \
+    'jq -r --arg stage "${pikachu}" '\''.status.currentlyIn[$stage].since'\'')"' \
+    'since_epoch="$(date -u -d "${since}" +%s)"' \
+    'lower_bound=$((since_epoch + 90))' \
+    'kargo_wait_wall_clock_boundary "${since}" "${lower_bound}"' \
+    '"${since}" "${lower_bound}" "${pre_boundary_token}"'; do
+    rg -qF "${ppv_persisted_boundary_contract}" "${tmp}/ppv-soak-logical.sh" ||
+      fail "the soak path is no longer bound to persisted Pikachu since: ${ppv_persisted_boundary_contract}"
+  done
+
+  for ppv_soak_fn in \
+    kargo_refresh_stage_recorded \
+    kargo_wait_wall_clock_boundary \
+    kargo_capture_soak_pre_stimulus \
+    kargo_capture_promotion_dry_run_acceptance \
+    kargo_capture_promotion_denial \
+    kargo_assert_no_promotion_for \
+    kargo_wait_promotion_succeeded; do
+    sed -n "/^${ppv_soak_fn}() {$/,/^}$/p" "${ppv_source}" \
+      >"${tmp}/ppv-${ppv_soak_fn}.sh"
+    [ "$(tail -n 1 "${tmp}/ppv-${ppv_soak_fn}.sh")" = '}' ] ||
+      fail "the extracted ${ppv_soak_fn}() body is unterminated"
+  done
+  awk '
+    {
+      line = $0
+      sub(/[[:space:]]*\\[[:space:]]*$/, "", line)
+      logical = (logical == "" ? line : logical " " line)
+      if ($0 ~ /\\[[:space:]]*$/) next
+      print logical
+      logical = ""
+    }
+  ' "${tmp}/ppv-kargo_refresh_stage_recorded.sh" \
+    >"${tmp}/ppv-recorded-refresh-logical.sh"
+  awk '
+    /previous_token="\$\(kubectl/ { previous = NR }
+    /kubectl .* annotate stage/ { annotate = NR }
+    /sit_wait_for 90 .*kargo_check_refresh_handled/ { wait = NR }
+    /last_handled_refresh="\$\(kubectl/ { handled = NR }
+    /\[ "\$\{last_handled_refresh\}" = "\$\{token\}" \]/ { assertion = NR }
+    /acknowledged_at="\$\(sit_now\)"/ { acknowledged = NR }
     END {
-      if (!wait || !lower || !upper || !driver || !(wait < lower && lower < upper && upper < driver)) exit 1
+      if (!previous || !annotate || !wait || !handled || !assertion || !acknowledged ||
+          !(previous < annotate && annotate < wait && wait < handled &&
+            handled < assertion && assertion < acknowledged)) exit 1
     }
-  ' "${tmp}/ppv-soak-function.sh" ||
-    fail 'the soak path refreshes before eligibility or drives verification before both wall-clock bounds'
+  ' "${tmp}/ppv-recorded-refresh-logical.sh" ||
+    fail 'the recorded Stage refresh does not order previous-token capture, annotation, acknowledgement, and evidence'
+  if ! rg -qF 'token="fleet-sit-$(sit_epoch)-$$-${RANDOM}"' \
+    "${tmp}/ppv-recorded-refresh-logical.sh" ||
+    ! rg -q 'previous_token=.*status\.lastHandledRefresh' \
+      "${tmp}/ppv-recorded-refresh-logical.sh" ||
+    ! rg -q 'sit_wait_for 90 .*kargo_check_refresh_handled .*"\$\{token\}"' \
+      "${tmp}/ppv-recorded-refresh-logical.sh" ||
+    ! rg -q 'last_handled_refresh=.*status\.lastHandledRefresh' \
+      "${tmp}/ppv-recorded-refresh-logical.sh" ||
+    ! rg -qF '[ "${last_handled_refresh}" = "${token}" ]' \
+      "${tmp}/ppv-recorded-refresh-logical.sh"; then
+    fail 'the recorded Stage refresh no longer proves a unique token and lastHandledRefresh acknowledgement'
+  fi
+  # shellcheck disable=SC2016 # literal jq fields from the extracted source
+  for ppv_refresh_field in \
+    'token:$token' 'previousToken:$previousToken' \
+    'annotatedAt:$annotatedAt' 'annotatedEpoch:$annotatedEpoch' \
+    'acknowledgedAt:$acknowledgedAt' 'acknowledgedEpoch:$acknowledgedEpoch' \
+    'lastHandledRefresh:$lastHandledRefresh'; do
+    rg -qF "${ppv_refresh_field}" "${tmp}/ppv-kargo_refresh_stage_recorded.sh" ||
+      fail "the recorded Stage refresh omits ${ppv_refresh_field}"
+  done
+
+  if ! rg -qF 'while [ "${current_epoch}" -lt "${lower_bound}" ]' \
+    "${tmp}/ppv-kargo_wait_wall_clock_boundary.sh" ||
+    ! rg -qF 'current_epoch="$(sit_epoch)"' \
+      "${tmp}/ppv-kargo_wait_wall_clock_boundary.sh" ||
+    ! rg -qF 'deadline=$((started_monotonic + remaining + 30))' \
+      "${tmp}/ppv-kargo_wait_wall_clock_boundary.sh" ||
+    ! rg -qF '[ "${sleep_s}" -le 2 ] || sleep_s=2' \
+      "${tmp}/ppv-kargo_wait_wall_clock_boundary.sh" ||
+    ! rg -qF 'finishedEpoch:$finishedEpoch' \
+      "${tmp}/ppv-kargo_wait_wall_clock_boundary.sh"; then
+    fail 'the wall-clock helper is not a bounded predicate over the persisted epoch'
+  fi
+  if rg -q "sleep[[:space:]]+(['\"]?90['\"]?|.*lower_bound)|sleep_s=90" \
+    "${tmp}/ppv-kargo_wait_wall_clock_boundary.sh"; then
+    fail 'the wall-clock helper replaced boundary polling with a hard-coded soak sleep'
+  fi
+
+  awk '
+    {
+      line = $0
+      sub(/[[:space:]]*\\[[:space:]]*$/, "", line)
+      logical = (logical == "" ? line : logical " " line)
+      if ($0 ~ /\\[[:space:]]*$/) next
+      print logical
+      logical = ""
+    }
+  ' "${tmp}/ppv-kargo_capture_soak_pre_stimulus.sh" \
+    >"${tmp}/ppv-soak-snapshot-logical.sh"
+
+  if rg -qi 'kubectl .*\b(annotate|apply|create|delete|patch|replace)\b|kargo_refresh_stage|kargo_backdate_freight_stage|--subresource[= ]status|projectconfig|promotionpolicies|kargo_seed_freight|kargo_create_manual_promotion' \
+    "${tmp}/ppv-soak-snapshot-logical.sh"; then
+    fail 'the pre-stimulus snapshot is not read-only'
+  fi
+  if rg -qi 'kubectl .*\b(annotate|apply|create|delete|patch|replace)\b|kargo_refresh_stage|kargo_backdate_freight_stage|--subresource[= ]status|projectconfig|promotionpolicies|kargo_seed_freight|kargo_create_manual_promotion' \
+    "${tmp}/ppv-kargo_wait_wall_clock_boundary.sh"; then
+    fail 'the wall-clock boundary helper manufactures eligibility or state'
+  fi
+  if rg -qi 'kubectl .*\b(apply|create|delete|patch|replace)\b|kargo_backdate_freight_stage|--subresource[= ]status|projectconfig|promotionpolicies|kargo_seed_freight|kargo_create_manual_promotion' \
+    "${tmp}/ppv-recorded-refresh-logical.sh"; then
+    fail 'the recorded refresh helper performs state changes beyond its supported annotation'
+  fi
+  # shellcheck disable=SC2016 # literal jq predicates from the extracted source
+  for ppv_snapshot_contract in \
+    '.capturedEpoch >= .lowerBoundEpoch' \
+    '.expectedPikachuSince == $since and .persistedPikachuSince == $since' \
+    '(.residency.pikachu.since // "") == $since' \
+    '(.residency.raichu.since // "") != ""' \
+    '(.verification.pikachu.verifiedAt // "") != ""' \
+    '(.verification.raichu.verifiedAt // "") != ""' \
+    '.autoPromotionEnabled == true' \
+    '.lastHandledRefresh == $token' \
+    '.promotionCount == 0 and (.ampharosPromotions | length) == 0'; do
+    rg -qF "${ppv_snapshot_contract}" \
+      "${tmp}/ppv-kargo_capture_soak_pre_stimulus.sh" ||
+      fail "the pre-stimulus snapshot lost contract ${ppv_snapshot_contract}"
+  done
+  rg -q 'kubectl create --dry-run=server ' \
+    "${tmp}/ppv-kargo_capture_promotion_dry_run_acceptance.sh" ||
+    fail 'the post-boundary admission proof is not a server-side dry run'
+  rg -q 'admitted:true,serverSide:true' \
+    "${tmp}/ppv-kargo_capture_promotion_dry_run_acceptance.sh" ||
+    fail 'the server-side dry-run artifact no longer records successful admission'
+  [ "$(rg -c 'kubectl create ' \
+    "${tmp}/ppv-kargo_capture_promotion_dry_run_acceptance.sh")" -eq 1 ] ||
+    fail 'the admission helper contains a Promotion create beyond its one server-side dry run'
+  if rg -q 'kubectl .*\b(annotate|apply|delete|patch|replace)\b|kargo_refresh_stage' \
+    "${tmp}/ppv-kargo_capture_promotion_dry_run_acceptance.sh"; then
+    fail 'the admission helper mutates state outside its server-side dry run'
+  fi
+  if ! rg -q 'kubectl create -f ' \
+    "${tmp}/ppv-kargo_capture_promotion_denial.sh" ||
+    rg -q -- '--dry-run' "${tmp}/ppv-kargo_capture_promotion_denial.sh" ||
+    ! rg -qF '[ "${status}" -ne 0 ] ||' \
+      "${tmp}/ppv-kargo_capture_promotion_denial.sh" ||
+    ! rg -qF "rg -F 'Freight is not available to this Stage'" \
+      "${tmp}/ppv-kargo_capture_promotion_denial.sh" ||
+    ! rg -q 'admitted:false' \
+      "${tmp}/ppv-kargo_capture_promotion_denial.sh"; then
+    fail 'the pre-boundary negative is no longer a real webhook denial with pinned text'
+  fi
+  [ "$(rg -c 'kubectl create ' \
+    "${tmp}/ppv-kargo_capture_promotion_denial.sh")" -eq 1 ] ||
+    fail 'the denial helper contains a Promotion create beyond its one rejected request'
+  if rg -q 'kubectl .*\b(annotate|apply|delete|patch|replace)\b|kargo_refresh_stage' \
+    "${tmp}/ppv-kargo_capture_promotion_denial.sh"; then
+    fail 'the pre-boundary denial helper mutates state beyond its rejected Promotion request'
+  fi
+  if ! rg -qF 'deadline=$((SECONDS + duration_s))' \
+    "${tmp}/ppv-kargo_assert_no_promotion_for.sh" ||
+    ! rg -qF 'while [ "${SECONDS}" -lt "${deadline}" ]' \
+      "${tmp}/ppv-kargo_assert_no_promotion_for.sh" ||
+    ! rg -qF 'count="$(kargo_promotion_count' \
+      "${tmp}/ppv-kargo_assert_no_promotion_for.sh" ||
+    ! rg -qF 'promotionCount:0' \
+      "${tmp}/ppv-kargo_assert_no_promotion_for.sh"; then
+    fail 'the 12-second pre-boundary hold no longer proves zero Promotions for its full duration'
+  fi
+  if rg -qi 'kubectl .*\b(annotate|apply|create|delete|patch|replace)\b|kargo_refresh_stage|kargo_backdate_freight_stage|--subresource[= ]status|projectconfig|promotionpolicies' \
+    "${tmp}/ppv-kargo_assert_no_promotion_for.sh"; then
+    fail 'the pre-boundary no-Promotion hold mutates the state it observes'
+  fi
+  rg -q 'sit_wait_for 240 ' "${tmp}/ppv-kargo_wait_promotion_succeeded.sh" ||
+    fail 'the Promotion success wait no longer retains its literal 240-second budget'
+  if rg -qi 'kubectl .*\b(annotate|apply|create|delete|patch|replace)\b|kargo_refresh_stage|kargo_backdate_freight_stage|--subresource[= ]status|projectconfig|promotionpolicies' \
+    "${tmp}/ppv-kargo_wait_promotion_succeeded.sh"; then
+    fail 'the bounded Promotion wait mutates the Stage or eligibility state it observes'
+  fi
+
+  # shellcheck disable=SC2016 # literal jq predicates from the extracted source
+  for ppv_post_refresh_contract in \
+    '.token != $previousToken and .previousToken == $previousToken' \
+    '.lastHandledRefresh == .token' \
+    '(.annotatedAt | fromdateiso8601) == .annotatedEpoch' \
+    '(.acknowledgedAt | fromdateiso8601) == .acknowledgedEpoch' \
+    '.annotatedEpoch >= $lowerBoundEpoch' \
+    '.acknowledgedEpoch >= $lowerBoundEpoch' \
+    '$dryRun[0].fleetSitDryRun.admittedEpoch <= .annotatedEpoch'; do
+    rg -qF "${ppv_post_refresh_contract}" "${tmp}/ppv-soak-function.sh" ||
+      fail "the post-boundary refresh lost contract ${ppv_post_refresh_contract}"
+  done
+  for ppv_soak_evidence in \
+    kargo-runtime-soak-pre-boundary-refresh.json \
+    kargo-runtime-soak-boundary-wait.json \
+    kargo-runtime-soak-pre-stimulus.json \
+    kargo-runtime-soak-ampharos-available-dry-run.json \
+    kargo-runtime-soak-post-boundary-refresh.json; do
+    sed -n "/sit_leg_begin 'L9-kargo-v1-runtime'/,/run_kargo_runtime_leg/p" \
+      "${ppv_source}" | rg -qF "${ppv_soak_evidence}" ||
+      fail "the L9 evidence declaration omits ${ppv_soak_evidence}"
+  done
+  sed -n '/^run_kargo_runtime_leg() {$/,/^}$/p' "${ppv_source}" \
+    >"${tmp}/ppv-runtime-leg.sh"
+  awk '
+    /kargo_runtime_trace_wall_clock_soak/ { soak = NR }
+    /kargo_runtime_finalize_git_oracle/ { oracle = NR }
+    /kargo_runtime_collect_logs/ { logs = NR }
+    END { if (!soak || !oracle || !logs || !(soak < oracle && oracle < logs)) exit 1 }
+  ' "${tmp}/ppv-runtime-leg.sh" ||
+    fail 'the repaired soak no longer flows through the unchanged git oracle and log capture'
   ! rg -q '\.status\.freightHistory\[0\]' "${ppv_source}" ||
     fail 'the F2 reverify path still uses freightHistory[0] identity'
   ! rg -q 'kargo_wait_verification_phase|kargo_drive_stage_reconciliation' "${ppv_source}" ||
@@ -3189,10 +3475,42 @@ PPVTUPLES
     kargo-runtime-canary-promotions-final.json \
     kargo-runtime-canary-analysisruns-final.json \
     kargo-runtime-canary-events-final.json \
-    kargo-runtime-canary-analysis-outcomes-final.json; do
+    kargo-runtime-canary-analysis-outcomes-final.json \
+    kargo-runtime-canary-sitsoak-stages-final.json \
+    kargo-runtime-canary-sitsoak-freight-final.json \
+    kargo-runtime-canary-sitsoak-promotions-final.json \
+    kargo-runtime-canary-sitsoak-analysisruns-final.json \
+    kargo-runtime-canary-sitsoak-events-final.json \
+    kargo-runtime-canary-sitsoak-analysis-outcomes-final.json; do
     rg -qF "${fallback}" "${ppv_source}" ||
       fail "final failure fallback omits ${fallback}"
   done
+  sed -n '/^collect_final_evidence() {$/,/^}$/p' "${ppv_source}" \
+    >"${tmp}/ppv-final-evidence.sh"
+  awk '
+    {
+      line = $0
+      sub(/[[:space:]]*\\[[:space:]]*$/, "", line)
+      logical = (logical == "" ? line : logical " " line)
+      if ($0 ~ /\\[[:space:]]*$/) next
+      print logical
+      logical = ""
+    }
+  ' "${tmp}/ppv-final-evidence.sh" >"${tmp}/ppv-final-evidence-logical.sh"
+  for fallback_capture in \
+    'canary-sitsoak stages.kargo.akuity.io .*kargo_final_paths\[6\]' \
+    'canary-sitsoak freight.kargo.akuity.io .*kargo_final_paths\[7\]' \
+    'canary-sitsoak promotions.kargo.akuity.io .*kargo_final_paths\[8\]' \
+    'canary-sitsoak analysisruns.argoproj.io .*kargo_final_paths\[9\]' \
+    'canary-sitsoak events .*kargo_final_paths\[10\]' \
+    'canary-sitsoak configmap/kargo-analysis-outcomes .*kargo_final_paths\[11\]'; do
+    rg -q "kargo_capture_json_evidence ${fallback_capture}" \
+      "${tmp}/ppv-final-evidence-logical.sh" ||
+      fail "final failure fallback does not capture ${fallback_capture}"
+  done
+  rg -qF 'SIT_LEG_EVIDENCE+=("${kargo_final_paths[@]}")' \
+    "${tmp}/ppv-final-evidence.sh" ||
+    fail 'the final canary and canary-sitsoak captures are not declared on L9 failure'
   sed -n '/^on_error() {$/,/^}$/p' "${ppv_source}" >"${tmp}/ppv-on-error.sh"
   awk '
     /collect_final_evidence/ { collect = NR }
@@ -3208,7 +3526,7 @@ PPVTUPLES
     ! rg -q 'error_lines=.*BASH_LINENO' "${ppv_source}"; then
     fail 'last-error diagnostics do not retain the Bash call stack'
   fi
-  echo '  all 15 runtime edges, distinct reverify, unrefreshed soak ordering, outcome captures, and final fallbacks are source-guarded ✓'
+  echo '  all 15 runtime edges, distinct reverify, causal soak ordering, outcome captures, and both project fallbacks are source-guarded ✓'
   ;;
 guard)
   bash ./scripts/validate/registry-guard.sh

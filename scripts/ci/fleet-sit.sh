@@ -2333,6 +2333,52 @@ kargo_refresh_stage_quiet() {
   done
 }
 
+# Record both sides of the supported Stage refresh contract: the unique
+# annotation token written by the driver and the same token acknowledged in
+# status.lastHandledRefresh by the released controller.
+kargo_refresh_stage_recorded() {
+  local project="$1"
+  local stage="$2"
+  local output="$3"
+  local token previous_token annotated_at annotated_epoch
+  local acknowledged_at acknowledged_epoch last_handled_refresh
+  token="fleet-sit-$(sit_epoch)-$$-${RANDOM}"
+  previous_token="$(kubectl -n "${project}" get stage "${stage}" \
+    -o jsonpath='{.status.lastHandledRefresh}')"
+  annotated_at="$(sit_now)"
+  annotated_epoch="$(date -u -d "${annotated_at}" +%s)"
+  kubectl -n "${project}" annotate stage "${stage}" \
+    "kargo.akuity.io/refresh=${token}" --overwrite >/dev/null
+  sit_wait_for 90 "Kargo Stage ${project}/${stage} to handle refresh ${token}" \
+    kargo_check_refresh_handled "${project}" "${stage}" "${token}"
+  last_handled_refresh="$(kubectl -n "${project}" get stage "${stage}" \
+    -o jsonpath='{.status.lastHandledRefresh}')"
+  [ "${last_handled_refresh}" = "${token}" ] ||
+    sit_fail "Kargo Stage ${project}/${stage} did not persist refresh acknowledgement ${token}"
+  acknowledged_at="$(sit_now)"
+  acknowledged_epoch="$(date -u -d "${acknowledged_at}" +%s)"
+  [ "${acknowledged_epoch}" -ge "${annotated_epoch}" ] ||
+    sit_fail "Kargo Stage ${project}/${stage} refresh acknowledgement predates its annotation"
+  jq -n \
+    --arg project "${project}" \
+    --arg stage "${stage}" \
+    --arg token "${token}" \
+    --arg previousToken "${previous_token}" \
+    --arg annotatedAt "${annotated_at}" \
+    --argjson annotatedEpoch "${annotated_epoch}" \
+    --arg acknowledgedAt "${acknowledged_at}" \
+    --argjson acknowledgedEpoch "${acknowledged_epoch}" \
+    --arg lastHandledRefresh "${last_handled_refresh}" '
+      {
+        schemaVersion:1,project:$project,stage:$stage,
+        token:$token,previousToken:$previousToken,
+        annotatedAt:$annotatedAt,annotatedEpoch:$annotatedEpoch,
+        acknowledgedAt:$acknowledgedAt,acknowledgedEpoch:$acknowledgedEpoch,
+        lastHandledRefresh:$lastHandledRefresh
+      }
+    ' >"${output}"
+}
+
 kargo_check_promotion_succeeded() {
   local project="$1"
   local stage="$2"
@@ -3162,6 +3208,139 @@ kargo_assert_no_promotion_for() {
     ' >"${output}"
 }
 
+# Wait for the boundary derived from a persisted Freight residency timestamp.
+# The real UTC clock is the gate; the monotonic deadline only prevents a clock
+# anomaly from hanging the leg indefinitely.
+kargo_wait_wall_clock_boundary() {
+  local since="$1"
+  local lower_bound="$2"
+  local reason="$3"
+  local output="$4"
+  local started_at started_epoch started_monotonic remaining deadline
+  local current_epoch now_monotonic sleep_s finished_at finished_epoch
+  [[ ${lower_bound} =~ ^[0-9]+$ ]] || {
+    sit_fail "wall-clock lower bound is not an unsigned epoch: ${lower_bound}"
+    return 1
+  }
+  started_at="$(sit_now)"
+  started_epoch="$(date -u -d "${started_at}" +%s)"
+  started_monotonic="$(kargo_monotonic_now)"
+  remaining=$((lower_bound - started_epoch))
+  [ "${remaining}" -gt 0 ] || remaining=0
+  deadline=$((started_monotonic + remaining + 30))
+  current_epoch="${started_epoch}"
+  while [ "${current_epoch}" -lt "${lower_bound}" ]; do
+    now_monotonic="$(kargo_monotonic_now)"
+    if [ "${now_monotonic}" -ge "${deadline}" ]; then
+      sit_fail "timed out waiting for ${reason} at epoch ${lower_bound}"
+      return 1
+    fi
+    sleep_s=$((lower_bound - current_epoch))
+    [ "${sleep_s}" -le 2 ] || sleep_s=2
+    sleep "${sleep_s}"
+    current_epoch="$(sit_epoch)"
+  done
+  finished_at="$(sit_now)"
+  finished_epoch="$(date -u -d "${finished_at}" +%s)"
+  [ "${finished_epoch}" -ge "${lower_bound}" ] ||
+    sit_fail "wall clock moved behind ${reason} after reaching epoch ${lower_bound}"
+  jq -n \
+    --arg promotionTimeSince "${since}" \
+    --arg reason "${reason}" \
+    --arg startedAt "${started_at}" \
+    --argjson startedEpoch "${started_epoch}" \
+    --arg finishedAt "${finished_at}" \
+    --argjson finishedEpoch "${finished_epoch}" \
+    --argjson lowerBoundEpoch "${lower_bound}" \
+    --argjson waitedSeconds "$((finished_epoch - started_epoch))" '
+      {
+        schemaVersion:1,promotionTimeSince:$promotionTimeSince,reason:$reason,
+        lowerBoundEpoch:$lowerBoundEpoch,
+        startedAt:$startedAt,startedEpoch:$startedEpoch,
+        finishedAt:$finishedAt,finishedEpoch:$finishedEpoch,
+        waitedSeconds:$waitedSeconds
+      }
+    ' >"${output}"
+}
+
+# Take the last mutation-free read before probing admission and issuing the
+# post-boundary wake-up. The snapshot binds the original residency clock, both
+# upstream memberships/verifications, policy, Promotion absence, and the
+# previously acknowledged refresh token into one artifact.
+kargo_capture_soak_pre_stimulus() {
+  local project="$1"
+  local ampharos="$2"
+  local pikachu="$3"
+  local raichu="$4"
+  local freight="$5"
+  local expected_since="$6"
+  local lower_bound="$7"
+  local pre_boundary_token="$8"
+  local output="$9"
+  local freight_snapshot="${KARGO_RUNTIME_DIR}/soak-pre-stimulus-freight.json"
+  local stage_snapshot="${KARGO_RUNTIME_DIR}/soak-pre-stimulus-stage.json"
+  local promotions_snapshot="${KARGO_RUNTIME_DIR}/soak-pre-stimulus-promotions.json"
+  local captured_at captured_epoch
+  kubectl -n "${project}" get freight "${freight}" -o json >"${freight_snapshot}"
+  kubectl -n "${project}" get stage "${ampharos}" -o json >"${stage_snapshot}"
+  kubectl -n "${project}" get promotions.kargo.akuity.io -o json \
+    >"${promotions_snapshot}"
+  captured_at="$(sit_now)"
+  captured_epoch="$(date -u -d "${captured_at}" +%s)"
+  jq -n \
+    --arg project "${project}" \
+    --arg stage "${ampharos}" \
+    --arg freightName "${freight}" \
+    --arg pikachu "${pikachu}" \
+    --arg raichu "${raichu}" \
+    --arg expectedSince "${expected_since}" \
+    --arg preBoundaryRefreshToken "${pre_boundary_token}" \
+    --arg capturedAt "${captured_at}" \
+    --argjson capturedEpoch "${captured_epoch}" \
+    --argjson lowerBoundEpoch "${lower_bound}" \
+    --slurpfile freight "${freight_snapshot}" \
+    --slurpfile ampharosStage "${stage_snapshot}" \
+    --slurpfile promotions "${promotions_snapshot}" '
+      ($freight[0]) as $freightObject |
+      ($ampharosStage[0]) as $stageObject |
+      ([$promotions[0].items[]? | select(.spec.stage == $stage)]) as $ampharosPromotions |
+      {
+        schemaVersion:1,project:$project,stage:$stage,freight:$freightName,
+        capturedAt:$capturedAt,capturedEpoch:$capturedEpoch,
+        lowerBoundEpoch:$lowerBoundEpoch,expectedPikachuSince:$expectedSince,
+        persistedPikachuSince:($freightObject.status.currentlyIn[$pikachu].since // null),
+        residency:{
+          pikachu:($freightObject.status.currentlyIn[$pikachu] // null),
+          raichu:($freightObject.status.currentlyIn[$raichu] // null)
+        },
+        verification:{
+          pikachu:($freightObject.status.verifiedIn[$pikachu] // null),
+          raichu:($freightObject.status.verifiedIn[$raichu] // null)
+        },
+        autoPromotionEnabled:($stageObject.status.autoPromotionEnabled // false),
+        preBoundaryRefreshToken:$preBoundaryRefreshToken,
+        lastHandledRefresh:($stageObject.status.lastHandledRefresh // null),
+        promotionCount:($ampharosPromotions | length),
+        ampharosPromotions:$ampharosPromotions,
+        freightObject:$freightObject,
+        ampharosStageObject:$stageObject
+      }
+    ' >"${output}"
+  jq -e --arg since "${expected_since}" --arg token "${pre_boundary_token}" '
+    .capturedEpoch >= .lowerBoundEpoch and
+    .expectedPikachuSince == $since and .persistedPikachuSince == $since and
+    (.residency.pikachu.since // "") == $since and
+    (.residency.raichu.since // "") != "" and
+    (.verification.pikachu.verifiedAt // "") != "" and
+    (.verification.raichu.verifiedAt // "") != "" and
+    .autoPromotionEnabled == true and
+    $token != "" and .preBoundaryRefreshToken == $token and
+    .lastHandledRefresh == $token and
+    .promotionCount == 0 and (.ampharosPromotions | length) == 0
+  ' "${output}" >/dev/null ||
+    sit_fail 'the soak pre-stimulus snapshot did not preserve the causal boundary state'
+}
+
 # Encode a real millisecond timestamp plus 80 bits of cryptographic entropy as
 # a lowercase ULID. This is the same 26-character ordering component used by
 # pinned Kargo v1.9.10 Promotion names.
@@ -3462,12 +3641,32 @@ kargo_capture_promotion_dry_run_acceptance() {
   local freight="$3"
   local output="$4"
   local manifest="${KARGO_RUNTIME_DIR}/available-${project}-${stage}-${freight}.yaml"
+  local enriched="${output}.captured"
+  local requested_at requested_epoch admitted_at admitted_epoch
   kargo_write_promotion_manifest "${project}" "${stage}" "${freight}" "${manifest}"
+  requested_at="$(sit_now)"
+  requested_epoch="$(date -u -d "${requested_at}" +%s)"
   kubectl create --dry-run=server -f "${manifest}" -o json >"${output}"
   jq -e --arg stage "${stage}" --arg freight "${freight}" '
     .spec.stage == $stage and .spec.freight == $freight and
     (.spec.steps | length) == 4
   ' "${output}" >/dev/null
+  admitted_at="$(sit_now)"
+  admitted_epoch="$(date -u -d "${admitted_at}" +%s)"
+  jq \
+    --arg requestedAt "${requested_at}" \
+    --argjson requestedEpoch "${requested_epoch}" \
+    --arg admittedAt "${admitted_at}" \
+    --argjson admittedEpoch "${admitted_epoch}" '
+      . + {
+        fleetSitDryRun:{
+          admitted:true,serverSide:true,
+          requestedAt:$requestedAt,requestedEpoch:$requestedEpoch,
+          admittedAt:$admittedAt,admittedEpoch:$admittedEpoch
+        }
+      }
+    ' "${output}" >"${enriched}"
+  mv "${enriched}" "${output}"
 }
 
 kargo_seed_freight() {
@@ -4061,8 +4260,10 @@ kargo_runtime_install_soak_project() {
 kargo_runtime_trace_wall_clock_soak() {
   local project='canary-sitsoak'
   local tag='4.4.4'
-  local pikachu ampharos freight since since_epoch promotion_epoch lower_bound elapsed
+  local pikachu raichu ampharos freight since since_epoch promotion_epoch lower_bound elapsed
+  local pre_boundary_token
   pikachu="$(kargo_stage_name "${project}" pikachu)"
+  raichu="$(kargo_stage_name "${project}" raichu)"
   ampharos="$(kargo_stage_name "${project}" ampharos)"
   kargo_seed_freight "${project}" fleet-sit-f4 "${tag}" \
     "${report}/kargo-runtime-soak-freight-created.json"
@@ -4089,7 +4290,10 @@ kargo_runtime_trace_wall_clock_soak() {
     jq -r --arg stage "${pikachu}" '.status.currentlyIn[$stage].since')"
   since_epoch="$(date -u -d "${since}" +%s)"
   lower_bound=$((since_epoch + 90))
-  kargo_refresh_stage "${project}" "${ampharos}"
+  kargo_refresh_stage_recorded "${project}" "${ampharos}" \
+    "${report}/kargo-runtime-soak-pre-boundary-refresh.json"
+  pre_boundary_token="$(jq -r '.token' \
+    "${report}/kargo-runtime-soak-pre-boundary-refresh.json")"
   kargo_assert_no_promotion_for 12 "${project}" "${ampharos}" "${freight}" \
     'real 90s wall-clock soak has not elapsed from promotion-time since' \
     "${report}/kargo-runtime-soak-early-hold.json"
@@ -4097,8 +4301,38 @@ kargo_runtime_trace_wall_clock_soak() {
     'real wall-clock lower bound before 90s' \
     "${report}/kargo-runtime-soak-early-denial.json"
 
-  # No further refresh is issued here. The released controller must schedule
-  # and make the Stage eligible from its own real wall clock.
+  # Kargo v1.9.10 emits no soak-expiry event and requeues a settled Stage every
+  # five minutes. Cross the persisted boundary on the real clock, prove the
+  # webhook admits before any mutation, then issue one supported wake-up.
+  kargo_wait_wall_clock_boundary "${since}" "${lower_bound}" \
+    'persisted Pikachu residency plus the real 90s soak' \
+    "${report}/kargo-runtime-soak-boundary-wait.json"
+  kargo_capture_soak_pre_stimulus \
+    "${project}" "${ampharos}" "${pikachu}" "${raichu}" "${freight}" \
+    "${since}" "${lower_bound}" "${pre_boundary_token}" \
+    "${report}/kargo-runtime-soak-pre-stimulus.json"
+  kargo_capture_promotion_dry_run_acceptance \
+    "${project}" "${ampharos}" "${freight}" \
+    "${report}/kargo-runtime-soak-ampharos-available-dry-run.json"
+  kargo_refresh_stage_recorded "${project}" "${ampharos}" \
+    "${report}/kargo-runtime-soak-post-boundary-refresh.json"
+  jq -e \
+    --arg previousToken "${pre_boundary_token}" \
+    --argjson lowerBoundEpoch "${lower_bound}" \
+    --slurpfile dryRun \
+    "${report}/kargo-runtime-soak-ampharos-available-dry-run.json" '
+      .token != $previousToken and .previousToken == $previousToken and
+      .lastHandledRefresh == .token and
+      (.annotatedAt | fromdateiso8601) == .annotatedEpoch and
+      (.acknowledgedAt | fromdateiso8601) == .acknowledgedEpoch and
+      .annotatedEpoch >= $lowerBoundEpoch and
+      .acknowledgedEpoch >= $lowerBoundEpoch and
+      .acknowledgedEpoch >= .annotatedEpoch and
+      $dryRun[0].fleetSitDryRun.admitted == true and
+      $dryRun[0].fleetSitDryRun.serverSide == true and
+      $dryRun[0].fleetSitDryRun.admittedEpoch <= .annotatedEpoch
+    ' "${report}/kargo-runtime-soak-post-boundary-refresh.json" >/dev/null ||
+    sit_fail 'the distinct post-boundary refresh was early, unacknowledged, or preceded admission'
   kargo_wait_promotion_succeeded "${project}" "${ampharos}" "${freight}" \
     "${report}/kargo-runtime-soak-ampharos-promotion.json"
   promotion_epoch="$(date -u -d \
@@ -4122,16 +4356,38 @@ kargo_runtime_trace_wall_clock_soak() {
     --arg freight "${freight}" --arg tag "${tag}" \
     --arg promotionTimeSince "${since}" \
     --argjson requiredSoakSeconds 90 \
+    --argjson lowerBoundEpoch "${lower_bound}" \
     --argjson observedPromotionAfterSeconds "${elapsed}" \
-    --slurpfile early "${report}/kargo-runtime-soak-early-denial.json" '
+    --slurpfile early "${report}/kargo-runtime-soak-early-denial.json" \
+    --slurpfile earlyHold "${report}/kargo-runtime-soak-early-hold.json" \
+    --slurpfile boundaryWait "${report}/kargo-runtime-soak-boundary-wait.json" \
+    --slurpfile preStimulus "${report}/kargo-runtime-soak-pre-stimulus.json" \
+    --slurpfile preBoundaryRefresh \
+    "${report}/kargo-runtime-soak-pre-boundary-refresh.json" \
+    --slurpfile dryRun \
+    "${report}/kargo-runtime-soak-ampharos-available-dry-run.json" \
+    --slurpfile postBoundaryRefresh \
+    "${report}/kargo-runtime-soak-post-boundary-refresh.json" '
       {
         trace:"real-wall-clock-90s-strengthener",freight:$freight,tag:$tag,
         promotionTimeSince:$promotionTimeSince,
         requiredSoakSeconds:$requiredSoakSeconds,
+        lowerBoundEpoch:$lowerBoundEpoch,
         observedPromotionAfterSeconds:$observedPromotionAfterSeconds,
         earlyWebhookDenial:$early[0],
+        earlyNoPromotionHold:$earlyHold[0],
+        boundaryWait:$boundaryWait[0],
+        preStimulus:$preStimulus[0],
+        preBoundaryRefresh:$preBoundaryRefresh[0],
+        postBoundaryDryRunAdmitted:$dryRun[0].fleetSitDryRun.admitted,
+        postBoundaryDryRunPromotion:$dryRun[0],
+        postBoundaryRefresh:$postBoundaryRefresh[0],
         lowerBoundSatisfied:($observedPromotionAfterSeconds >= $requiredSoakSeconds),
-        controllerClockWasNotPatched:true
+        controllerClockWasNotPatched:true,
+        stimulusAfterLowerBound:
+          ($postBoundaryRefresh[0].annotatedEpoch >= $lowerBoundEpoch),
+        earlyRefreshDidNotPromote:
+          ($earlyHold[0].promotionCount == 0 and $early[0].admitted == false)
       }
     ' >"${report}/kargo-runtime-soak-trace.json"
 }
@@ -4259,10 +4515,11 @@ run_kargo_runtime_leg() {
           "failed analysis remains an independent gate after residency is satisfied",
           "verification does not reset Freight.status.currentlyIn[stage].since and eligibility is immediate when late verification succeeds",
           "adding the pikachu auto policy and removing the ampharos policy in one ProjectConfig patch flips their real runtime behavior",
-          "the otherwise-identical 90s project respects a genuine promotion-time wall-clock lower bound"
+          "the otherwise-identical 90s project respects a genuine promotion-time wall-clock lower bound, proved by pre-boundary webhook denial and post-boundary webhook admission before any new stimulus"
         ],
         residuals:[
           "literal passage of the production 15m duration remains unrun; persisted 15m-clock backdating proves both orderings and per-upstream comparison, and the same released controller code is wall-clock-strengthened at 90s",
+          "Kargo v1.9.10 emits no soak-expiry event and requeues a settled Stage every five minutes, so the SIT wakes the Stage with one supported refresh after the boundary instead of measuring controller polling latency",
           "the Kargo API/UI approval surface is disabled; explicit Promotion CR creation exercises the Kubernetes admission and SubjectAccessReview surface",
           "Warehouse discovery against a reachable registry is unrun; Freight is seeded through the real webhook against subscriptions whose consumer-only runtime host is registry.sit.invalid"
         ],
@@ -4305,6 +4562,12 @@ collect_final_evidence() {
     'kargo-runtime-canary-analysisruns-final.json'
     'kargo-runtime-canary-events-final.json'
     'kargo-runtime-canary-analysis-outcomes-final.json'
+    'kargo-runtime-canary-sitsoak-stages-final.json'
+    'kargo-runtime-canary-sitsoak-freight-final.json'
+    'kargo-runtime-canary-sitsoak-promotions-final.json'
+    'kargo-runtime-canary-sitsoak-analysisruns-final.json'
+    'kargo-runtime-canary-sitsoak-events-final.json'
+    'kargo-runtime-canary-sitsoak-analysis-outcomes-final.json'
   )
   kargo_capture_json_evidence canary stages.kargo.akuity.io \
     "${report}/${kargo_final_paths[0]}" || true
@@ -4318,6 +4581,18 @@ collect_final_evidence() {
     "${report}/${kargo_final_paths[4]}" || true
   kargo_capture_json_evidence canary configmap/kargo-analysis-outcomes \
     "${report}/${kargo_final_paths[5]}" || true
+  kargo_capture_json_evidence canary-sitsoak stages.kargo.akuity.io \
+    "${report}/${kargo_final_paths[6]}" || true
+  kargo_capture_json_evidence canary-sitsoak freight.kargo.akuity.io \
+    "${report}/${kargo_final_paths[7]}" || true
+  kargo_capture_json_evidence canary-sitsoak promotions.kargo.akuity.io \
+    "${report}/${kargo_final_paths[8]}" || true
+  kargo_capture_json_evidence canary-sitsoak analysisruns.argoproj.io \
+    "${report}/${kargo_final_paths[9]}" || true
+  kargo_capture_json_evidence canary-sitsoak events \
+    "${report}/${kargo_final_paths[10]}" || true
+  kargo_capture_json_evidence canary-sitsoak configmap/kargo-analysis-outcomes \
+    "${report}/${kargo_final_paths[11]}" || true
   if [ "${SIT_CURRENT_LEG:-}" = 'L9-kargo-v1-runtime' ]; then
     SIT_LEG_EVIDENCE+=("${kargo_final_paths[@]}")
   fi
@@ -5258,6 +5533,11 @@ run_full() {
     'kargo-runtime-persisted.json' 'kargo-runtime-persisted-contract.json' \
     'kargo-runtime-f1-trace.json' 'kargo-runtime-f2-trace.json' \
     'kargo-runtime-f3-trace.json' 'kargo-runtime-soak-trace.json' \
+    'kargo-runtime-soak-pre-boundary-refresh.json' \
+    'kargo-runtime-soak-boundary-wait.json' \
+    'kargo-runtime-soak-pre-stimulus.json' \
+    'kargo-runtime-soak-ampharos-available-dry-run.json' \
+    'kargo-runtime-soak-post-boundary-refresh.json' \
     'kargo-runtime-git.diff' 'kargo-runtime-git-oracle.json' \
     'kargo-runtime-raichu-values-before.yaml' 'kargo-runtime-raichu-values-after.yaml' \
     'kargo-runtime-controller.log' 'kargo-runtime-management-controller.log' \
