@@ -2267,6 +2267,27 @@ kargo_refresh_stage() {
     kargo_check_refresh_handled "${project}" "${stage}" "${token}"
 }
 
+# Same refresh-token annotate-and-wait as kargo_refresh_stage, bounded by an
+# explicit timeout instead of a fixed 90s. Used only from inside a bounded
+# retry driver where a per-attempt timeout is an expected, retried condition
+# rather than a terminal failure: unlike kargo_refresh_stage, it never routes
+# through sit_wait_for/sit_fail, so a retry that later succeeds leaves no
+# misleading "assertion failed" text behind.
+kargo_refresh_stage_quiet() {
+  local project="$1"
+  local stage="$2"
+  local timeout_s="$3"
+  local token deadline
+  token="fleet-sit-$(sit_epoch)-$$-${RANDOM}"
+  kubectl -n "${project}" annotate stage "${stage}" \
+    "kargo.akuity.io/refresh=${token}" --overwrite >/dev/null
+  deadline=$((SECONDS + timeout_s))
+  while ! kargo_check_refresh_handled "${project}" "${stage}" "${token}"; do
+    [ "${SECONDS}" -lt "${deadline}" ] || return 1
+    sleep "${FLEET_SIT_POLL_SECONDS:-3}"
+  done
+}
+
 kargo_check_promotion_succeeded() {
   local project="$1"
   local stage="$2"
@@ -2304,16 +2325,112 @@ kargo_check_freight_verified() {
     jq -e --arg stage "${stage}" '.status.verifiedIn[$stage].verifiedAt != null' >/dev/null
 }
 
+# Shared jq preamble for every Stage status predicate. It binds $collection to
+# the Freight-history collection carrying the EXACT $freight - never
+# freightHistory[0], which the controller re-orders as new Freight arrives -
+# then $verification (that collection's current verification) and $coherent
+# (the post-terminal Stage state the pinned controller must reach before it can
+# verify that Freight at all: no current Promotion, a Succeeded last Promotion
+# for this Freight, a matching collection, and Healthy health).
+#
+# The dollar references are jq variables, not shell expansions.
+# shellcheck disable=SC2016
+KARGO_STAGE_PREDICATE_PREAMBLE='
+  ((.status.freightHistory // []) |
+    map(select(.items["Warehouse/dummy"].name == $freight)) | first) as $collection |
+  ((($collection.verificationHistory // [])[0]) // null) as $verification |
+  (
+    (.status.currentPromotion // null) == null and
+    (.status.lastPromotion.status.phase // "") == "Succeeded" and
+    (.status.lastPromotion.freight.name // "") == $freight and
+    $collection != null and
+    (.status.health.status // "") == "Healthy"
+  ) as $coherent |
+'
+
 kargo_check_stage_verification() {
   local project="$1"
   local stage="$2"
   local freight="$3"
   local phase="$4"
   kubectl -n "${project}" get stage "${stage}" -o json 2>/dev/null |
-    jq -e --arg freight "${freight}" --arg phase "${phase}" '
-      .status.freightHistory[0].items["Warehouse/dummy"].name == $freight and
-      .status.freightHistory[0].verificationHistory[0].phase == $phase
+    jq -e --arg freight "${freight}" --arg phase "${phase}" \
+      "${KARGO_STAGE_PREDICATE_PREAMBLE}"'
+      $collection != null and ($verification.phase // "") == $phase
     ' >/dev/null
+}
+
+# The post-terminal Stage state the reconciliation driver waits for: the
+# Promotion is finished, the Stage is healthy for this exact Freight, and
+# verification has actually started rather than never having been scheduled.
+kargo_check_stage_reconciled() {
+  local project="$1"
+  local stage="$2"
+  local freight="$3"
+  kubectl -n "${project}" get stage "${stage}" -o json 2>/dev/null |
+    jq -e --arg freight "${freight}" \
+      "${KARGO_STAGE_PREDICATE_PREAMBLE}"'
+      $coherent and
+      (["Pending","Running","Successful"] | index($verification.phase // "")) != null
+    ' >/dev/null
+}
+
+kargo_check_stage_success() {
+  local project="$1"
+  local stage="$2"
+  local freight="$3"
+  kubectl -n "${project}" get stage "${stage}" -o json 2>/dev/null |
+    jq -e --arg freight "${freight}" \
+      "${KARGO_STAGE_PREDICATE_PREAMBLE}"'
+      $coherent and ($verification.phase // "") == "Successful"
+    ' >/dev/null
+}
+
+# Everything needed to tell a health failure from a verification failure from a
+# Freight-projection failure, captured on the terminal failure itself rather
+# than reconstructed later from controller logs.
+#
+# The AnalysisRun filter must join on the exact Freight collection, not just
+# the Stage: F1/F2 already leave successful AnalysisRuns behind for the same
+# Stage name, and a Stage-only label filter would surface those stale runs as
+# if they belonged to this failure. The collection id is derived with the
+# same exact-Freight selector every other Stage predicate uses, then required
+# alongside the Stage label.
+#
+# Every path written here is appended to SIT_LEG_EVIDENCE (report-relative)
+# so a terminal L9 failure records these diagnostics as structured evidence
+# instead of leaving them undeclared on disk.
+kargo_capture_stage_failure_diagnostics() {
+  local project="$1"
+  local stage="$2"
+  local freight="$3"
+  local prefix="$4"
+  local collection_id relative
+  kubectl -n "${project}" get stage "${stage}" -o json \
+    >"${prefix}-stage.json" 2>&1 || true
+  kubectl -n "${project}" get freight "${freight}" -o json \
+    >"${prefix}-freight.json" 2>&1 || true
+  kubectl -n "${project}" get promotions.kargo.akuity.io -o json 2>/dev/null |
+    jq --arg stage "${stage}" --arg freight "${freight}" '
+      [.items[]? | select(.spec.stage == $stage and .spec.freight == $freight)] |
+      sort_by(.metadata.creationTimestamp)
+    ' >"${prefix}-promotions.json" || true
+  collection_id="$(jq -r --arg freight "${freight}" \
+    "${KARGO_STAGE_PREDICATE_PREAMBLE}"'$collection.id // empty' \
+    "${prefix}-stage.json" 2>/dev/null)" || true
+  kubectl -n "${project}" get analysisruns -o json 2>/dev/null |
+    jq --arg stage "${stage}" --arg collection "${collection_id}" '
+      [.items[]? |
+        select(.metadata.labels["kargo.akuity.io/stage"] == $stage and
+          $collection != "" and
+          .metadata.labels["kargo.akuity.io/freight-collection"] == $collection)] |
+      sort_by(.metadata.creationTimestamp)
+    ' >"${prefix}-analysisruns.json" || true
+  relative="${prefix#"${report}/"}"
+  SIT_LEG_EVIDENCE+=(
+    "${relative}-stage.json" "${relative}-freight.json"
+    "${relative}-promotions.json" "${relative}-analysisruns.json"
+  )
 }
 
 kargo_wait_verified() {
@@ -2321,11 +2438,122 @@ kargo_wait_verified() {
   local stage="$2"
   local freight="$3"
   local output="$4"
-  sit_wait_for 180 "Freight ${freight} verification in ${project}/${stage}" \
-    kargo_check_freight_verified "${project}" "${freight}" "${stage}"
-  sit_wait_for 60 "Stage ${project}/${stage} successful verification history" \
-    kargo_check_stage_verification "${project}" "${stage}" "${freight}" Successful
+  local diagnostics="${output%.json}-verification-failure"
+  # Coherent Stage success is the FIRST gate. The global Freight projection
+  # cannot say whether promotion completion, Stage health, or the AnalysisRun
+  # is the blocked prerequisite, so it must never be the sole first predicate.
+  if ! sit_wait_for 180 "coherent verified Stage ${project}/${stage} for ${freight}" \
+    kargo_check_stage_success "${project}" "${stage}" "${freight}"; then
+    kargo_capture_stage_failure_diagnostics "${project}" "${stage}" "${freight}" \
+      "${diagnostics}"
+    sit_fail "Stage ${project}/${stage} did not reach coherent verified success for ${freight}"
+    return 1
+  fi
+  if ! sit_wait_for 60 "Freight ${freight} verification projection in ${project}/${stage}" \
+    kargo_check_freight_verified "${project}" "${freight}" "${stage}"; then
+    kargo_capture_stage_failure_diagnostics "${project}" "${stage}" "${freight}" \
+      "${diagnostics}"
+    sit_fail "Freight ${freight} was never projected as verified in ${project}/${stage}"
+    return 1
+  fi
   kubectl -n "${project}" get stage "${stage}" -o json >"${output}"
+}
+
+# Kargo v1.9.10 evaluates Stage health as Unknown while a Promotion is current
+# and refuses to start verification until health is Healthy, so a hermetic
+# zero-duration Promotion can reach its terminal phase without the Stage ever
+# being reconciled again. Request that reconciliation explicitly with fresh
+# refresh tokens instead of waiting longer: bounded in attempts and in time,
+# and loud with live objects when the runtime cannot recover.
+kargo_drive_stage_reconciliation() {
+  local project="$1"
+  local stage="$2"
+  local freight="$3"
+  local output="$4"
+  local diagnostics="${output%.json}-diagnostics"
+  local state="${KARGO_RUNTIME_DIR}/reconciled-${project}-${stage}.json"
+  local max_attempts=8
+  local refresh_timeout=90
+  local attempt_window=20
+  local attempts=0
+  local reconciled=0
+  local started_at started_epoch overall_deadline attempt_deadline remaining
+  started_at="$(sit_now)"
+  started_epoch="$(sit_epoch)"
+  overall_deadline=$((SECONDS + 300))
+  # The 300s deadline above is the DOCUMENTED overall budget, not just an
+  # outer loop-entry check: kargo_refresh_stage's own wait can otherwise run
+  # up to 90s past it. Every wait below is instead capped by whatever of that
+  # budget remains, so the driver can never overrun by close to one more
+  # refresh timeout.
+  while [ "${reconciled}" -eq 0 ] &&
+    [ "${attempts}" -lt "${max_attempts}" ] &&
+    [ "${SECONDS}" -lt "${overall_deadline}" ]; do
+    attempts=$((attempts + 1))
+    remaining=$((overall_deadline - SECONDS))
+    [ "${remaining}" -gt 0 ] || break
+    if ! kargo_refresh_stage_quiet "${project}" "${stage}" \
+      "$((remaining < refresh_timeout ? remaining : refresh_timeout))"; then
+      continue
+    fi
+    remaining=$((overall_deadline - SECONDS))
+    [ "${remaining}" -gt 0 ] || break
+    attempt_deadline=$((SECONDS + (remaining < attempt_window ? remaining : attempt_window)))
+    while [ "${SECONDS}" -lt "${attempt_deadline}" ]; do
+      if kargo_check_stage_reconciled "${project}" "${stage}" "${freight}"; then
+        reconciled=1
+        break
+      fi
+      sleep "${FLEET_SIT_POLL_SECONDS:-3}"
+    done
+  done
+  if [ "${reconciled}" -ne 1 ]; then
+    kargo_capture_stage_failure_diagnostics "${project}" "${stage}" "${freight}" \
+      "${diagnostics}"
+    sit_fail "Stage ${project}/${stage} never reconciled into a coherent post-Promotion state for ${freight} after ${attempts} refresh attempts"
+    return 1
+  fi
+  kubectl -n "${project}" get stage "${stage}" -o json >"${state}"
+  jq -n \
+    --arg project "${project}" \
+    --arg stage "${stage}" \
+    --arg freight "${freight}" \
+    --arg startedAt "${started_at}" \
+    --arg finishedAt "$(sit_now)" \
+    --argjson attempts "${attempts}" \
+    --argjson maxAttempts "${max_attempts}" \
+    --argjson elapsed "$(($(sit_epoch) - started_epoch))" \
+    --slurpfile observed "${state}" '
+      ($observed[0].status) as $status |
+      (($status.freightHistory // []) |
+        map(select(.items["Warehouse/dummy"].name == $freight)) | first) as $collection |
+      {
+        project:$project,stage:$stage,freight:$freight,
+        trigger:"kargo.akuity.io/refresh",
+        refreshAttempts:$attempts,maxRefreshAttempts:$maxAttempts,
+        startedAt:$startedAt,finishedAt:$finishedAt,elapsed_s:$elapsed,
+        coherentStage:{
+          currentPromotion:($status.currentPromotion // null),
+          lastPromotionName:($status.lastPromotion.name // null),
+          lastPromotionPhase:($status.lastPromotion.status.phase // null),
+          lastPromotionFreight:($status.lastPromotion.freight.name // null),
+          health:($status.health.status // null),
+          lastHandledRefresh:($status.lastHandledRefresh // null),
+          freightCollectionId:($collection.id // null),
+          verificationPhase:((($collection.verificationHistory // [])[0].phase) // null)
+        }
+      }
+    ' >"${output}"
+  jq -e --arg freight "${freight}" '
+    .refreshAttempts >= 1 and
+    .coherentStage.currentPromotion == null and
+    .coherentStage.lastPromotionPhase == "Succeeded" and
+    .coherentStage.lastPromotionFreight == $freight and
+    .coherentStage.freightCollectionId != null and
+    .coherentStage.health == "Healthy" and
+    (.coherentStage.verificationPhase | IN("Pending","Running","Successful"))
+  ' "${output}" >/dev/null ||
+    sit_fail "the recorded reconciliation artifact for ${project}/${stage} is not a coherent Stage state"
 }
 
 kargo_check_auto_enabled() {
@@ -2574,12 +2802,17 @@ kargo_backdate_freight_stage() {
 kargo_capture_current_analysis_run() {
   local project="$1"
   local stage="$2"
-  local expected_phase="$3"
-  local output="$4"
+  local freight="$3"
+  local expected_phase="$4"
+  local output="$5"
   local analysis_run
   analysis_run="$(kubectl -n "${project}" get stage "${stage}" -o json |
-    jq -r '.status.freightHistory[0].verificationHistory[0].analysisRun.name // empty')"
-  [ -n "${analysis_run}" ] || sit_fail "Stage ${project}/${stage} has no current AnalysisRun"
+    jq -r --arg freight "${freight}" \
+      "${KARGO_STAGE_PREDICATE_PREAMBLE}"'
+      $verification.analysisRun.name // empty
+    ')"
+  [ -n "${analysis_run}" ] ||
+    sit_fail "Stage ${project}/${stage} has no current AnalysisRun for ${freight}"
   kubectl -n "${project}" get analysisrun "${analysis_run}" -o json >"${output}"
   jq -e --arg phase "${expected_phase}" '.status.phase == $phase' "${output}" >/dev/null
 }
@@ -2641,14 +2874,18 @@ kargo_runtime_trace_f1() {
   freight="$(jq -r '.metadata.name' "${report}/kargo-runtime-f1-freight-created.json")"
 
   kargo_auto_promote_and_verify "${project}" pichu "${freight}" "${tag}" kargo-runtime-f1-pichu
-  jq -e '
-    .status.freightHistory[0].verificationHistory[0].phase == "Successful" and
-    .status.freightHistory[0].verificationHistory[0].analysisRun == null
+  jq -e --arg freight "${freight}" \
+    "${KARGO_STAGE_PREDICATE_PREAMBLE}"'
+    $collection != null and
+    $verification.phase == "Successful" and
+    $verification.analysisRun == null
   ' "${report}/kargo-runtime-f1-pichu-stage.json" >/dev/null
   kargo_auto_promote_and_verify "${project}" raichu "${freight}" "${tag}" kargo-runtime-f1-raichu
-  jq -e '
-    .status.freightHistory[0].verificationHistory[0].phase == "Successful" and
-    .status.freightHistory[0].verificationHistory[0].analysisRun == null
+  jq -e --arg freight "${freight}" \
+    "${KARGO_STAGE_PREDICATE_PREAMBLE}"'
+    $collection != null and
+    $verification.phase == "Successful" and
+    $verification.analysisRun == null
   ' "${report}/kargo-runtime-f1-raichu-stage.json" >/dev/null
 
   kargo_refresh_stage "${project}" "${pikachu}"
@@ -2666,7 +2903,7 @@ kargo_runtime_trace_f1() {
   kargo_wait_git_tag "${project}" pikachu "${tag}"
   kargo_wait_verified "${project}" "${pikachu}" "${freight}" \
     "${report}/kargo-runtime-f1-pikachu-stage.json"
-  kargo_capture_current_analysis_run "${project}" "${pikachu}" Successful \
+  kargo_capture_current_analysis_run "${project}" "${pikachu}" "${freight}" Successful \
     "${report}/kargo-runtime-f1-canary-smoke-analysisrun.json"
 
   kargo_refresh_stage "${project}" "${ampharos}"
@@ -2695,7 +2932,7 @@ kargo_runtime_trace_f1() {
   kargo_wait_git_tag "${project}" ampharos "${tag}"
   kargo_wait_verified "${project}" "${ampharos}" "${freight}" \
     "${report}/kargo-runtime-f1-ampharos-stage.json"
-  kargo_capture_current_analysis_run "${project}" "${ampharos}" Successful \
+  kargo_capture_current_analysis_run "${project}" "${ampharos}" "${freight}" Successful \
     "${report}/kargo-runtime-f1-canary-analysis-analysisrun.json"
   kubectl -n "${project}" get freight "${freight}" -o json \
     >"${report}/kargo-runtime-f1-freight-final.json"
@@ -2753,7 +2990,7 @@ kargo_runtime_trace_f2() {
   kargo_wait_git_tag "${project}" pikachu "${tag}"
   kargo_wait_verification_phase "${project}" "${pikachu}" "${freight}" Failed \
     "${report}/kargo-runtime-f2-pikachu-failed-stage.json"
-  kargo_capture_current_analysis_run "${project}" "${pikachu}" Failed \
+  kargo_capture_current_analysis_run "${project}" "${pikachu}" "${freight}" Failed \
     "${report}/kargo-runtime-f2-canary-smoke-failed-analysisrun.json"
   kubectl -n "${project}" get freight "${freight}" -o json \
     >"${report}/kargo-runtime-f2-freight-after-failure.json"
@@ -2785,7 +3022,7 @@ kargo_runtime_trace_f2() {
     >"${report}/kargo-runtime-f2-reverify-request.txt"
   kargo_wait_verified "${project}" "${pikachu}" "${freight}" \
     "${report}/kargo-runtime-f2-pikachu-reverified-stage.json"
-  kargo_capture_current_analysis_run "${project}" "${pikachu}" Successful \
+  kargo_capture_current_analysis_run "${project}" "${pikachu}" "${freight}" Successful \
     "${report}/kargo-runtime-f2-canary-smoke-reverified-analysisrun.json"
   since_after_reverify="$(kubectl -n "${project}" get freight "${freight}" -o json |
     jq -r --arg stage "${pikachu}" '.status.currentlyIn[$stage].since')"
@@ -2803,7 +3040,7 @@ kargo_runtime_trace_f2() {
   kargo_wait_git_tag "${project}" ampharos "${tag}"
   kargo_wait_verified "${project}" "${ampharos}" "${freight}" \
     "${report}/kargo-runtime-f2-ampharos-stage.json"
-  kargo_capture_current_analysis_run "${project}" "${ampharos}" Successful \
+  kargo_capture_current_analysis_run "${project}" "${ampharos}" "${freight}" Successful \
     "${report}/kargo-runtime-f2-canary-analysis-analysisrun.json"
   kubectl -n "${project}" get freight "${freight}" -o json \
     >"${report}/kargo-runtime-f2-freight-final.json"
@@ -2833,7 +3070,9 @@ kargo_runtime_trace_f2() {
 kargo_runtime_trace_f3() {
   local project='canary'
   local tag='3.3.3'
-  local pikachu raichu ampharos freight policy_patch
+  local pichu pikachu raichu ampharos freight policy_patch
+  local pikachu_since raichu_since
+  pichu="$(kargo_stage_name "${project}" pichu)"
   pikachu="$(kargo_stage_name "${project}" pikachu)"
   raichu="$(kargo_stage_name "${project}" raichu)"
   ampharos="$(kargo_stage_name "${project}" ampharos)"
@@ -2845,16 +3084,31 @@ kargo_runtime_trace_f3() {
   kargo_auto_promote_and_verify "${project}" raichu "${freight}" "${tag}" kargo-runtime-f3-raichu
   kargo_backdate_freight_stage "${project}" "${freight}" "${raichu}" 1200 \
     "${report}/kargo-runtime-f3-raichu-backdate.json"
+  raichu_since="$(jq -r '.after' "${report}/kargo-runtime-f3-raichu-backdate.json")"
   kargo_refresh_stage "${project}" "${ampharos}"
   kargo_assert_no_promotion_for 12 "${project}" "${ampharos}" "${freight}" \
     'only the raichu rendezvous member carries the Freight' \
     "${report}/kargo-runtime-f3-single-member-hold.json"
+  # Bind the refusal to `availabilityStrategy: All` rather than to a generic
+  # controller delay: the exact Freight must be verified AND soaked since the
+  # backdated timestamp in raichu (not merely newly resident with a non-null
+  # since), and absent from pikachu, at the moment the live webhook refuses.
+  kubectl -n "${project}" get freight "${freight}" -o json \
+    >"${report}/kargo-runtime-f3-single-member-freight.json"
+  jq -e --arg pikachu "${pikachu}" --arg raichu "${raichu}" \
+    --arg raichuSince "${raichu_since}" '
+    .status.verifiedIn[$raichu].verifiedAt != null and
+    .status.currentlyIn[$raichu].since == $raichuSince and
+    (.status.verifiedIn[$pikachu] // null) == null and
+    (.status.currentlyIn[$pikachu] // null) == null
+  ' "${report}/kargo-runtime-f3-single-member-freight.json" >/dev/null ||
+    sit_fail 'the f3 single-member refusal is not causally bound to a soaked, backdated raichu residency with pikachu absent'
   kargo_capture_promotion_denial "${project}" "${ampharos}" "${freight}" \
     'availabilityStrategy All rejects Freight present in only raichu' \
     "${report}/kargo-runtime-f3-single-member-denial.json"
 
   policy_patch="$(jq -cn \
-    --arg pichu "$(kargo_stage_name "${project}" pichu)" \
+    --arg pichu "${pichu}" \
     --arg raichu "${raichu}" \
     --arg pikachu "${pikachu}" '
       {spec:{promotionPolicies:[
@@ -2865,10 +3119,22 @@ kargo_runtime_trace_f3() {
     ')"
   kubectl -n "${project}" patch projectconfig "${project}" --type merge \
     -p "${policy_patch}" -o json >"${report}/kargo-runtime-f3-policy-flip.json"
-  jq -e --arg pikachu "${pikachu}" --arg ampharos "${ampharos}" '
-    [.spec.promotionPolicies[] | select(.autoPromotionEnabled == true) | .stageSelector.name] as $enabled |
-    ($enabled | index($pikachu)) != null and ($enabled | index($ampharos)) == null
-  ' "${report}/kargo-runtime-f3-policy-flip.json" >/dev/null
+  # Exactly the three enabled selectors and nothing else. A superset, a
+  # disabled entry, or a surviving ampharos policy would silently weaken the
+  # atomic flip into a partial one.
+  jq -e \
+    --arg pichu "${pichu}" --arg pikachu "${pikachu}" \
+    --arg raichu "${raichu}" --arg ampharos "${ampharos}" '
+    (.spec.promotionPolicies // []) as $policies |
+    ($policies | map(.stageSelector.name) | sort) as $selectors |
+    ($policies |
+      map(select(.autoPromotionEnabled == true) | .stageSelector.name) | sort) as $enabled |
+    ($policies | length) == 3 and
+    $selectors == ([$pichu,$pikachu,$raichu] | sort) and
+    $enabled == $selectors and
+    ($selectors | index($ampharos)) == null
+  ' "${report}/kargo-runtime-f3-policy-flip.json" >/dev/null ||
+    sit_fail 'the atomic f3 ProjectConfig patch is not exactly the three enabled pichu/pikachu/raichu selectors with no ampharos policy'
 
   kargo_refresh_stage "${project}" "${pikachu}"
   kargo_refresh_stage "${project}" "${ampharos}"
@@ -2878,19 +3144,47 @@ kargo_runtime_trace_f3() {
     kargo_check_auto_enabled "${project}" "${ampharos}" false
   kargo_wait_promotion_succeeded "${project}" "${pikachu}" "${freight}" \
     "${report}/kargo-runtime-f3-pikachu-auto-promotion.json"
+  # The automatic Promotion starts and succeeds inside one second, so the Stage
+  # can be left holding the health it evaluated WHILE that Promotion was still
+  # current. Drive the post-terminal reconciliation before waiting on anything
+  # derived from it.
+  kargo_drive_stage_reconciliation "${project}" "${pikachu}" "${freight}" \
+    "${report}/kargo-runtime-f3-pikachu-reconciliation.json"
   kargo_wait_git_tag "${project}" pikachu "${tag}"
   kargo_wait_verified "${project}" "${pikachu}" "${freight}" \
     "${report}/kargo-runtime-f3-pikachu-stage.json"
-  kargo_capture_current_analysis_run "${project}" "${pikachu}" Successful \
+  kargo_capture_current_analysis_run "${project}" "${pikachu}" "${freight}" Successful \
     "${report}/kargo-runtime-f3-canary-smoke-analysisrun.json"
   kargo_backdate_freight_stage "${project}" "${freight}" "${pikachu}" 1200 \
     "${report}/kargo-runtime-f3-pikachu-backdate.json"
+
+  # Destroying path. Prove availability FIRST: a no-Promotion hold taken before
+  # the webhook has admitted the Freight would be vacuously true because
+  # pikachu might simply not be verified yet.
+  pikachu_since="$(jq -r '.after' "${report}/kargo-runtime-f3-pikachu-backdate.json")"
+  kubectl -n "${project}" get freight "${freight}" -o json \
+    >"${report}/kargo-runtime-f3-rendezvous-membership.json"
+  jq -e \
+    --arg pikachu "${pikachu}" --arg raichu "${raichu}" \
+    --arg pikachuSince "${pikachu_since}" --arg raichuSince "${raichu_since}" '
+    .status.verifiedIn[$pikachu].verifiedAt != null and
+    .status.verifiedIn[$raichu].verifiedAt != null and
+    .status.currentlyIn[$pikachu].since == $pikachuSince and
+    .status.currentlyIn[$raichu].since == $raichuSince
+  ' "${report}/kargo-runtime-f3-rendezvous-membership.json" >/dev/null ||
+    sit_fail 'both f3 rendezvous members are not verified and aged for the exact Freight'
+  kargo_capture_promotion_dry_run_acceptance "${project}" "${ampharos}" "${freight}" \
+    "${report}/kargo-runtime-f3-ampharos-available-dry-run.json"
+  [ "$(kargo_promotion_count "${project}" "${ampharos}" "${freight}")" -eq 0 ] ||
+    sit_fail 'the admitted ampharos dry run persisted a Promotion'
   kargo_refresh_stage "${project}" "${ampharos}"
+  kargo_check_auto_enabled "${project}" "${ampharos}" false ||
+    sit_fail 'ampharos auto-promotion was enabled at the start of the policy-removal hold'
   kargo_assert_no_promotion_for 15 "${project}" "${ampharos}" "${freight}" \
     'Freight is available but the ampharos auto-promotion policy was removed' \
     "${report}/kargo-runtime-f3-ampharos-policy-hold.json"
-  kargo_capture_promotion_dry_run_acceptance "${project}" "${ampharos}" "${freight}" \
-    "${report}/kargo-runtime-f3-ampharos-available-dry-run.json"
+  kargo_check_auto_enabled "${project}" "${ampharos}" false ||
+    sit_fail 'ampharos auto-promotion was re-enabled during the policy-removal hold'
   [ "$(kargo_promotion_count "${project}" "${ampharos}" "${freight}")" -eq 0 ] ||
     sit_fail 'ampharos auto-promoted after its policy was removed'
   kubectl -n "${project}" get freight "${freight}" -o json \
@@ -2898,17 +3192,31 @@ kargo_runtime_trace_f3() {
 
   jq -n \
     --arg freight "${freight}" --arg tag "${tag}" \
+    --arg pikachu "${pikachu}" --arg raichu "${raichu}" \
+    --slurpfile singleMemberFreight "${report}/kargo-runtime-f3-single-member-freight.json" \
     --slurpfile denial "${report}/kargo-runtime-f3-single-member-denial.json" \
     --slurpfile policy "${report}/kargo-runtime-f3-policy-flip.json" \
+    --slurpfile reconciliation "${report}/kargo-runtime-f3-pikachu-reconciliation.json" \
+    --slurpfile membership "${report}/kargo-runtime-f3-rendezvous-membership.json" \
     --slurpfile hold "${report}/kargo-runtime-f3-ampharos-policy-hold.json" \
     --slurpfile available "${report}/kargo-runtime-f3-ampharos-available-dry-run.json" '
+      ($singleMemberFreight[0].status) as $singleMember |
       {
         trace:"f3-single-member-and-policy-flip",freight:$freight,tag:$tag,
+        singleMemberFreightState:{
+          verifiedInRaichuAt:($singleMember.verifiedIn[$raichu].verifiedAt),
+          residentInRaichuSince:($singleMember.currentlyIn[$raichu].since),
+          verifiedInPikachu:($singleMember.verifiedIn[$pikachu] // null),
+          residentInPikachu:($singleMember.currentlyIn[$pikachu] // null)
+        },
         singleMemberDenial:$denial[0],
         atomicPolicyMutation:$policy[0].spec.promotionPolicies,
         pikachuAutoAfterPolicyAddition:true,
+        pikachuPostPromotionReconciliation:$reconciliation[0],
+        rendezvousMembership:$membership[0].status,
         ampharosAvailableByLiveWebhook:true,
         ampharosDryRunPromotion:$available[0],
+        ampharosAdmissionProvenBeforeHold:true,
         ampharosHeldAfterPolicyRemoval:$hold[0]
       }
     ' >"${report}/kargo-runtime-f3-trace.json"
@@ -2977,7 +3285,7 @@ kargo_runtime_trace_wall_clock_soak() {
   kargo_wait_git_tag "${project}" pikachu "${tag}"
   kargo_wait_verified "${project}" "${pikachu}" "${freight}" \
     "${report}/kargo-runtime-soak-pikachu-stage.json"
-  kargo_capture_current_analysis_run "${project}" "${pikachu}" Successful \
+  kargo_capture_current_analysis_run "${project}" "${pikachu}" "${freight}" Successful \
     "${report}/kargo-runtime-soak-canary-smoke-analysisrun.json"
   since="$(kubectl -n "${project}" get freight "${freight}" -o json |
     jq -r --arg stage "${pikachu}" '.status.currentlyIn[$stage].since')"
@@ -3005,7 +3313,7 @@ kargo_runtime_trace_wall_clock_soak() {
   kargo_wait_git_tag "${project}" ampharos "${tag}"
   kargo_wait_verified "${project}" "${ampharos}" "${freight}" \
     "${report}/kargo-runtime-soak-ampharos-stage.json"
-  kargo_capture_current_analysis_run "${project}" "${ampharos}" Successful \
+  kargo_capture_current_analysis_run "${project}" "${ampharos}" "${freight}" Successful \
     "${report}/kargo-runtime-soak-canary-analysis-analysisrun.json"
 
   jq -n \
@@ -4071,6 +4379,7 @@ run_full() {
     'kargo-runtime-delta-oracle.json' 'kargo-runtime-rendered-contract.json' \
     'kargo-runtime-persisted.json' 'kargo-runtime-persisted-contract.json' \
     'kargo-runtime-f1-trace.json' 'kargo-runtime-f2-trace.json' \
+    'kargo-runtime-f3-pikachu-reconciliation.json' \
     'kargo-runtime-f3-trace.json' 'kargo-runtime-soak-trace.json' \
     'kargo-runtime-git.diff' 'kargo-runtime-git-oracle.json' \
     'kargo-runtime-raichu-values-before.yaml' 'kargo-runtime-raichu-values-after.yaml' \
