@@ -2388,11 +2388,58 @@ kargo_write_promotion_manifest() {
   local stage="$2"
   local freight="$3"
   local output="$4"
+  local promotion_template
+  promotion_template="$(kubectl -n "${project}" get stage "${stage}" -o json |
+    jq -c '{
+      steps:(.spec.promotionTemplate.spec.steps // []),
+      vars:((.spec.vars // []) + (.spec.promotionTemplate.spec.vars // []))
+    }')"
+  jq -e '.steps | type == "array" and length > 0' <<<"${promotion_template}" >/dev/null ||
+    sit_fail "Stage ${project}/${stage} has no promotion steps to build into a Promotion"
+  # The dollar reference is a yq variable, not shell expansion.
+  # shellcheck disable=SC2016
+  NAMESPACE="${project}" STAGE="${stage}" FREIGHT="${freight}" \
+    PROMOTION_TEMPLATE="${promotion_template}" yq '
+    (strenv(PROMOTION_TEMPLATE) | from_json) as $template |
+    .metadata.namespace = strenv(NAMESPACE) |
+    .spec.stage = strenv(STAGE) |
+    .spec.freight = strenv(FREIGHT) |
+    .spec.steps = $template.steps |
+    .spec.vars = $template.vars
+  ' "${validation_dir}/fixtures/kargo-runtime/promotion.yaml" >"${output}"
+}
+
+kargo_capture_missing_promotion_steps_denial() {
+  local project="$1"
+  local stage="$2"
+  local freight="$3"
+  local output="$4"
+  local manifest="${KARGO_RUNTIME_DIR}/missing-steps-${project}-${stage}-${freight}.yaml"
+  local log="${output}.response.txt"
+  local status=0
   NAMESPACE="${project}" STAGE="${stage}" FREIGHT="${freight}" yq '
     .metadata.namespace = strenv(NAMESPACE) |
     .spec.stage = strenv(STAGE) |
     .spec.freight = strenv(FREIGHT)
-  ' "${validation_dir}/fixtures/kargo-runtime/promotion.yaml" >"${output}"
+  ' "${validation_dir}/fixtures/kargo-runtime/promotion.yaml" >"${manifest}"
+  kubectl create --dry-run=server -f "${manifest}" -o json >"${log}" 2>&1 || status=$?
+  [ "${status}" -ne 0 ] ||
+    sit_fail 'the live Kargo webhook admitted a manual Promotion with no materialized steps'
+  rg -F 'defines no promotion steps' "${log}" >/dev/null ||
+    sit_fail 'the missing-step Promotion denial did not carry the pinned webhook text'
+  jq -n \
+    --arg project "${project}" \
+    --arg stage "${stage}" \
+    --arg freight "${freight}" \
+    --argjson exitStatus "${status}" \
+    --rawfile response "${log}" '
+      {
+        project:$project,stage:$stage,freight:$freight,
+        admitted:false,exitStatus:$exitStatus,
+        expectedText:"defines no promotion steps",
+        response:($response | .[0:4096])
+      }
+    ' >"${output}"
 }
 
 kargo_create_manual_promotion() {
@@ -2610,6 +2657,8 @@ kargo_runtime_trace_f1() {
   kargo_assert_no_promotion_for 15 "${project}" "${pikachu}" "${freight}" \
     'manual gate has no ProjectConfig policy' \
     "${report}/kargo-runtime-f1-pikachu-manual-hold.json"
+  kargo_capture_missing_promotion_steps_denial "${project}" "${pikachu}" "${freight}" \
+    "${report}/kargo-runtime-f1-pikachu-missing-steps-denial.json"
   kargo_create_manual_promotion "${project}" "${pikachu}" "${freight}" \
     "${report}/kargo-runtime-f1-pikachu-manual-promotion-created.json"
   kargo_wait_promotion_succeeded "${project}" "${pikachu}" "${freight}" \
@@ -2662,6 +2711,7 @@ kargo_runtime_trace_f1() {
   jq -n \
     --arg freight "${freight}" --arg tag "${tag}" \
     --slurpfile hold "${report}/kargo-runtime-f1-pikachu-manual-hold.json" \
+    --slurpfile missingSteps "${report}/kargo-runtime-f1-pikachu-missing-steps-denial.json" \
     --slurpfile early "${report}/kargo-runtime-f1-early-denial.json" \
     --slurpfile oneMember "${report}/kargo-runtime-f1-one-member-denial.json" \
     --slurpfile pikachuBackdate "${report}/kargo-runtime-f1-pikachu-backdate.json" \
@@ -2670,6 +2720,7 @@ kargo_runtime_trace_f1() {
       {
         trace:"f1-verification-before-soak",freight:$freight,tag:$tag,
         pichuAuto:true,raichuAuto:true,pikachuManualHold:$hold[0],
+        missingManualStepsDenial:$missingSteps[0],
         explicitPikachuPromotion:true,canarySmoke:"Successful",
         earlyDenial:$early[0],singleBackdateDenial:$oneMember[0],
         backdates:[$pikachuBackdate[0],$raichuBackdate[0]],
