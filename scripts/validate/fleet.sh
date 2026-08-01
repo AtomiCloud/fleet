@@ -1371,7 +1371,7 @@ active_instance_json() {
     --argjson memory "${memory}" \
     --arg kubernetes "${kubernetes}" \
     --arg labelForm "${label_form}" '
-      [{cluster_id:$id,labels:{"ratchet-node":"fleet","ratchet-generation":"9"},
+      [{cluster_id:$id,labels:{"ratchet-node":"fleet","ratchet-generation":"11"},
         shape:{virtual_cpu:$cpu,memory_megabytes:$memory,machine_arch:"amd64",os:"linux"},
         kubernetes:$kubernetes}]
       | if $labelForm == "wrong-generation" then
@@ -1408,7 +1408,7 @@ emit_list_form() {
     printf '\033[0K'
     ;;
   invalid-utf8)
-    printf '[{"cluster_id":"%s","labels":{"ratchet-node":"fleet","ratchet-generation":"9"},"shape":{"virtual_cpu":16,"memory_megabytes":32768,"machine_arch":"amd64","os":"linux"},"kubernetes":"1.33","ignored":"audited-' "${id}"
+    printf '[{"cluster_id":"%s","labels":{"ratchet-node":"fleet","ratchet-generation":"11"},"shape":{"virtual_cpu":16,"memory_megabytes":32768,"machine_arch":"amd64","os":"linux"},"kubernetes":"1.33","ignored":"audited-' "${id}"
     printf '\xff'
     printf -- '-byte"}]\n'
     ;;
@@ -1584,7 +1584,7 @@ create)
   done
   expected=(
     --ephemeral --duration 2h --machine_type 16x32 --enable=kubernetes:1.33
-    --wait_kube_system --label ratchet-node=fleet --label ratchet-generation=9
+    --wait_kube_system --label ratchet-node=fleet --label ratchet-generation=11
     --purpose 'fleet full L0-L9 Namespace built-in-k3s proof'
     --cidfile "${cid}" --output json --output_json_to "${metadata}"
   )
@@ -1874,7 +1874,7 @@ NSL_NSC_SHIM
     .argv == [
       "--ephemeral","--duration","2h","--machine_type","16x32",
       "--enable=kubernetes:1.33","--wait_kube_system",
-      "--label","ratchet-node=fleet","--label","ratchet-generation=9",
+      "--label","ratchet-node=fleet","--label","ratchet-generation=11",
       "--purpose","fleet full L0-L9 Namespace built-in-k3s proof",
       "--cidfile",$cid,"--output","json","--output_json_to",$metadata
     ]
@@ -2240,7 +2240,7 @@ NSL_SCHEMA_CASES
   # validate_live_instance diagnostic and closed exact-id cleanup.
   nsl_run wrong-live-generation fail NSC_SHIM_LIST_LABELS=wrong-generation
   nsl_assert_live_label_refusal \
-    wrong-live-generation ratchet-generation 7 9
+    wrong-live-generation ratchet-generation 7 11
   nsl_run wrong-live-node fail NSC_SHIM_LIST_LABELS=wrong-node
   nsl_assert_live_label_refusal \
     wrong-live-node ratchet-node not-fleet fleet
@@ -2633,7 +2633,7 @@ NSL_ROW_SCHEMA_MUTANTS
   nsl_run mutation-live-generation-guard pass NSC_SHIM_LIST_LABELS=wrong-generation
   nsl_assert_exact_destroy mutation-live-generation-guard
   nsl_assert_single_live_label_delta \
-    mutation-live-generation-guard ratchet-generation 7 9
+    mutation-live-generation-guard ratchet-generation 7 11
   nsl_restore_list_proof
 
   # The jq variable names are literal production bytes, not shell expansions.
