@@ -285,29 +285,36 @@ validate_finished_report() {
 nsc_list_json() {
   local output="$1"
   local raw="${output}.raw"
-  script -qec 'nsc list --output json' /dev/null >"${raw}" 2>"${output}.stderr" || return 1
-  # nsc v0.0.532 emits one measured TTY envelope around the JSON value:
-  # cursor-hide + erase-display + erase-line, then JSON, then a newline,
-  # erase-display + cursor-show. Strip only those exact bytes. A broad ANSI
-  # sanitizer could rewrite JSON content and turn an unexpected client stream
-  # into apparently valid evidence.
-  local prefix=$'\033[?25l\033[0J\033[0K'
-  local suffix=$'\033[0J\033[?25h'
-  local payload
-  payload="$(tr -d '\r' <"${raw}")"
-  case "${payload}" in
-  "${prefix}"*) payload="${payload#"${prefix}"}" ;;
-  *) return 1 ;;
-  esac
-  case "${payload}" in
-  *$'\n'"${suffix}") payload="${payload%$'\n'"${suffix}"}" ;;
-  *) return 1 ;;
-  esac
-  [[ ${payload} != *$'\033'* ]] || return 1
-  printf '%s\n' "${payload}" >"${output}"
-  jq -e -s '
+  local list_status=0
+  nsc list --output json </dev/null >"${raw}" 2>"${output}.stderr" || list_status=$?
+  # The command status remains authoritative even when stdout looks complete.
+  if [ "${list_status}" -ne 0 ]; then
+    echo "nsc list exited ${list_status}; refusing its retained stdout" >&2
+    return 1
+  fi
+  # Empty stdout is a distinct client failure, not an empty instance set.
+  if [ ! -s "${raw}" ]; then
+    echo 'nsc list returned empty stdout' >&2
+    return 1
+  fi
+  # Never sanitize control bytes into evidence that the client did not emit.
+  if LC_ALL=C grep -q $'\033' "${raw}"; then
+    echo 'nsc list stdout contains an ESC byte' >&2
+    return 1
+  fi
+  # Raw JSON evidence must be well-formed UTF-8 without byte substitution.
+  if ! iconv -f UTF-8 -t UTF-8 "${raw}" >/dev/null; then
+    echo 'nsc list stdout is not valid UTF-8' >&2
+    return 1
+  fi
+  # jq must observe exactly one complete top-level null or array value.
+  if ! jq -e -s '
     length == 1 and (.[0] == null or (.[0] | type) == "array")
-  ' "${output}" >/dev/null
+  ' "${raw}" >/dev/null; then
+    echo 'nsc list stdout is not exactly one JSON null or array value' >&2
+    return 1
+  fi
+  cp -- "${raw}" "${output}"
 }
 
 instance_absent_from() {
@@ -752,7 +759,7 @@ validate_download_archive() {
 }
 
 run_outer() {
-  for command in bash date git jq nsc script sha256sum tar timeout; do
+  for command in bash date git iconv jq nsc sha256sum tar timeout; do
     require_command "${command}"
   done
   validate_nsc_version
