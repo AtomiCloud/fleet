@@ -157,8 +157,14 @@ verify_wrapper_identity() {
 }
 
 prepare_verified_snapshot() {
-  git -C "${checkout}" rev-parse --git-dir >/dev/null 2>&1 ||
-    fail "not a git checkout: ${checkout}"
+  # Keep git's own diagnosis. Discarding it collapsed every distinct cause into
+  # one message: a foreign-owned tree and an absent `.git` both exit 128 and
+  # differ only in the text, and an unexecutable git exits 126. The generation-11
+  # run at product 1ce87ae failed here on the instance with no way to tell which.
+  # The refusal is unchanged; only the report gains git's stderr.
+  local git_dir_probe
+  git_dir_probe="$(git -C "${checkout}" rev-parse --git-dir 2>&1)" ||
+    fail "not a git checkout: ${checkout}: ${git_dir_probe}"
   if [ "${mode}" = 'inner' ]; then
     commit="${FLEET_SIT_EXPECTED_HEAD:-}"
     [[ ${commit} =~ ^[0-9a-f]{40}$ ]] ||
@@ -838,9 +844,23 @@ run_outer() {
   # this wrapper run on GNU coreutils and are unaffected. (The intended image
   # is the Wolfi userland, but the observed fact is the BusyBox version and its
   # `-c`-only usage banner.)
+  #
+  # `tar -o` is BusyBox's documented "don't restore user:group" and GNU tar's
+  # extract-mode --no-same-owner; the GNU long spellings are absent from
+  # BusyBox's usage table, so the short flag is the portable one. Without it the
+  # archive's recorded uid is restored, and a session whose euid differs then
+  # meets git's ownership refusal on the transferred tree. The host-side report
+  # extract below already declines restored ownership for the same reason.
+  #
+  # The chain proved only the uploaded archive's digest and never the extracted
+  # tree, so a transfer-side defect surfaced two stages later at `inner-run`
+  # with no diagnosis. Prove the tree is a usable checkout here, at the stage
+  # that owns the transfer, where the refusal lands in retained setup stderr.
+  # The predicate sits before the checksum so the program still ends in
+  # `| sha256sum -c`, and the whole program is still one argument after `--`.
   failure_stage='snapshot-setup'
   local setup_command
-  setup_command="test ! -e '${remote_root}/source' && mkdir -p '${remote_root}/result' && tar -xzf '${remote_archive}' -C '${remote_root}' && printf '%s  %s\\n' '${transfer_sha}' '${remote_archive}' | sha256sum -c"
+  setup_command="test ! -e '${remote_root}/source' && mkdir -p '${remote_root}/result' && tar -o -xzf '${remote_archive}' -C '${remote_root}' && git -C '${remote_root}/source' rev-parse --git-dir >/dev/null && printf '%s  %s\\n' '${transfer_sha}' '${remote_archive}' | sha256sum -c"
   setup_started_epoch="$(date +%s)"
   nsc ssh --disable-pty "${instance_id}" -- "${setup_command}" \
     >"${lifecycle_dir}/setup.txt" 2>"${lifecycle_dir}/setup.stderr"

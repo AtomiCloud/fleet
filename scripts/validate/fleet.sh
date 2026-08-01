@@ -1222,6 +1222,41 @@ sit-namespace-lifecycle | sit-proof-lifecycle)
   *'| sha256sum -c"') ;;
   *) fail 'the remote setup program does not end in the portable BusyBox sha256sum -c form' ;;
   esac
+  # The remote extraction must decline restored ownership, using BusyBox's
+  # documented short flag. `tar -o -xzf` does not contain the substring
+  # `tar -xzf`, so refusing that substring refuses exactly the bare form. The
+  # GNU long spellings are absent from BusyBox's usage table and are refused
+  # here for the same reason `sha256sum --check` was.
+  case "${nsl_setup_program_line}" in
+  *'tar -o -xzf'*) ;;
+  *) fail 'the remote source extraction is not the ownership-neutral BusyBox tar -o -xzf form' ;;
+  esac
+  case "${nsl_setup_program_line}" in
+  *'tar -xzf'*)
+    fail 'the remote source extraction reverted to the bare tar -xzf that restores the archive owner'
+    ;;
+  esac
+  case "${nsl_setup_program_line}" in
+  *'--no-same-owner'* | *'--no-same-permissions'*)
+    fail 'the remote source extraction used a GNU-only long ownership flag that BusyBox tar does not document'
+    ;;
+  esac
+  # The setup program must prove the extracted tree is a usable checkout at the
+  # stage that owns the transfer, not leave it to fail opaquely at inner-run.
+  case "${nsl_setup_program_line}" in
+  *'rev-parse --git-dir'*) ;;
+  *) fail 'the remote setup program does not prove the transferred tree is a git checkout' ;;
+  esac
+  # The predicate must precede the checksum, or the packed program stops ending
+  # in the trailing token every other pin and the fake client rely on.
+  case "${nsl_setup_program_line}" in
+  *'rev-parse --git-dir'*'| sha256sum -c"') ;;
+  *) fail 'the remote git predicate must run before the trailing checksum' ;;
+  esac
+  # R1: the wrapper must keep git's own diagnosis rather than discard it.
+  if rg -qF -- 'rev-parse --git-dir >/dev/null 2>&1' "${proof_source}"; then
+    fail 'the checkout preflight still discards the git diagnostic that made the g11 inner failure undiagnosable'
+  fi
   if rg -n "script -q.*nsc list|nsc list.*script -q" "${proof_source}"; then
     fail 'the production Namespace list path still allocates a pseudo-terminal'
   fi
@@ -1300,6 +1335,98 @@ NSL_TOOL_RECEIPT_DRIVER
   bash "${tmp}/namespace-tool-receipt-driver.sh" \
     "${nsl_tool_fns}" "${tmp}/namespace-tool-receipt-work" ||
     fail 'Namespace tool-version receipts did not fail closed'
+
+  # The checkout preflight, driven as production bytes rather than a
+  # transcription. The generation-11 inner failure at product 1ce87ae reported
+  # only `not a git checkout: <path>` because the probe discarded git's stderr,
+  # which left a foreign-owned tree and an absent `.git` indistinguishable —
+  # both exit 128 and differ only in that discarded text. These cases require
+  # the distinguishing text to survive into the refusal.
+  #
+  # The preamble is extracted verbatim from the opening of
+  # prepare_verified_snapshot up to its first mode branch, then closed into a
+  # callable function, so the probe under test is the shipped bytes.
+  nsl_probe_fn="${tmp}/namespace-checkout-probe-fn.sh"
+  awk '
+    /^prepare_verified_snapshot\(\) \{$/ { capture = 1 }
+    capture && /^  if \[ "\$\{mode\}" = .inner. \]; then$/ { capture = 0; print "}" }
+    capture { print }
+  ' "${proof_source}" >"${nsl_probe_fn}"
+  grep -qxF 'prepare_verified_snapshot() {' "${nsl_probe_fn}" &&
+    [ "$(tail -n 1 "${nsl_probe_fn}")" = '}' ] ||
+    fail 'could not extract the production checkout preflight for the diagnostic regression'
+  grep -qF 'rev-parse --git-dir' "${nsl_probe_fn}" ||
+    fail 'the extracted checkout preflight does not contain the git-dir probe'
+
+  cat >"${tmp}/namespace-checkout-probe-driver.sh" <<'NSL_PROBE_DRIVER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+fn_file="$1"
+checkout="$2"
+fail() {
+  echo "fleet SIT proof failed: $*" >&2
+  exit 1
+}
+# shellcheck source=/dev/null
+source "${fn_file}"
+prepare_verified_snapshot
+echo 'checkout preflight accepted'
+NSL_PROBE_DRIVER
+
+  nsl_probe_repo="${tmp}/namespace-checkout-probe-repo"
+  mkdir -p "${nsl_probe_repo}"
+  git -C "${nsl_probe_repo}" init --quiet --initial-branch=main
+  git -C "${nsl_probe_repo}" config user.name fleet-checkout-probe
+  git -C "${nsl_probe_repo}" config user.email fleet-checkout-probe@invalid.example
+  printf '%s\n' fixture >"${nsl_probe_repo}/fixture.txt"
+  git -C "${nsl_probe_repo}" add fixture.txt
+  git -C "${nsl_probe_repo}" commit --quiet -m 'checkout probe fixture'
+
+  nsl_probe_run() {
+    local name="$1" target="$2"
+    shift 2
+    nsl_probe_status=0
+    env "$@" bash "${tmp}/namespace-checkout-probe-driver.sh" \
+      "${nsl_probe_fn}" "${target}" \
+      >"${tmp}/checkout-probe-${name}.out" \
+      2>"${tmp}/checkout-probe-${name}.err" || nsl_probe_status=$?
+  }
+
+  nsl_probe_run healthy "${nsl_probe_repo}"
+  [ "${nsl_probe_status}" -eq 0 ] ||
+    fail "the production checkout preflight rejected a healthy checkout: $(tr '\n' ' ' <"${tmp}/checkout-probe-healthy.err")"
+
+  # Positive control for the lever itself. If this git no longer honours the
+  # ownership test hook the case would silently stop proving anything, so refuse
+  # rather than skip.
+  git -C "${nsl_probe_repo}" rev-parse --git-dir >/dev/null 2>&1 ||
+    fail 'the checkout probe fixture is not a usable repository'
+  if env GIT_TEST_ASSUME_DIFFERENT_OWNER=1 \
+    git -C "${nsl_probe_repo}" rev-parse --git-dir >/dev/null 2>&1; then
+    fail 'GIT_TEST_ASSUME_DIFFERENT_OWNER no longer forces the ownership refusal, so the diagnostic regression would be vacuous'
+  fi
+
+  nsl_probe_run foreign-owner "${nsl_probe_repo}" GIT_TEST_ASSUME_DIFFERENT_OWNER=1
+  [ "${nsl_probe_status}" -ne 0 ] ||
+    fail 'the production checkout preflight accepted a checkout git refuses to own'
+  grep -qF 'not a git checkout' "${tmp}/checkout-probe-foreign-owner.err" ||
+    fail 'the foreign-owner refusal lost the production refusal text'
+  grep -qF 'dubious ownership' "${tmp}/checkout-probe-foreign-owner.err" ||
+    fail 'the foreign-owner refusal discarded the git ownership diagnostic that made the g11 inner failure undiagnosable'
+
+  nsl_probe_absent="${tmp}/namespace-checkout-probe-absent"
+  rm -rf "${nsl_probe_absent}"
+  mkdir -p "${nsl_probe_absent}"
+  printf '%s\n' fixture >"${nsl_probe_absent}/fixture.txt"
+  nsl_probe_run absent-git "${nsl_probe_absent}"
+  [ "${nsl_probe_status}" -ne 0 ] ||
+    fail 'the production checkout preflight accepted a directory with no .git surface'
+  grep -qF 'not a git repository' "${tmp}/checkout-probe-absent-git.err" ||
+    fail 'the absent-.git refusal discarded the git diagnostic that distinguishes it from an ownership refusal'
+  if grep -qF 'dubious ownership' "${tmp}/checkout-probe-absent-git.err"; then
+    fail 'the absent-.git refusal reported an ownership cause, so the two causes are still not distinguished'
+  fi
+  echo '    checkout preflight keeps git diagnosis for both foreign ownership and an absent .git ✓'
 
   nsl_root="${tmp}/namespace-lifecycle"
   nsl_fixture="${nsl_root}/fixture"
@@ -1836,8 +1963,42 @@ ssh)
       exit 76
     }
     [ "${NSC_SHIM_FAIL_STAGE:-}" != 'setup' ] || exit 62
+    # Model the remote program's own predicates, in its order, from the joined
+    # string. The instance restores the archive's recorded owner unless the
+    # extraction declines to; a session whose euid differs from that owner then
+    # meets git's ownership refusal on the transferred tree. Reproducing that
+    # here is what stops a bare extraction from being blessed offline.
+    setup_owner_neutral=''
+    case "${remote_command}" in
+    *'tar -o -xzf'*) setup_owner_neutral=1 ;;
+    *'tar -xzf'*) setup_owner_neutral=0 ;;
+    *)
+      echo 'shim: unmodeled remote source extraction' >&2
+      exit 77
+      ;;
+    esac
+    case "${remote_command}" in
+    *"rev-parse --git-dir"*) ;;
+    *)
+      echo 'shim: the setup program does not prove the transferred tree is a git checkout' >&2
+      exit 78
+      ;;
+    esac
     mkdir -p "${state}/remote/result"
     tar -xzf "${state}/source.tgz" -C "${state}/remote"
+    if [ "${setup_owner_neutral}" -eq 0 ]; then
+      # Recover the exact remote path the program probes, so the modeled refusal
+      # names the same directory the real one would.
+      setup_source_path="${remote_command#*git -C \'}"
+      setup_source_path="${setup_source_path%%\'*}"
+      printf "fatal: detected dubious ownership in repository at '%s'\n" "${setup_source_path}" >&2
+      printf 'To add an exception for this directory, call:\n\n' >&2
+      printf "\tgit config --global --add safe.directory %s\n\n" "${setup_source_path}" >&2
+      printf '========================================\n' >&2
+      printf 'Failed: Process exited with status 128\n' >&2
+      printf '========================================\n\n' >&2
+      exit 128
+    fi
     printf 'source.tgz: OK\n'
     ;;
   env\ *--inner)
@@ -2600,6 +2761,20 @@ NSL_SCHEMA_CASES
     echo "    ${name}: GNU-only sha256sum --check failed closed at snapshot-setup ✓"
   }
 
+  nsl_assert_extract_owner_refusal() {
+    local name="$1"
+    nsl_assert_closed_cleanup "${name}"
+    jq -e '.failureStage == "snapshot-setup"' \
+      "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+      fail "Namespace lifecycle ${name}: the bare extraction did not fail at snapshot-setup"
+    grep -qF 'dubious ownership' "${nsl_report}/lifecycle/setup.stderr" ||
+      fail "Namespace lifecycle ${name}: retained stderr lost the ownership diagnostic"
+    grep -qF 'Failed: Process exited with status 128' \
+      "${nsl_report}/lifecycle/setup.stderr" ||
+      fail "Namespace lifecycle ${name}: retained stderr lost the remote git refusal status"
+    echo "    ${name}: bare extraction failed closed at snapshot-setup on the ownership refusal ✓"
+  }
+
   nsl_assert_false_absence_mutant_pass() {
     local name="$1" form="$2"
     local listing="${nsl_report}/lifecycle/destroy-attempt-1/list-after-destroy-1.json"
@@ -2711,6 +2886,25 @@ NSL_SCHEMA_CASES
     "${nsl_setup_program_prefix}"'| sha256sum --check"'
   nsl_run mutation-setup-gnu-checksum fail
   nsl_assert_busybox_checksum_refusal mutation-setup-gnu-checksum
+  nsl_restore_list_proof
+
+  # Regression for the generation-11 inner failure at product 1ce87ae. Restoring
+  # the exact pre-repair bare extraction lets the instance restore the archive's
+  # recorded owner, and the transferred tree then meets git's ownership refusal.
+  # Foreign ownership is the leading, offline-reproduced hypothesis for that run,
+  # not a fact the consumed bundle proves — the remote uid was never captured —
+  # so this case pins the modeled behaviour of a bare extraction, not a claim
+  # about what the instance did. The failure must land at snapshot-setup with
+  # the ownership diagnostic while exact destroy and strict absence complete.
+  nsl_setup_program_bare="${nsl_setup_program_line/tar -o -xzf/tar -xzf}"
+  [ "${nsl_setup_program_bare}" != "${nsl_setup_program_line}" ] ||
+    fail 'could not derive the bare-extraction mutant from the reviewed setup program'
+  nsl_install_exact_line_mutant \
+    extract-owner \
+    "${nsl_setup_program_line}" \
+    "${nsl_setup_program_bare}"
+  nsl_run mutation-setup-bare-extract fail
+  nsl_assert_extract_owner_refusal mutation-setup-bare-extract
   nsl_restore_list_proof
 
   nsl_install_list_guard_mutant \
