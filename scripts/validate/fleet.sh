@@ -1175,6 +1175,16 @@ sit-namespace-lifecycle | sit-proof-lifecycle)
     fail 'created-instance recovery no longer tries the cidfile, receipt, and stdout surfaces independently'
   rg -qF 'validate_create_cidfile' "${proof_source}" ||
     fail 'the harness no longer validates the generated cidfile against the pinned instance id'
+  mapfile -t nsl_production_ssh_calls < <(
+    rg -n '^[[:space:]]+nsc ssh[[:space:]]' "${proof_source}"
+  )
+  [ "${#nsl_production_ssh_calls[@]}" -eq 4 ] ||
+    fail 'the production Namespace wrapper must carry exactly four explicit nsc ssh calls'
+  for nsl_production_ssh_call in "${nsl_production_ssh_calls[@]}"; do
+    if [[ ${nsl_production_ssh_call} != *"nsc ssh --disable-pty \"\${instance_id}\" -- "* ]]; then
+      fail "the production Namespace ssh call lacks the nsc v0.0.532 remote-command separator: ${nsl_production_ssh_call}"
+    fi
+  done
   if rg -n "script -q.*nsc list|nsc list.*script -q" "${proof_source}"; then
     fail 'the production Namespace list path still allocates a pseudo-terminal'
   fi
@@ -1684,6 +1694,15 @@ ssh)
   shift
   [ "${1:-}" = "${id}" ] || exit 61
   shift
+  [ "${1:-}" = '--' ] || {
+    echo 'shim: nsc ssh requires -- before the remote command' >&2
+    exit 68
+  }
+  shift
+  [ "$#" -gt 0 ] || {
+    echo 'shim: nsc ssh remote command is empty after --' >&2
+    exit 69
+  }
   joined="$(printf '%s ' "$@")"
   if [ "${1:-}" = 'hostname' ]; then
     if [ "${NSC_SHIM_FAIL_STAGE:-}" = 'hostname' ]; then
@@ -1811,6 +1830,14 @@ NSL_NSC_SHIM
     fail 'prepare-only created, listed, used, or destroyed a Namespace instance'
 
   nsl_run success pass
+  mapfile -t nsl_success_ssh_calls < <(grep '^ssh' "${nsl_state}/calls.log")
+  [ "${#nsl_success_ssh_calls[@]}" -eq 4 ] ||
+    fail 'successful Namespace lifecycle did not exercise all four production ssh calls'
+  for nsl_success_ssh_call in "${nsl_success_ssh_calls[@]}"; do
+    if [[ ${nsl_success_ssh_call} != $'ssh\t'"--disable-pty ${nsl_id} -- "* ]]; then
+      fail "successful Namespace lifecycle observed an ssh call without the exact separator position: ${nsl_success_ssh_call}"
+    fi
+  done
   jq -e '
     .status == "pass" and
     .namespace.createdByHarness == true and
@@ -2274,6 +2301,38 @@ NSL_SCHEMA_CASES
       fail "the committed ${label} mutant changed more than one production line"
   }
 
+  nsl_install_ssh_separator_mutant() {
+    local label="$1" exact_call="$2" mutant_call="$3"
+    local proof_path='scripts/ci/fleet-sit-proof.sh'
+    local expected_stat=$'1\t1\tscripts/ci/fleet-sit-proof.sh'
+    local mutation_stat
+    awk -v exact_call="${exact_call}" -v mutant_call="${mutant_call}" '
+      BEGIN { found = 0 }
+      $0 == exact_call { found++; print mutant_call; next }
+      { print }
+      END { if (found != 1) exit 89 }
+    ' "${nsl_proof_baseline}" >"${nsl_fixture}/${proof_path}" ||
+      fail "could not install the exact ${label} ssh-separator mutation"
+    git -C "${nsl_fixture}" add "${proof_path}"
+    if git -C "${nsl_fixture}" diff --cached --quiet; then
+      fail "the exact ${label} ssh-separator mutation changed no bytes"
+    fi
+    mutation_stat="$(git -C "${nsl_fixture}" diff --cached --numstat -- "${proof_path}")"
+    [ "${mutation_stat}" = "${expected_stat}" ] ||
+      fail "the exact ${label} ssh-separator mutation did not replace one production line"
+    git -C "${nsl_fixture}" diff --cached --unified=0 -- "${proof_path}" |
+      grep -qxF -- "-${exact_call}" ||
+      fail "the exact ${label} ssh-separator mutation did not remove its reviewed call"
+    git -C "${nsl_fixture}" diff --cached --unified=0 -- "${proof_path}" |
+      grep -qxF -- "+${mutant_call}" ||
+      fail "the exact ${label} ssh-separator mutation inserted unexpected bytes"
+    git -C "${nsl_fixture}" commit --quiet \
+      -m "Remove ${label} ssh separator" --only "${proof_path}"
+    mutation_stat="$(git -C "${nsl_fixture}" diff-tree --no-commit-id --numstat -r HEAD)"
+    [ "${mutation_stat}" = "${expected_stat}" ] ||
+      fail "the committed ${label} ssh-separator mutant changed more than one production line"
+  }
+
   nsl_install_exact_proof_block_mutant() {
     local label="$1" start_clause="$2" end_clause="$3" deleted_count="$4"
     local proof_path='scripts/ci/fleet-sit-proof.sh'
@@ -2360,6 +2419,18 @@ NSL_SCHEMA_CASES
     fi
   }
 
+  nsl_assert_ssh_separator_refusal() {
+    local name="$1" stage="$2" retained_stderr="$3"
+    nsl_assert_closed_cleanup "${name}"
+    jq -e --arg stage "${stage}" '.failureStage == $stage' \
+      "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+      fail "Namespace lifecycle ${name}: missing separator did not fail at ${stage}"
+    grep -qF 'shim: nsc ssh requires -- before the remote command' \
+      "${nsl_report}/lifecycle/${retained_stderr}" ||
+      fail "Namespace lifecycle ${name}: retained stderr did not prove nsc client-side option parsing"
+    echo "    ${name}: exact production separator deletion failed closed at ${stage} ✓"
+  }
+
   nsl_assert_false_absence_mutant_pass() {
     local name="$1" form="$2"
     local listing="${nsl_report}/lifecycle/destroy-attempt-1/list-after-destroy-1.json"
@@ -2378,6 +2449,50 @@ NSL_SCHEMA_CASES
       nsl_assert_schema_fixture "${form}" "${listing}.raw"
     echo "    ${name}: exact production-line deletion re-opened false absence ✓"
   }
+
+  # nsc v0.0.532 requires `--` after the instance id even when the remote
+  # command begins with a non-option token. Delete only that separator at each
+  # production call and require the fake client to reproduce the real
+  # client-side refusal while exact cleanup and absence proof still complete.
+  # shellcheck disable=SC1003,SC2016
+  nsl_install_ssh_separator_mutant \
+    hostname \
+    '  nsc ssh --disable-pty "${instance_id}" -- hostname \' \
+    '  nsc ssh --disable-pty "${instance_id}" hostname \'
+  nsl_run mutation-ssh-separator-hostname fail
+  nsl_assert_ssh_separator_refusal \
+    mutation-ssh-separator-hostname hostname-preflight hostname.stderr
+  nsl_restore_list_proof
+
+  # shellcheck disable=SC1003,SC2016
+  nsl_install_ssh_separator_mutant \
+    setup \
+    '  nsc ssh --disable-pty "${instance_id}" -- sh -eu -c "${setup_command}" \' \
+    '  nsc ssh --disable-pty "${instance_id}" sh -eu -c "${setup_command}" \'
+  nsl_run mutation-ssh-separator-setup fail
+  nsl_assert_ssh_separator_refusal \
+    mutation-ssh-separator-setup snapshot-setup setup.stderr
+  nsl_restore_list_proof
+
+  # shellcheck disable=SC1003,SC2016
+  nsl_install_ssh_separator_mutant \
+    inner \
+    '    nsc ssh --disable-pty "${instance_id}" -- env \' \
+    '    nsc ssh --disable-pty "${instance_id}" env \'
+  nsl_run mutation-ssh-separator-inner fail
+  nsl_assert_ssh_separator_refusal \
+    mutation-ssh-separator-inner inner-run inner-run.log
+  nsl_restore_list_proof
+
+  # shellcheck disable=SC1003,SC2016
+  nsl_install_ssh_separator_mutant \
+    archive \
+    '  nsc ssh --disable-pty "${instance_id}" -- sh -eu -c "${archive_command}" \' \
+    '  nsc ssh --disable-pty "${instance_id}" sh -eu -c "${archive_command}" \'
+  nsl_run mutation-ssh-separator-archive fail
+  nsl_assert_ssh_separator_refusal \
+    mutation-ssh-separator-archive remote-report-collection remote-report-archive.stderr
+  nsl_restore_list_proof
 
   nsl_install_list_guard_mutant \
     exit-status '  # The command status remains authoritative even when stdout looks complete.'

@@ -802,8 +802,11 @@ run_outer() {
   failure_stage='instance-acquisition'
   acquire_instance
 
+  # nsc v0.0.532 keeps parsing client flags after the instance id unless the
+  # explicit remote-command separator ends option parsing. Keep it on every
+  # ssh call, including commands whose first token does not begin with `-`.
   failure_stage='hostname-preflight'
-  nsc ssh --disable-pty "${instance_id}" hostname \
+  nsc ssh --disable-pty "${instance_id}" -- hostname \
     >"${lifecycle_dir}/hostname.txt" 2>"${lifecycle_dir}/hostname.stderr"
   [ "$(tr -d '[:space:]' <"${lifecycle_dir}/hostname.txt")" = "${instance_id}" ] ||
     fail 'Namespace hostname does not equal the exact instance id'
@@ -826,7 +829,7 @@ run_outer() {
   local setup_command
   setup_command="test ! -e '${remote_root}/source' && mkdir -p '${remote_root}/result' && tar -xzf '${remote_archive}' -C '${remote_root}' && printf '%s  %s\\n' '${transfer_sha}' '${remote_archive}' | sha256sum --check"
   setup_started_epoch="$(date +%s)"
-  nsc ssh --disable-pty "${instance_id}" sh -eu -c "${setup_command}" \
+  nsc ssh --disable-pty "${instance_id}" -- sh -eu -c "${setup_command}" \
     >"${lifecycle_dir}/setup.txt" 2>"${lifecycle_dir}/setup.stderr"
   setup_finished_epoch="$(date +%s)"
 
@@ -834,7 +837,7 @@ run_outer() {
   inner_started_epoch="$(date +%s)"
   local inner_status=0
   timeout --signal=TERM --kill-after=30s 5400 \
-    nsc ssh --disable-pty "${instance_id}" env \
+    nsc ssh --disable-pty "${instance_id}" -- env \
     FLEET_SIT_NAMESPACE_INNER=namespace-k3s-v1 \
     FLEET_SIT_INSTANCE_ID="${instance_id}" \
     FLEET_SIT_EXPECTED_HEAD="${commit}" \
@@ -847,7 +850,7 @@ run_outer() {
   failure_stage='remote-report-collection'
   local archive_command
   archive_command="test -s '${remote_report}/sit-report.json' && tar -czf '${remote_report_archive}' -C '${remote_root}/result' sit-report && sha256sum '${remote_report_archive}'"
-  nsc ssh --disable-pty "${instance_id}" sh -eu -c "${archive_command}" \
+  nsc ssh --disable-pty "${instance_id}" -- sh -eu -c "${archive_command}" \
     >"${lifecycle_dir}/remote-report-sha256.txt" \
     2>"${lifecycle_dir}/remote-report-archive.stderr"
   remote_report_sha="$(awk 'NR == 1 {print $1}' "${lifecycle_dir}/remote-report-sha256.txt")"
