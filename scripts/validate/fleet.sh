@@ -1371,6 +1371,170 @@ NSL_TOOL_RECEIPT_DRIVER
     "${nsl_tool_fns}" "${tmp}/namespace-tool-receipt-work" ||
     fail 'Namespace tool-version receipts did not fail closed'
 
+  # The recursive hard-deadline seam, executed for real against a PATH-first
+  # timeout spy. The seam `exec`s timeout, so the spy terminates the run before
+  # any SIT work begins: nothing live can happen, and the exact argv the
+  # instance would receive is captured.
+  #
+  # The instance's timeout is not guaranteed to accept GNU long spellings, which
+  # is why the short form is load-bearing rather than cosmetic. A source grep
+  # would not prove the argv actually handed over, so this runs the bytes.
+  nsl_seam_root="${tmp}/deadline-seam"
+  nsl_seam_real_timeout="$(command -v timeout)"
+  case "${nsl_seam_real_timeout}" in
+  /*) ;;
+  *) fail 'could not resolve the real timeout executable for the deadline seam test' ;;
+  esac
+  nsl_seam_build() {
+    local dest="$1"
+    rm -rf -- "${dest}"
+    mkdir -p -- "${dest}/scripts/ci" "${dest}/scripts/validate/fleet-sit" "${dest}/spy"
+    cp "${sit_source}" "${dest}/scripts/ci/fleet-sit.sh"
+    cp "${PWD}/scripts/validate/fleet-sit/pins.env" \
+      "${dest}/scripts/validate/fleet-sit/pins.env"
+    cp "${PWD}/scripts/validate/fleet-sit/assert.sh" \
+      "${dest}/scripts/validate/fleet-sit/assert.sh"
+    # One argument per line: "$*" would collapse argument boundaries and make a
+    # split or merged argument indistinguishable from the accepted form.
+    cat >"${dest}/spy/timeout" <<'NSL_SEAM_TIMEOUT_SPY'
+#!/usr/bin/env bash
+: >"${NSL_SEAM_ARGV_FILE:?}"
+for nsl_seam_arg in "$@"; do
+  printf '%s\n' "${nsl_seam_arg}" >>"${NSL_SEAM_ARGV_FILE}"
+done
+printf '%s\n' "${FLEET_SIT_UNDER_TIMEOUT:-<unset>}" >"${NSL_SEAM_MARKER_FILE:?}"
+exit 0
+NSL_SEAM_TIMEOUT_SPY
+    cat >"${dest}/spy/nsc" <<'NSL_SEAM_NSC_SENTINEL'
+#!/usr/bin/env bash
+printf 'nsc reached: %s\n' "$*" >>"${NSL_SEAM_NSC_WITNESS:?}"
+exit 90
+NSL_SEAM_NSC_SENTINEL
+    chmod +x "${dest}/spy/timeout" "${dest}/spy/nsc"
+  }
+  nsl_seam_run() {
+    local dest="$1"
+    nsl_seam_argv_file="${dest}/argv.txt"
+    nsl_seam_marker_file="${dest}/marker.txt"
+    nsl_seam_nsc_witness="${dest}/nsc-witness.txt"
+    : >"${nsl_seam_argv_file}"
+    : >"${nsl_seam_marker_file}"
+    : >"${nsl_seam_nsc_witness}"
+    nsl_seam_status=0
+    # The outer bound must use the real binary by absolute path: the spy is
+    # first on PATH for the child, so an unqualified `timeout` here would be
+    # intercepted and the witness would record this wrapper instead of the seam.
+    env PATH="${dest}/spy:${PATH}" \
+      NSL_SEAM_ARGV_FILE="${nsl_seam_argv_file}" \
+      NSL_SEAM_MARKER_FILE="${nsl_seam_marker_file}" \
+      NSL_SEAM_NSC_WITNESS="${nsl_seam_nsc_witness}" \
+      FLEET_SIT_UNDER_TIMEOUT=0 \
+      "${nsl_seam_real_timeout}" 60 bash "${dest}/scripts/ci/fleet-sit.sh" --full \
+      >"${dest}/stdout.txt" 2>"${dest}/stderr.txt" || nsl_seam_status=$?
+  }
+  # The single acceptance predicate. The baseline must pass it and every mutant
+  # must be required to fail it, with an on-point reason — comparing a mutant's
+  # argv against the canonical string alone would not prove the production
+  # regression makes this test fail for the right cause.
+  nsl_seam_reason=''
+  nsl_seam_accepts() {
+    local dest="$1"
+    local -a argv=()
+    nsl_seam_reason=''
+    mapfile -t argv <"${dest}/argv.txt"
+    local -a want=(-s TERM -k 30 4200 "${dest}/scripts/ci/fleet-sit.sh" --full)
+    if [ "${#argv[@]}" -ne "${#want[@]}" ]; then
+      nsl_seam_reason="argument count ${#argv[@]} is not ${#want[@]}"
+      return 1
+    fi
+    local index
+    for index in "${!want[@]}"; do
+      if [ "${argv[${index}]}" != "${want[${index}]}" ]; then
+        nsl_seam_reason="argument $((index + 1)) is '${argv[${index}]}', expected '${want[${index}]}'"
+        return 1
+      fi
+    done
+    if [ "$(cat "${dest}/marker.txt")" != '1' ]; then
+      nsl_seam_reason='the recursion marker was not exported before exec'
+      return 1
+    fi
+    if [ -s "${dest}/nsc-witness.txt" ]; then
+      nsl_seam_reason='an nsc client was reached'
+      return 1
+    fi
+    return 0
+  }
+  nsl_seam_build "${nsl_seam_root}"
+  nsl_seam_run "${nsl_seam_root}"
+  [ "${nsl_seam_status}" -eq 0 ] ||
+    fail "the deadline seam did not reach the timeout spy: $(tr '\n' ' ' <"${nsl_seam_root}/stderr.txt")"
+  nsl_seam_accepts "${nsl_seam_root}" ||
+    fail "the deadline seam was rejected by its own acceptance predicate: ${nsl_seam_reason}"
+  echo '    deadline seam hands timeout the exact portable short-option argv ✓'
+  echo '    deadline seam exports the recursion marker before handing over ✓'
+  echo '    deadline seam performs no client action before the hard deadline ✓'
+
+  # Mutation coverage. Each rewrites only the seam line in an isolated copy and
+  # requires the argv assertion above to fail on point. A source grep cannot
+  # establish this, so every case re-executes the seam.
+  nsl_seam_mutation() {
+    local label="$1" replacement="$2" expected_reason="$3"
+    local dest="${tmp}/deadline-seam-${label}"
+    nsl_seam_build "${dest}"
+    # shellcheck disable=SC2016
+    local original='  exec timeout -s TERM -k 30 4200 "${script_path}" --full'
+    MUTATION_EXACT_LINE="${original}" MUTATION_MUTANT_LINE="${replacement}" awk '
+      BEGIN {
+        exact = ENVIRON["MUTATION_EXACT_LINE"]
+        mutant = ENVIRON["MUTATION_MUTANT_LINE"]
+        found = 0
+      }
+      $0 == exact { found++; print mutant; next }
+      { print }
+      END { if (found != 1) exit 89 }
+    ' "${sit_source}" >"${dest}/scripts/ci/fleet-sit.sh" ||
+      fail "could not install the ${label} deadline-seam mutation"
+    chmod +x "${dest}/scripts/ci/fleet-sit.sh"
+    nsl_seam_run "${dest}"
+    if nsl_seam_accepts "${dest}"; then
+      fail "the ${label} deadline-seam mutation still satisfied the acceptance predicate"
+    fi
+    case "${nsl_seam_reason}" in
+    *"${expected_reason}"*) ;;
+    *)
+      fail "the ${label} deadline-seam mutation failed for the wrong reason: ${nsl_seam_reason}"
+      ;;
+    esac
+    echo "    deadline-seam mutation ${label} fails the acceptance predicate on point ✓"
+  }
+  # shellcheck disable=SC2016
+  # The GNU long form packs option and value into one word each, so it arrives
+  # as five argv words rather than seven; the count check is the on-point
+  # rejection for that regression.
+  nsl_seam_mutation gnu-long-flags \
+    '  exec timeout --signal=TERM --kill-after=30s 4200 "${script_path}" --full' \
+    'argument count 5 is not 7'
+  # shellcheck disable=SC2016
+  nsl_seam_mutation altered-signal-value \
+    '  exec timeout -s HUP -k 30 4200 "${script_path}" --full' \
+    "argument 2 is 'HUP', expected 'TERM'"
+  # shellcheck disable=SC2016
+  nsl_seam_mutation altered-kill-after-value \
+    '  exec timeout -s TERM -k 45 4200 "${script_path}" --full' \
+    "argument 4 is '45', expected '30'"
+  # shellcheck disable=SC2016
+  nsl_seam_mutation omitted-kill-after-option \
+    '  exec timeout -s TERM 4200 "${script_path}" --full' \
+    'argument count 5 is not 7'
+  # shellcheck disable=SC2016
+  nsl_seam_mutation altered-deadline-value \
+    '  exec timeout -s TERM -k 30 3600 "${script_path}" --full' \
+    "argument 5 is '3600', expected '4200'"
+  # shellcheck disable=SC2016
+  nsl_seam_mutation omitted-full-argument \
+    '  exec timeout -s TERM -k 30 4200 "${script_path}"' \
+    'argument count 6 is not 7'
+
   # The checkout preflight, driven as production bytes rather than a
   # transcription. The generation-11 inner failure at product 1ce87ae reported
   # only `not a git checkout: <path>` because the probe discarded git's stderr,

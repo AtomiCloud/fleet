@@ -32,9 +32,16 @@ cd "${root}"
 
 # Keep the hard deadline outside the stateful worker so TERM still runs the
 # worker's evidence and cleanup traps.
+#
+# Short options only. This line runs on the instance, whose timeout is not
+# guaranteed to accept the GNU long spellings; BusyBox documents `-s` and `-k`
+# but not `--signal`/`--kill-after`, and the generation-11 history already lost
+# one live attempt to exactly that class of assumption with `sha256sum --check`.
+# `-k 30` and the bare `4200` keep the same 30-second TERM-to-KILL allowance and
+# 4200-second deadline as the long form they replace.
 if [ "${mode}" = 'full' ] && [ "${FLEET_SIT_UNDER_TIMEOUT:-0}" != '1' ]; then
   export FLEET_SIT_UNDER_TIMEOUT=1
-  exec timeout --signal=TERM --kill-after=30s 4200 "${script_path}" --full
+  exec timeout -s TERM -k 30 4200 "${script_path}" --full
 fi
 
 # The direct inputs this SIT reads or copies, as fixed pathspec ROOTS. The
