@@ -298,9 +298,21 @@ nsc_list_json() {
     return 1
   fi
   # Never sanitize control bytes into evidence that the client did not emit.
-  if LC_ALL=C grep -q $'\033' "${raw}"; then
-    echo 'nsc list stdout contains an ESC byte' >&2
-    return 1
+  # grep status 1 is the only ordinary no-match result; execution failure is
+  # schema uncertainty and must not become an exact-id absence claim.
+  local grep_status=0
+  LC_ALL=C grep -q $'\033' "${raw}" || grep_status=$?
+  if [ "${grep_status}" -ne 1 ]; then
+    case "${grep_status}" in
+    0)
+      echo 'nsc list stdout contains an ESC byte' >&2
+      return 1
+      ;;
+    [2-9] | [1-9][0-9]*)
+      echo "nsc list ESC scan failed: grep exited ${grep_status}" >&2
+      return 1
+      ;;
+    esac
   fi
   # Raw JSON evidence must be well-formed UTF-8 without byte substitution.
   if ! iconv -f UTF-8 -t UTF-8 "${raw}" >/dev/null; then
@@ -308,10 +320,33 @@ nsc_list_json() {
     return 1
   fi
   # jq must observe exactly one complete top-level null or array value.
+  # Array rows are admitted only when every selector and ownership/shape field
+  # has the reviewed JSON type; malformed rows can never flow into absence.
   if ! jq -e -s '
-    length == 1 and (.[0] == null or (.[0] | type) == "array")
+    def selector_safe_id:
+      type == "string" and test("\\A[a-z0-9]{13,14}\\z");
+    def reviewed_labels:
+      type == "object" and all(.[]; type == "string");
+    def reviewed_shape:
+      type == "object" and
+      (.virtual_cpu | type) == "number" and
+      (.memory_megabytes | type) == "number" and
+      (.machine_arch | type) == "string" and
+      (.os | type) == "string";
+    def reviewed_row:
+      type == "object" and
+      (.cluster_id | selector_safe_id) and
+      (.labels | reviewed_labels) and
+      (.shape | reviewed_shape);
+    length == 1 and
+    (.[0] == null or (
+      (.[0] | type) == "array" and
+      all(.[0][]; reviewed_row) and
+      ([.[0][] | select(type == "object") | .cluster_id] as $ids | ($ids | length) == ($ids | unique | length)) and
+      true
+    ))
   ' "${raw}" >/dev/null; then
-    echo 'nsc list stdout is not exactly one JSON null or array value' >&2
+    echo 'nsc list stdout is not exactly one JSON null or array value with schema-valid rows' >&2
     return 1
   fi
   cp -- "${raw}" "${output}"

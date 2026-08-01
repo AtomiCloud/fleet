@@ -1306,6 +1306,25 @@ exit 97
 NSL_SCRIPT_SHIM
   chmod +x "${nsl_bin}/script"
 
+  nsl_real_grep="$(command -v grep)"
+  case "${nsl_real_grep}" in
+  /*) ;;
+  *) fail 'could not resolve the real grep executable for the Namespace lifecycle shim' ;;
+  esac
+  cat >"${nsl_bin}/grep" <<'NSL_GREP_SHIM'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+if [ "${NSC_SHIM_GREP_FAILURE_AFTER_DESTROY:-0}" -eq 1 ] &&
+  [ -f "${NSC_SHIM_STATE:?}/destroyed" ] &&
+  [ "${1:-}" = '-q' ] && [ "${2:-}" = $'\033' ]; then
+  echo 'shim: injected grep execution failure during the ESC scan' >&2
+  exit 2
+fi
+exec "${NSC_SHIM_REAL_GREP:?}" "$@"
+NSL_GREP_SHIM
+  chmod +x "${nsl_bin}/grep"
+
   cat >"${nsl_bin}/nsc" <<'NSL_NSC_SHIM'
 #!/usr/bin/env bash
 set -Eeuo pipefail
@@ -1353,6 +1372,92 @@ active_instance_json() {
           .
         end
     '
+}
+
+emit_list_form() {
+  local form="$1"
+  local unrelated_id='zzzzzzzzzzzzz'
+  case "${form}" in
+  array) active_instance_json ;;
+  null) printf 'null\n' ;;
+  empty) : ;;
+  nonzero-valid)
+    active_instance_json
+    exit 29
+    ;;
+  multiple)
+    active_instance_json
+    active_instance_json
+    ;;
+  multiple-null)
+    printf 'null\nnull\n'
+    ;;
+  malformed) printf '[{"cluster_id":"%s"}' "${id}" ;;
+  escape)
+    active_instance_json
+    printf '\033[0K'
+    ;;
+  invalid-utf8)
+    printf '[{"cluster_id":"%s","labels":{"ratchet-node":"fleet","ratchet-generation":"9"},"shape":{"virtual_cpu":16,"memory_megabytes":32768,"machine_arch":"amd64","os":"linux"},"kubernetes":"1.33","ignored":"audited-' "${id}"
+    printf '\xff'
+    printf -- '-byte"}]\n'
+    ;;
+  missing-id)
+    active_instance_json "${unrelated_id}" | jq '.[0] |= del(.cluster_id)'
+    ;;
+  null-id)
+    active_instance_json "${unrelated_id}" | jq '.[0].cluster_id = null'
+    ;;
+  numeric-id)
+    active_instance_json "${unrelated_id}" | jq '.[0].cluster_id = 7'
+    ;;
+  unsafe-id)
+    active_instance_json "${unrelated_id}" | jq '.[0].cluster_id = "ABCDEFGHIJKLM"'
+    ;;
+  unsafe-id-newline)
+    active_instance_json "${unrelated_id}" | jq '.[0].cluster_id = "abcdefghijklm\n"'
+    ;;
+  unsafe-id-short)
+    active_instance_json "${unrelated_id}" | jq '.[0].cluster_id = "abcdefghijkl"'
+    ;;
+  unsafe-id-long)
+    active_instance_json "${unrelated_id}" | jq '.[0].cluster_id = "abcdefghijklmno"'
+    ;;
+  valid-14-id)
+    active_instance_json 'abcdefghijklmn' | jq '.[0].labels = {}'
+    ;;
+  scalar-row) printf '[null]\n' ;;
+  labels-scalar)
+    active_instance_json "${unrelated_id}" | jq '.[0].labels = "schema-drift"'
+    ;;
+  labels-numeric)
+    active_instance_json "${unrelated_id}" | jq '.[0].labels["ratchet-node"] = 7'
+    ;;
+  shape-scalar)
+    active_instance_json "${unrelated_id}" | jq '.[0].shape = "schema-drift"'
+    ;;
+  shape-cpu-string)
+    active_instance_json "${unrelated_id}" | jq '.[0].shape.virtual_cpu = "16"'
+    ;;
+  shape-memory-string)
+    active_instance_json "${unrelated_id}" | jq '.[0].shape.memory_megabytes = "32768"'
+    ;;
+  shape-arch-number)
+    active_instance_json "${unrelated_id}" | jq '.[0].shape.machine_arch = 64'
+    ;;
+  shape-os-number)
+    active_instance_json "${unrelated_id}" | jq '.[0].shape.os = 7'
+    ;;
+  duplicate-id)
+    active_instance_json "${unrelated_id}" | jq '. + .'
+    ;;
+  top-object) printf '{}\n' ;;
+  missing-exact-id) active_instance_json "${unrelated_id}" ;;
+  *)
+    echo "shim: unmodeled list form ${form}" >&2
+    exit 54
+    ;;
+  esac
 }
 
 write_synthetic_report() {
@@ -1556,39 +1661,13 @@ list)
   printf 'fixture direct-list stderr\n' >&2
   if [ -f "${state}/destroyed" ]; then
     if [ "${NSC_SHIM_FAIL_STAGE:-}" = 'absence' ]; then
-      active_instance_json
+      emit_list_form array
     else
-      printf 'null\n'
+      emit_list_form "${NSC_SHIM_AFTER_DESTROY_LIST_FORM:-null}"
     fi
     exit 0
   fi
-  case "${NSC_SHIM_LIST_FORM:-array}" in
-  array) active_instance_json ;;
-  empty) : ;;
-  nonzero-valid)
-    active_instance_json
-    exit 29
-    ;;
-  multiple)
-    active_instance_json
-    active_instance_json
-    ;;
-  malformed) printf '[{"cluster_id":"%s"}' "${id}" ;;
-  escape)
-    active_instance_json
-    printf '\033[0K'
-    ;;
-  invalid-utf8)
-    printf '[{"cluster_id":"%s","labels":{"ratchet-node":"fleet","ratchet-generation":"9"},"shape":{"virtual_cpu":16,"memory_megabytes":32768,"machine_arch":"amd64","os":"linux"},"kubernetes":"1.33","ignored":"audited-' "${id}"
-    printf '\xff'
-    printf -- '-byte"}]\n'
-    ;;
-  missing-id) active_instance_json 'zzzzzzzzzzzzz' ;;
-  *)
-    echo "shim: unmodeled list form ${NSC_SHIM_LIST_FORM:-}" >&2
-    exit 54
-    ;;
-  esac
+  emit_list_form "${NSC_SHIM_LIST_FORM:-array}"
   ;;
 destroy)
   log "destroy"$'\t'"${1:-}"$'\t'"${2:-}"
@@ -1682,6 +1761,7 @@ NSL_NSC_SHIM
       PATH="${nsl_bin}:${PATH}" \
       NSC_SHIM_STATE="${nsl_state}" \
       NSC_SHIM_ID="${nsl_id}" \
+      NSC_SHIM_REAL_GREP="${nsl_real_grep}" \
       FLEET_SIT_REPORT="${nsl_report}" \
       "$@" \
       bash "${nsl_fixture}/scripts/ci/fleet-sit-proof.sh" --full \
@@ -1722,6 +1802,7 @@ NSL_NSC_SHIM
   nsl_prepare_state="${nsl_root}/prepare-state"
   mkdir -p "${nsl_prepare_state}"
   env PATH="${nsl_bin}:${PATH}" NSC_SHIM_STATE="${nsl_prepare_state}" NSC_SHIM_ID="${nsl_id}" \
+    NSC_SHIM_REAL_GREP="${nsl_real_grep}" \
     FLEET_SIT_REPORT="${nsl_root}/prepare-report" \
     bash "${nsl_fixture}/scripts/ci/fleet-sit-proof.sh" --prepare-only \
     >"${nsl_root}/prepare.stdout" 2>"${nsl_root}/prepare.stderr" ||
@@ -1922,9 +2003,196 @@ NSL_NSC_SHIM
   ' "${nsl_invalid_utf8_raw}" >/dev/null ||
     fail 'jq alone no longer accepts the success-shaped raw 0xff fixture, so the regression test is not specific'
 
+  nsl_uncertain_listing=''
+  nsl_assert_unproven_absence() {
+    local name="$1"
+    local attempt
+    nsl_assert_exact_destroy "${name}"
+    nsl_assert_failed_lifecycle "${name}"
+    jq -e '
+      .failureStage == "exact-id-destroy-and-absence" and
+      .cleanup.destroySucceeded == true and
+      .cleanup.exactIdAbsenceProven == false
+    ' "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+      fail "Namespace lifecycle ${name}: schema uncertainty became exact-id absence"
+    attempt="$(jq -r '.cleanup.destroyAttempts' \
+      "${nsl_report}/lifecycle/lifecycle.json")"
+    [[ ${attempt} =~ ^[1-9][0-9]*$ ]] ||
+      fail "Namespace lifecycle ${name}: cleanup attempt count is invalid"
+    nsl_uncertain_listing="${nsl_report}/lifecycle/destroy-attempt-${attempt}/list-after-destroy-10.json"
+    test -s "${nsl_uncertain_listing}.raw" &&
+      test -e "${nsl_uncertain_listing}.stderr" ||
+      fail "Namespace lifecycle ${name}: uncertain absence bytes were not retained"
+    test ! -e "${nsl_uncertain_listing}" ||
+      fail "Namespace lifecycle ${name}: uncertain absence bytes reached the validated output"
+  }
+
+  nsl_assert_schema_fixture() {
+    local form="$1" raw="$2"
+    jq -e -s --arg form "${form}" --arg target "${nsl_id}" '
+      def selector_safe_id:
+        type == "string" and test("\\A[a-z0-9]{13,14}\\z");
+      def reviewed_labels:
+        type == "object" and all(.[]; type == "string");
+      def reviewed_shape:
+        type == "object" and
+        (.virtual_cpu | type) == "number" and
+        (.memory_megabytes | type) == "number" and
+        (.machine_arch | type) == "string" and
+        (.os | type) == "string";
+      def one_row:
+        length == 1 and (.[0] | type) == "array" and (.[0] | length) == 1;
+      if $form == "top-object" then
+        length == 1 and (.[0] | type) == "object" and (.[0] | length) == 0
+      elif $form == "multiple-null" then
+        length == 2 and all(.[]; . == null)
+      elif $form == "scalar-row" then
+        length == 1 and .[0] == [null]
+      elif $form == "duplicate-id" then
+        length == 1 and (.[0] | type) == "array" and (.[0] | length) == 2 and
+        .[0][0].cluster_id == .[0][1].cluster_id and
+        .[0][0].cluster_id != $target and
+        all(.[0][];
+          (type == "object") and
+          (.cluster_id | selector_safe_id) and
+          (.labels | reviewed_labels) and
+          (.shape | reviewed_shape))
+      elif one_row then
+        .[0][0] as $row |
+        if $form == "missing-id" then
+          ($row | type) == "object" and
+          ($row | has("cluster_id") | not) and
+          ($row.labels | reviewed_labels) and ($row.shape | reviewed_shape)
+        elif $form == "null-id" then
+          $row.cluster_id == null and
+          ($row.labels | reviewed_labels) and ($row.shape | reviewed_shape)
+        elif $form == "numeric-id" then
+          ($row.cluster_id | type) == "number" and
+          ($row.labels | reviewed_labels) and ($row.shape | reviewed_shape)
+        elif ($form | startswith("unsafe-id")) then
+          ($row.cluster_id | type) == "string" and
+          ($row.cluster_id | selector_safe_id | not) and
+          ($row.labels | reviewed_labels) and ($row.shape | reviewed_shape)
+        elif $form == "labels-scalar" then
+          ($row.cluster_id | selector_safe_id) and $row.cluster_id != $target and
+          ($row.labels | type) == "string" and ($row.shape | reviewed_shape)
+        elif $form == "labels-numeric" then
+          ($row.cluster_id | selector_safe_id) and $row.cluster_id != $target and
+          ($row.labels | type) == "object" and
+          ($row.labels["ratchet-node"] | type) == "number" and
+          ($row.shape | reviewed_shape)
+        elif $form == "shape-scalar" then
+          ($row.cluster_id | selector_safe_id) and $row.cluster_id != $target and
+          ($row.labels | reviewed_labels) and ($row.shape | type) == "string"
+        elif $form == "shape-cpu-string" then
+          ($row.cluster_id | selector_safe_id) and $row.cluster_id != $target and
+          ($row.labels | reviewed_labels) and ($row.shape | type) == "object" and
+          ($row.shape.virtual_cpu | type) == "string" and
+          ($row.shape.memory_megabytes | type) == "number" and
+          ($row.shape.machine_arch | type) == "string" and
+          ($row.shape.os | type) == "string"
+        elif $form == "shape-memory-string" then
+          ($row.cluster_id | selector_safe_id) and $row.cluster_id != $target and
+          ($row.labels | reviewed_labels) and ($row.shape | type) == "object" and
+          ($row.shape.virtual_cpu | type) == "number" and
+          ($row.shape.memory_megabytes | type) == "string" and
+          ($row.shape.machine_arch | type) == "string" and
+          ($row.shape.os | type) == "string"
+        elif $form == "shape-arch-number" then
+          ($row.cluster_id | selector_safe_id) and $row.cluster_id != $target and
+          ($row.labels | reviewed_labels) and ($row.shape | type) == "object" and
+          ($row.shape.virtual_cpu | type) == "number" and
+          ($row.shape.memory_megabytes | type) == "number" and
+          ($row.shape.machine_arch | type) == "number" and
+          ($row.shape.os | type) == "string"
+        elif $form == "shape-os-number" then
+          ($row.cluster_id | selector_safe_id) and $row.cluster_id != $target and
+          ($row.labels | reviewed_labels) and ($row.shape | type) == "object" and
+          ($row.shape.virtual_cpu | type) == "number" and
+          ($row.shape.memory_megabytes | type) == "number" and
+          ($row.shape.machine_arch | type) == "string" and
+          ($row.shape.os | type) == "number"
+        else false
+        end
+      else false
+      end
+    ' "${raw}" >/dev/null ||
+      fail "Namespace lifecycle schema fixture ${form} does not isolate its named uncertainty"
+  }
+
+  nsl_assert_schema_uncertain_absence_refusal() {
+    local name="$1" form="$2"
+    nsl_run "${name}" fail "NSC_SHIM_AFTER_DESTROY_LIST_FORM=${form}"
+    nsl_assert_unproven_absence "${name}"
+    nsl_assert_schema_fixture "${form}" "${nsl_uncertain_listing}.raw"
+    grep -qF \
+      'nsc list stdout is not exactly one JSON null or array value with schema-valid rows' \
+      "${nsl_root}/cases/${name}/stderr.txt" ||
+      fail "Namespace lifecycle ${name}: schema-valid-row refusal was not emitted"
+    echo "    ${name}: destructive-path schema uncertainty refused ✓"
+  }
+
+  while IFS=$'\t' read -r nsl_schema_name nsl_schema_form; do
+    nsl_assert_schema_uncertain_absence_refusal \
+      "schema-absence-${nsl_schema_name}" "${nsl_schema_form}"
+  done <<'NSL_SCHEMA_CASES'
+missing-id	missing-id
+null-id	null-id
+numeric-id	numeric-id
+unsafe-id	unsafe-id
+unsafe-id-newline	unsafe-id-newline
+unsafe-id-short	unsafe-id-short
+unsafe-id-long	unsafe-id-long
+scalar-row	scalar-row
+labels-scalar	labels-scalar
+labels-numeric	labels-numeric
+shape-scalar	shape-scalar
+shape-cpu-string	shape-cpu-string
+shape-memory-string	shape-memory-string
+shape-arch-number	shape-arch-number
+shape-os-number	shape-os-number
+duplicate-id	duplicate-id
+top-object	top-object
+multiple-values	multiple-null
+NSL_SCHEMA_CASES
+
+  nsl_run schema-absence-grep-error fail \
+    NSC_SHIM_GREP_FAILURE_AFTER_DESTROY=1
+  nsl_assert_unproven_absence schema-absence-grep-error
+  jq -e -s 'length == 1 and .[0] == null' \
+    "${nsl_uncertain_listing}.raw" >/dev/null ||
+    fail 'Namespace lifecycle grep-error fixture is not a success-shaped JSON null absence'
+  grep -qF 'nsc list ESC scan failed: grep exited 2' \
+    "${nsl_root}/cases/schema-absence-grep-error/stderr.txt" ||
+    fail 'Namespace lifecycle grep execution error was not distinguished from ordinary no-match'
+  echo '    schema-absence-grep-error: grep execution failure refused after destroy ✓'
+
+  # The emergency selector seam admits the two reviewed service shapes even
+  # though first use remains pinned to 13 characters. A valid unrelated 14-byte
+  # row therefore crosses the raw boundary and does not block exact-id absence.
+  nsl_run schema-valid-fourteen-id pass \
+    NSC_SHIM_AFTER_DESTROY_LIST_FORM=valid-14-id
+  nsl_assert_exact_destroy schema-valid-fourteen-id
+  nsl_valid_fourteen_listing="${nsl_report}/lifecycle/destroy-attempt-1/list-after-destroy-1.json"
+  if ! { test -s "${nsl_valid_fourteen_listing}" &&
+    cmp -s "${nsl_valid_fourteen_listing}.raw" "${nsl_valid_fourteen_listing}"; }; then
+    fail 'Namespace lifecycle valid 14-character row did not cross the raw list boundary intact'
+  fi
+  jq -e -s '
+    length == 1 and (.[0] | type) == "array" and (.[0] | length) == 1 and
+    (.[0][0].cluster_id | test("\\A[a-z0-9]{14}\\z")) and
+    (.[0][0].labels | type) == "object" and
+    (.[0][0].shape.virtual_cpu | type) == "number" and
+    (.[0][0].shape.memory_megabytes | type) == "number" and
+    (.[0][0].shape.machine_arch | type) == "string" and
+    (.[0][0].shape.os | type) == "string"
+  ' "${nsl_valid_fourteen_listing}" >/dev/null ||
+    fail 'Namespace lifecycle valid 14-character row lost its reviewed schema'
+  echo '    schema-valid-fourteen-id: selector-safe emergency shape admitted ✓'
+
   # A syntactically valid array reaches the exact-id selection predicate but
   # cannot authorize first use unless it contains the one registered id.
-  nsl_run list-missing-exact-id fail NSC_SHIM_LIST_FORM=missing-id
+  nsl_run list-missing-exact-id fail NSC_SHIM_LIST_FORM=missing-exact-id
   nsl_assert_closed_cleanup list-missing-exact-id
   nsl_list_before="${nsl_report}/lifecycle/list-before-use.json"
   if ! { test -s "${nsl_list_before}" &&
@@ -1977,6 +2245,83 @@ NSL_NSC_SHIM
       -m "Remove ${label} list guard" --only scripts/ci/fleet-sit-proof.sh
   }
 
+  nsl_install_exact_proof_line_mutant() {
+    local label="$1" clause="$2"
+    local proof_path='scripts/ci/fleet-sit-proof.sh'
+    local expected_stat=$'0\t1\tscripts/ci/fleet-sit-proof.sh'
+    local mutation_stat
+    awk -v clause="${clause}" '
+      BEGIN { found = 0 }
+      $0 == clause { found++; next }
+      { print }
+      END { if (found != 1) exit 89 }
+    ' "${nsl_proof_baseline}" >"${nsl_fixture}/${proof_path}" ||
+      fail "could not delete the exact ${label} production clause"
+    git -C "${nsl_fixture}" add "${proof_path}"
+    if git -C "${nsl_fixture}" diff --cached --quiet; then
+      fail "the exact ${label} production-clause mutation changed no bytes"
+    fi
+    mutation_stat="$(git -C "${nsl_fixture}" diff --cached --numstat -- "${proof_path}")"
+    [ "${mutation_stat}" = "${expected_stat}" ] ||
+      fail "the exact ${label} mutation did not delete one production line"
+    git -C "${nsl_fixture}" diff --cached --unified=0 -- "${proof_path}" |
+      grep -qxF -- "-${clause}" ||
+      fail "the exact ${label} mutation deleted a different production line"
+    git -C "${nsl_fixture}" commit --quiet \
+      -m "Remove ${label} clause" --only "${proof_path}"
+    mutation_stat="$(git -C "${nsl_fixture}" diff-tree --no-commit-id --numstat -r HEAD)"
+    [ "${mutation_stat}" = "${expected_stat}" ] ||
+      fail "the committed ${label} mutant changed more than one production line"
+  }
+
+  nsl_install_exact_proof_block_mutant() {
+    local label="$1" start_clause="$2" end_clause="$3" deleted_count="$4"
+    local proof_path='scripts/ci/fleet-sit-proof.sh'
+    local expected_stat
+    local mutation_stat
+    expected_stat="0"$'\t'"${deleted_count}"$'\t'"${proof_path}"
+    awk \
+      -v start_clause="${start_clause}" \
+      -v end_clause="${end_clause}" \
+      -v expected_deleted="${deleted_count}" '
+        BEGIN { found = 0; skipping = 0; deleted = 0 }
+        !skipping && $0 == start_clause {
+          found++
+          skipping = 1
+          deleted++
+          next
+        }
+        skipping {
+          deleted++
+          if ($0 == end_clause) skipping = 0
+          next
+        }
+        { print }
+        END {
+          if (found != 1 || skipping || deleted != expected_deleted) exit 89
+        }
+      ' "${nsl_proof_baseline}" >"${nsl_fixture}/${proof_path}" ||
+      fail "could not delete the exact ${label} production block"
+    git -C "${nsl_fixture}" add "${proof_path}"
+    if git -C "${nsl_fixture}" diff --cached --quiet; then
+      fail "the exact ${label} production-block mutation changed no bytes"
+    fi
+    mutation_stat="$(git -C "${nsl_fixture}" diff --cached --numstat -- "${proof_path}")"
+    [ "${mutation_stat}" = "${expected_stat}" ] ||
+      fail "the exact ${label} mutation did not delete ${deleted_count} production lines"
+    git -C "${nsl_fixture}" diff --cached --unified=0 -- "${proof_path}" |
+      grep -qxF -- "-${start_clause}" ||
+      fail "the exact ${label} mutation did not delete its opening production clause"
+    git -C "${nsl_fixture}" diff --cached --unified=0 -- "${proof_path}" |
+      grep -qxF -- "-${end_clause}" ||
+      fail "the exact ${label} mutation did not delete its closing production clause"
+    git -C "${nsl_fixture}" commit --quiet \
+      -m "Remove ${label} block" --only "${proof_path}"
+    mutation_stat="$(git -C "${nsl_fixture}" diff-tree --no-commit-id --numstat -r HEAD)"
+    [ "${mutation_stat}" = "${expected_stat}" ] ||
+      fail "the committed ${label} mutant changed outside its exact production block"
+  }
+
   nsl_install_live_label_guard_mutant() {
     local label="$1" clause="$2"
     local proof_path='scripts/ci/fleet-sit-proof.sh'
@@ -2013,6 +2358,25 @@ NSL_NSC_SHIM
       git -C "${nsl_fixture}" commit --quiet \
         -m 'Restore direct list guards' --only scripts/ci/fleet-sit-proof.sh
     fi
+  }
+
+  nsl_assert_false_absence_mutant_pass() {
+    local name="$1" form="$2"
+    local listing="${nsl_report}/lifecycle/destroy-attempt-1/list-after-destroy-1.json"
+    nsl_assert_exact_destroy "${name}"
+    jq -e '
+      .status == "pass" and .failureStage == "complete" and
+      .cleanup.destroySucceeded == true and
+      .cleanup.exactIdAbsenceProven == true
+    ' "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+      fail "Namespace lifecycle ${name}: deleted production clause did not reopen false absence"
+    if ! { test -s "${listing}" && test -s "${listing}.raw" &&
+      cmp -s "${listing}.raw" "${listing}"; }; then
+      fail "Namespace lifecycle ${name}: mutant did not publish the uncertain bytes as validated absence"
+    fi
+    [ -z "${form}" ] ||
+      nsl_assert_schema_fixture "${form}" "${listing}.raw"
+    echo "    ${name}: exact production-line deletion re-opened false absence ✓"
   }
 
   nsl_install_list_guard_mutant \
@@ -2069,6 +2433,79 @@ NSL_NSC_SHIM
     length == 1 and (.[0] | type) == "array" and .[0][0].cluster_id == $id
   ' "${nsl_list_before}" >/dev/null ||
     fail 'the UTF-8 guard mutant did not prove jq alone accepts the invalid success-shaped list'
+  nsl_restore_list_proof
+
+  # Delete the exact jq admission call, then replay every targeted malformed row
+  # after destructive cleanup. Each run must become a false lifecycle pass under
+  # the mutant, proving the production row-schema clause—not test prose—closed it.
+  nsl_install_exact_proof_line_mutant \
+    row-schema '      all(.[0][]; reviewed_row) and'
+  while IFS=$'\t' read -r nsl_schema_name nsl_schema_form; do
+    nsl_run "mutation-schema-${nsl_schema_name}" pass \
+      "NSC_SHIM_AFTER_DESTROY_LIST_FORM=${nsl_schema_form}"
+    nsl_assert_false_absence_mutant_pass \
+      "mutation-schema-${nsl_schema_name}" "${nsl_schema_form}"
+  done <<'NSL_ROW_SCHEMA_MUTANTS'
+missing-id	missing-id
+null-id	null-id
+numeric-id	numeric-id
+unsafe-id	unsafe-id
+unsafe-id-newline	unsafe-id-newline
+unsafe-id-short	unsafe-id-short
+unsafe-id-long	unsafe-id-long
+scalar-row	scalar-row
+labels-scalar	labels-scalar
+labels-numeric	labels-numeric
+shape-scalar	shape-scalar
+shape-cpu-string	shape-cpu-string
+shape-memory-string	shape-memory-string
+shape-arch-number	shape-arch-number
+shape-os-number	shape-os-number
+NSL_ROW_SCHEMA_MUTANTS
+  nsl_restore_list_proof
+
+  # Each remaining one-line admission clause gets its own destructive-path
+  # mutant. The fixture is success-shaped for every other production predicate.
+  nsl_install_exact_proof_line_mutant \
+    top-level-array '      (.[0] | type) == "array" and'
+  nsl_run mutation-schema-top-object pass \
+    NSC_SHIM_AFTER_DESTROY_LIST_FORM=top-object
+  nsl_assert_false_absence_mutant_pass mutation-schema-top-object top-object
+  nsl_restore_list_proof
+
+  nsl_install_exact_proof_line_mutant \
+    single-document '    length == 1 and'
+  nsl_run mutation-schema-multiple-values pass \
+    NSC_SHIM_AFTER_DESTROY_LIST_FORM=multiple-null
+  nsl_assert_false_absence_mutant_pass \
+    mutation-schema-multiple-values multiple-null
+  nsl_restore_list_proof
+
+  # The jq variable is literal production source, not a shell expansion.
+  # shellcheck disable=SC2016
+  nsl_install_exact_proof_line_mutant \
+    duplicate-id \
+    '      ([.[0][] | select(type == "object") | .cluster_id] as $ids | ($ids | length) == ($ids | unique | length)) and'
+  nsl_run mutation-schema-duplicate-id pass \
+    NSC_SHIM_AFTER_DESTROY_LIST_FORM=duplicate-id
+  nsl_assert_false_absence_mutant_pass \
+    mutation-schema-duplicate-id duplicate-id
+  nsl_restore_list_proof
+
+  # Status 2 is injected only after exact destroy. Deleting precisely the grep
+  # execution-error branch must turn that uncertainty into a false null absence.
+  nsl_install_exact_proof_block_mutant \
+    grep-execution-error \
+    '    [2-9] | [1-9][0-9]*)' \
+    '      ;;' \
+    4
+  nsl_run mutation-schema-grep-error pass \
+    NSC_SHIM_GREP_FAILURE_AFTER_DESTROY=1
+  nsl_assert_false_absence_mutant_pass mutation-schema-grep-error ''
+  jq -e -s 'length == 1 and .[0] == null' \
+    "${nsl_report}/lifecycle/destroy-attempt-1/list-after-destroy-1.json.raw" \
+    >/dev/null ||
+    fail 'the grep-error mutant did not falsely accept a success-shaped JSON null'
   nsl_restore_list_proof
 
   # Delete exactly one jq clause from the committed production wrapper. The
