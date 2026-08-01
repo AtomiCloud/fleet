@@ -1303,13 +1303,34 @@ sit-namespace-lifecycle | sit-proof-lifecycle)
     fail 'the production Namespace outer preflight does not require iconv'
   rg -qF 'iconv -f UTF-8 -t UTF-8 "${raw}" >/dev/null' "${proof_source}" ||
     fail 'the production Namespace list path has no checked raw UTF-8 boundary'
-  rg -qF 'namespace_first_line_receipt apk info --who-owns "${path}"' "${sit_source}" ||
-    fail 'Wolfi BusyBox tool receipts no longer use fail-closed package ownership'
+  # BusyBox applet paths are created by the busybox package trigger and are not
+  # in its file manifest, so apk cannot own them: the generation-11 run at
+  # product b67f0ba died on `apk info --who-owns /sbin/gzip`. The receipt must
+  # query the identity-proven busybox binary instead, and must never revert to
+  # the applet path.
+  rg -qF 'namespace_first_line_receipt apk info --who-owns "${busybox_path}"' "${sit_source}" ||
+    fail 'Wolfi BusyBox tool receipts no longer use fail-closed package ownership of the busybox binary'
+  if rg -qF 'apk info --who-owns "${path}"' "${sit_source}"; then
+    fail 'a Wolfi BusyBox applet receipt reverted to the unowned applet path that failed on the instance'
+  fi
+  rg -qF 'busybox_path="$(command -v busybox 2>/dev/null || true)"' "${sit_source}" ||
+    fail 'the Wolfi applet receipt no longer resolves busybox from PATH fail-closed'
+  rg -qF 'busybox is not on PATH for the applet ownership receipt' "${sit_source}" ||
+    fail 'the Wolfi applet receipt no longer refuses a missing busybox binary'
+  rg -qF '[ "${path}" -ef "${busybox_path}" ] ||' "${sit_source}" ||
+    fail 'the Wolfi applet receipt no longer binds the applet to busybox by file identity'
+  rg -qF 'applet is not the same file as the busybox binary' "${sit_source}" ||
+    fail 'the Wolfi applet identity refusal no longer names the applet and the busybox binary'
+  # The failing receipt command's own words are the only thing that separates an
+  # unowned path from an unsupported ownership invocation. R1 of g11c made the
+  # same repair for the git checkout predicate.
+  rg -qF 'sit_fail "tool receipt command failed: $*: ${output}"' "${sit_source}" ||
+    fail 'the tool receipt failure diagnostic discards the failing command output again'
   if rg -n '(sha256sum|tar|timeout)[[:space:]]+--version' "${sit_source}"; then
     fail 'a Wolfi BusyBox applet receipt reverted to a non-portable GNU --version probe'
   fi
-  rg -qF 'apk awk bash curl docker git gzip head jq kubectl mkfifo nproc sed sha256sum tar tee timeout tr' \
-    "${sit_source}" || fail 'the Namespace bootstrap gate no longer requires nproc before use'
+  rg -qF 'apk awk bash busybox curl docker git gzip head jq kubectl mkfifo nproc sed sha256sum tar tee timeout tr' \
+    "${sit_source}" || fail 'the Namespace bootstrap gate no longer requires nproc and busybox before use'
   rg -qF 'sit_require_command "${bootstrap}"' "${sit_source}" ||
     fail 'the Namespace bootstrap command gate disappeared'
   rg -qF "'namespace-platform.json' 'pins-verified.txt'" "${sit_source}" ||
@@ -1370,6 +1391,222 @@ NSL_TOOL_RECEIPT_DRIVER
   bash "${tmp}/namespace-tool-receipt-driver.sh" \
     "${nsl_tool_fns}" "${tmp}/namespace-tool-receipt-work" ||
     fail 'Namespace tool-version receipts did not fail closed'
+
+  # BusyBox applet ownership receipts, again as extracted production bytes
+  # rather than a transcription, driven against real symlink and hardlink
+  # fixtures and a PATH-first fake busybox plus fake apk. The fake apk answers
+  # only for the busybox binary, which is exactly the asymmetry the repair
+  # depends on. The same driver is the shared acceptance predicate for the
+  # unmutated baseline and for both isolated mutants, and each assertion has a
+  # distinct exit status and witness line, so a mutant that dies of exit 127, a
+  # syntax error, a missing fixture or an unrelated assertion cannot be
+  # mistaken for a mutation that was genuinely caught.
+  nsl_wolfi_fns="${tmp}/namespace-wolfi-receipt-fns.sh"
+  : >"${nsl_wolfi_fns}"
+  for nsl_wolfi_fn in \
+    namespace_tool_record \
+    namespace_first_line_receipt \
+    namespace_wolfi_tool_receipt \
+    namespace_wolfi_tool_record; do
+    sed -n "/^${nsl_wolfi_fn}() {\$/,/^}\$/p" "${sit_source}" >"${tmp}/nsl-wolfi-fn.sh"
+    test -s "${tmp}/nsl-wolfi-fn.sh" ||
+      fail "could not extract ${nsl_wolfi_fn}() for the BusyBox applet ownership test"
+    [ "$(tail -n 1 "${tmp}/nsl-wolfi-fn.sh")" = '}' ] ||
+      fail "the extracted ${nsl_wolfi_fn}() applet helper is unterminated"
+    cat "${tmp}/nsl-wolfi-fn.sh" >>"${nsl_wolfi_fns}"
+  done
+  cat >"${tmp}/namespace-wolfi-receipt-driver.sh" <<'NSL_WOLFI_RECEIPT_DRIVER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+fn_file="$1"
+work="$2"
+rm -rf "${work}"
+mkdir -p "${work}"
+
+sit_fail() {
+  printf 'fixture refusal: %s\n' "$*" >&2
+  return 1
+}
+
+nsl_die() {
+  printf 'NSL-WOLFI-ASSERTION-FAILED: %s\n' "$2" >&2
+  exit "$1"
+}
+
+# shellcheck source=/dev/null
+source "${fn_file}"
+
+apk_bin="${work}/apkbin"
+bb_bin="${work}/bbbin"
+applets="${work}/applets"
+mkdir -p "${apk_bin}" "${bb_bin}" "${applets}"
+
+printf '#!/bin/sh\nexit 0\n' >"${bb_bin}/busybox"
+chmod 755 "${bb_bin}/busybox"
+NSL_BUSYBOX_PATH="${bb_bin}/busybox"
+export NSL_BUSYBOX_PATH
+
+# Ownership is answered only for the busybox binary itself. An applet path is
+# refused exactly as the instance's apk refused /sbin/gzip.
+cat >"${apk_bin}/apk" <<'NSL_FAKE_APK'
+#!/bin/sh
+case "${NSL_APK_MODE:-owned}" in
+fail)
+  echo "apk fixture refuses ownership: $*" >&2
+  exit 1
+  ;;
+empty)
+  exit 0
+  ;;
+esac
+if [ "$3" = "${NSL_BUSYBOX_PATH}" ]; then
+  echo "${NSL_BUSYBOX_PATH} is owned by busybox-1.37.0-r59"
+  exit 0
+fi
+echo "ERROR: $3: could not find owner package" >&2
+exit 1
+NSL_FAKE_APK
+chmod 755 "${apk_bin}/apk"
+
+nsl_outer_path="${PATH}"
+PATH="${apk_bin}:${bb_bin}:${nsl_outer_path}"
+export PATH
+
+# Real inode relationships, not simulated ones.
+ln -s "${bb_bin}/busybox" "${applets}/gzip"
+ln "${bb_bin}/busybox" "${applets}/sha256sum"
+printf '#!/bin/sh\nexit 0\n' >"${applets}/tar"
+chmod 755 "${applets}/tar"
+ln -s "${applets}/no-such-busybox" "${applets}/dangling"
+
+owned_line="${NSL_BUSYBOX_PATH} is owned by busybox-1.37.0-r59"
+
+# 1. symlinked applet succeeds, and the row keeps the applet path.
+namespace_wolfi_tool_record gzip "${applets}/gzip" 2>"${work}/t1.err" ||
+  nsl_die 41 symlink-applet-success
+grep -qxF "$(printf 'gzip\t%s\t%s' "${applets}/gzip" "${owned_line}")" \
+  "${work}/namespace-tools.tsv" ||
+  nsl_die 41 symlink-applet-evidence
+
+# 2. hardlinked applet succeeds. This is the case a basename guard got wrong.
+namespace_wolfi_tool_record sha256sum "${applets}/sha256sum" 2>"${work}/t2.err" ||
+  nsl_die 42 hardlink-applet-success
+grep -qxF "$(printf 'sha256sum\t%s\t%s' "${applets}/sha256sum" "${owned_line}")" \
+  "${work}/namespace-tools.tsv" ||
+  nsl_die 42 hardlink-applet-evidence
+
+# 3. an unrelated regular file is refused, and the refusal names both paths.
+if namespace_wolfi_tool_record tar "${applets}/tar" 2>"${work}/t3.err"; then
+  nsl_die 43 unrelated-regular-file-refusal
+fi
+grep -qF "applet is not the same file as the busybox binary: ${applets}/tar vs ${NSL_BUSYBOX_PATH}" \
+  "${work}/t3.err" ||
+  nsl_die 43 unrelated-regular-file-refusal-message
+
+# 4. a non-zero apk carries its own diagnostic through the receipt.
+if NSL_APK_MODE=fail namespace_wolfi_tool_record gzip-apk-fail "${applets}/gzip" \
+  2>"${work}/t4.err"; then
+  nsl_die 44 apk-failure-refusal
+fi
+grep -qF 'tool receipt command failed' "${work}/t4.err" ||
+  nsl_die 44 apk-failure-refusal-message
+grep -qF 'apk fixture refuses ownership' "${work}/t4.err" ||
+  nsl_die 44 apk-failure-diagnostic-preserved
+
+# 5. a successful but empty apk is refused.
+if NSL_APK_MODE=empty namespace_wolfi_tool_record gzip-apk-empty "${applets}/gzip" \
+  2>"${work}/t5.err"; then
+  nsl_die 45 apk-empty-output-refusal
+fi
+grep -qF 'returned no version or ownership line' "${work}/t5.err" ||
+  nsl_die 45 apk-empty-output-refusal-message
+
+# 6. a missing busybox is refused before apk is ever consulted. Only Bash
+# builtins run on this path, so dropping the fixture directories is safe.
+if PATH="${apk_bin}" namespace_wolfi_tool_record gzip-no-busybox "${applets}/gzip" \
+  2>"${work}/t6.err"; then
+  nsl_die 46 missing-busybox-refusal
+fi
+grep -qF "busybox is not on PATH for the applet ownership receipt: ${applets}/gzip" \
+  "${work}/t6.err" ||
+  nsl_die 46 missing-busybox-refusal-message
+
+# 7. a dangling applet link is refused rather than resolved.
+if namespace_wolfi_tool_record dangling "${applets}/dangling" 2>"${work}/t7.err"; then
+  nsl_die 47 dangling-applet-refusal
+fi
+grep -qF "applet is not the same file as the busybox binary: ${applets}/dangling vs ${NSL_BUSYBOX_PATH}" \
+  "${work}/t7.err" ||
+  nsl_die 47 dangling-applet-refusal-message
+
+# Only the two accepted applets may have produced evidence rows.
+[ "$(wc -l <"${work}/namespace-tools.tsv" | tr -d ' ')" -eq 2 ] ||
+  nsl_die 48 accepted-applet-row-count
+NSL_WOLFI_RECEIPT_DRIVER
+
+  nsl_wolfi_predicate() {
+    bash "${tmp}/namespace-wolfi-receipt-driver.sh" \
+      "$1" "${tmp}/namespace-wolfi-work-$2" >"${tmp}/nsl-wolfi-$2.out" \
+      2>"${tmp}/nsl-wolfi-$2.err"
+  }
+
+  # The shared unmutated baseline. Without this passing, a mutant's failure
+  # proves nothing at all.
+  bash -n "${nsl_wolfi_fns}" ||
+    fail 'the extracted BusyBox applet receipt helpers are not valid Bash'
+  nsl_wolfi_predicate "${nsl_wolfi_fns}" baseline ||
+    fail 'the BusyBox applet ownership receipt baseline did not pass its own acceptance predicate'
+
+  # M1: remove only the -ef identity guard.
+  nsl_wolfi_m1="${tmp}/namespace-wolfi-receipt-fns-m1.sh"
+  awk '
+    index($0, "-ef \"${busybox_path}\" ] ||") { skip = 1; next }
+    skip && $0 == "  }" { skip = 0; next }
+    skip { next }
+    { print }
+  ' "${nsl_wolfi_fns}" >"${nsl_wolfi_m1}"
+  if cmp -s "${nsl_wolfi_fns}" "${nsl_wolfi_m1}"; then
+    fail 'the M1 mutation did not change the extracted applet receipt, so it proves nothing'
+  fi
+  bash -n "${nsl_wolfi_m1}" ||
+    fail 'the M1 mutant is not valid Bash, so its failure would not be on point'
+  nsl_wolfi_m1_status=0
+  nsl_wolfi_predicate "${nsl_wolfi_m1}" m1 || nsl_wolfi_m1_status="$?"
+  [ "${nsl_wolfi_m1_status}" -ne 0 ] ||
+    fail 'removing the -ef identity guard still passed: the applet binding is not load-bearing'
+  [ "${nsl_wolfi_m1_status}" -eq 43 ] ||
+    fail "the M1 mutant failed with status ${nsl_wolfi_m1_status}, not the unrelated-file assertion"
+  grep -qF 'NSL-WOLFI-ASSERTION-FAILED: unrelated-regular-file-refusal' \
+    "${tmp}/nsl-wolfi-m1.err" ||
+    fail 'the M1 mutant did not fail at the named unrelated-file assertion'
+
+  # M2: change only the ownership query back to the applet path.
+  nsl_wolfi_m2="${tmp}/namespace-wolfi-receipt-fns-m2.sh"
+  awk '
+    {
+      from = "--who-owns \"${busybox_path}\""
+      to = "--who-owns \"${path}\""
+      i = index($0, from)
+      if (i > 0) {
+        $0 = substr($0, 1, i - 1) to substr($0, i + length(from))
+      }
+      print
+    }
+  ' "${nsl_wolfi_fns}" >"${nsl_wolfi_m2}"
+  if cmp -s "${nsl_wolfi_fns}" "${nsl_wolfi_m2}"; then
+    fail 'the M2 mutation did not change the extracted applet receipt, so it proves nothing'
+  fi
+  bash -n "${nsl_wolfi_m2}" ||
+    fail 'the M2 mutant is not valid Bash, so its failure would not be on point'
+  nsl_wolfi_m2_status=0
+  nsl_wolfi_predicate "${nsl_wolfi_m2}" m2 || nsl_wolfi_m2_status="$?"
+  [ "${nsl_wolfi_m2_status}" -ne 0 ] ||
+    fail 'querying ownership of the applet path still passed: the live g11 defect is not covered'
+  [ "${nsl_wolfi_m2_status}" -eq 41 ] ||
+    fail "the M2 mutant failed with status ${nsl_wolfi_m2_status}, not the symlink assertion"
+  grep -qF 'NSL-WOLFI-ASSERTION-FAILED: symlink-applet-success' \
+    "${tmp}/nsl-wolfi-m2.err" ||
+    fail 'the M2 mutant did not fail at the named symlink assertion'
 
   # The recursive hard-deadline seam, executed for real against a PATH-first
   # timeout spy. The seam `exec`s timeout, so the spy terminates the run before
@@ -2250,7 +2487,7 @@ active_instance_json() {
     --argjson memory "${memory}" \
     --arg kubernetes "${kubernetes}" \
     --arg labelForm "${label_form}" '
-      [{cluster_id:$id,labels:{"ratchet-node":"fleet","ratchet-generation":"11"},
+      [{cluster_id:$id,labels:{"ratchet-node":"fleet","ratchet-generation":"13"},
         shape:{virtual_cpu:$cpu,memory_megabytes:$memory,machine_arch:"amd64",os:"linux"},
         kubernetes:$kubernetes}]
       | if $labelForm == "wrong-generation" then
@@ -2287,7 +2524,7 @@ emit_list_form() {
     printf '\033[0K'
     ;;
   invalid-utf8)
-    printf '[{"cluster_id":"%s","labels":{"ratchet-node":"fleet","ratchet-generation":"11"},"shape":{"virtual_cpu":16,"memory_megabytes":32768,"machine_arch":"amd64","os":"linux"},"kubernetes":"1.33","ignored":"audited-' "${id}"
+    printf '[{"cluster_id":"%s","labels":{"ratchet-node":"fleet","ratchet-generation":"13"},"shape":{"virtual_cpu":16,"memory_megabytes":32768,"machine_arch":"amd64","os":"linux"},"kubernetes":"1.33","ignored":"audited-' "${id}"
     printf '\xff'
     printf -- '-byte"}]\n'
     ;;
@@ -2463,7 +2700,7 @@ create)
   done
   expected=(
     --ephemeral --duration 2h --machine_type 16x32 --enable=kubernetes:1.33
-    --wait_kube_system --label ratchet-node=fleet --label ratchet-generation=11
+    --wait_kube_system --label ratchet-node=fleet --label ratchet-generation=13
     --purpose 'fleet full L0-L9 Namespace built-in-k3s proof'
     --cidfile "${cid}" --output json --output_json_to "${metadata}"
   )
@@ -2881,7 +3118,7 @@ NSL_NSC_SHIM
     .argv == [
       "--ephemeral","--duration","2h","--machine_type","16x32",
       "--enable=kubernetes:1.33","--wait_kube_system",
-      "--label","ratchet-node=fleet","--label","ratchet-generation=11",
+      "--label","ratchet-node=fleet","--label","ratchet-generation=13",
       "--purpose","fleet full L0-L9 Namespace built-in-k3s proof",
       "--cidfile",$cid,"--output","json","--output_json_to",$metadata
     ]
@@ -3247,7 +3484,7 @@ NSL_SCHEMA_CASES
   # validate_live_instance diagnostic and closed exact-id cleanup.
   nsl_run wrong-live-generation fail NSC_SHIM_LIST_LABELS=wrong-generation
   nsl_assert_live_label_refusal \
-    wrong-live-generation ratchet-generation 7 11
+    wrong-live-generation ratchet-generation 7 13
   nsl_run wrong-live-node fail NSC_SHIM_LIST_LABELS=wrong-node
   nsl_assert_live_label_refusal \
     wrong-live-node ratchet-node not-fleet fleet
@@ -3761,7 +3998,7 @@ NSL_ROW_SCHEMA_MUTANTS
   nsl_run mutation-live-generation-guard pass NSC_SHIM_LIST_LABELS=wrong-generation
   nsl_assert_exact_destroy mutation-live-generation-guard
   nsl_assert_single_live_label_delta \
-    mutation-live-generation-guard ratchet-generation 7 11
+    mutation-live-generation-guard ratchet-generation 7 13
   nsl_restore_list_proof
 
   # The jq variable names are literal production bytes, not shell expansions.

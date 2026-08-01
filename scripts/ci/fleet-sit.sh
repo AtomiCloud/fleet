@@ -206,7 +206,7 @@ namespace_prepare_tools() {
     sit_fail "Namespace instance OS must be ${NSC_INSTANCE_OS_ID}, found ${os_id:-unknown}"
 
   local bootstrap
-  for bootstrap in apk awk bash curl docker git gzip head jq kubectl mkfifo nproc sed sha256sum tar tee timeout tr; do
+  for bootstrap in apk awk bash busybox curl docker git gzip head jq kubectl mkfifo nproc sed sha256sum tar tee timeout tr; do
     sit_require_command "${bootstrap}"
   done
   [ -x "${NSC_CONTAINERD_CTR}" ] ||
@@ -255,7 +255,7 @@ namespace_tool_record() {
 namespace_first_line_receipt() {
   local output
   output="$("$@" 2>&1)" || {
-    sit_fail "tool receipt command failed: $*"
+    sit_fail "tool receipt command failed: $*: ${output}"
     return 1
   }
   output="${output%%$'\n'*}"
@@ -273,9 +273,27 @@ namespace_tool_command_record() {
   namespace_tool_record "${name}" "${path}" "${version}"
 }
 
+# BusyBox applets such as gzip, sha256sum, tar and timeout are materialised by
+# the busybox package trigger, not listed in its file manifest, so apk cannot
+# answer `--who-owns` for the applet path itself. Bind the applet to the
+# packaged binary by file identity -- `-ef` compares device and inode after
+# following symlinks, so a symlinked or hardlinked applet is accepted while an
+# unrelated regular file, a byte-identical copy and a dangling link are all
+# refused -- then ask apk about the path that a package can actually own.
+# `command -v` and `[ -ef ]` are Bash builtins, so this adds no new instance
+# dependency; only `busybox` itself, which the bootstrap gate now requires.
 namespace_wolfi_tool_receipt() {
-  local path="$1"
-  namespace_first_line_receipt apk info --who-owns "${path}"
+  local path="$1" busybox_path
+  busybox_path="$(command -v busybox 2>/dev/null || true)"
+  [ -n "${busybox_path}" ] || {
+    sit_fail "busybox is not on PATH for the applet ownership receipt: ${path}"
+    return 1
+  }
+  [ "${path}" -ef "${busybox_path}" ] || {
+    sit_fail "applet is not the same file as the busybox binary: ${path} vs ${busybox_path}"
+    return 1
+  }
+  namespace_first_line_receipt apk info --who-owns "${busybox_path}"
 }
 
 namespace_wolfi_tool_record() {
