@@ -1185,6 +1185,19 @@ sit-namespace-lifecycle | sit-proof-lifecycle)
       fail "the production Namespace ssh call lacks the nsc v0.0.532 remote-command separator: ${nsl_production_ssh_call}"
     fi
   done
+  # nsc v0.0.532 InlineSsh joins the post-separator argv with single spaces, so
+  # a remote program holding spaces or quotes must be exactly one argument. The
+  # behavioural packing regressions below are the real gate; these refuse a
+  # silent reversion to the split `sh -eu -c <program>` form outright.
+  # shellcheck disable=SC2016
+  rg -qF -- '-- "${setup_command}"' "${proof_source}" ||
+    fail 'the production snapshot-setup program is not packed as one remote argument'
+  # shellcheck disable=SC2016
+  rg -qF -- '-- "${archive_command}"' "${proof_source}" ||
+    fail 'the production report-archive program is not packed as one remote argument'
+  if rg -n -- '--[[:space:]]+sh[[:space:]]' "${proof_source}"; then
+    fail 'a production Namespace ssh call reintroduced a nested remote shell that the nsc join would split'
+  fi
   if rg -n "script -q.*nsc list|nsc list.*script -q" "${proof_source}"; then
     fail 'the production Namespace list path still allocates a pseudo-terminal'
   fi
@@ -1703,40 +1716,105 @@ ssh)
     echo 'shim: nsc ssh remote command is empty after --' >&2
     exit 69
   }
-  joined="$(printf '%s ' "$@")"
-  if [ "${1:-}" = 'hostname' ]; then
+  # nsc v0.0.532 InlineSsh (internal/cli/cmd/cluster/ssh.go) puts the remote
+  # program on the wire as strings.Join(args, " "), and the remote login shell
+  # re-parses that one string. The client-side argv boundary therefore never
+  # reaches the instance, so this fake client must not dispatch on it: build the
+  # joined string exactly as nsc does, classify whether the join was lossless,
+  # then drop the original argv so nothing below can be blessed by a boundary
+  # the real remote side cannot observe.
+  remote_argc="$#"
+  remote_command="$(printf '%s ' "$@")"
+  remote_command="${remote_command% }"
+  # An argument survives the join only as a bare word; anything holding
+  # whitespace or shell syntax gets re-split remotely. Every legitimate
+  # multi-argument call the wrapper makes (hostname, the env/bash inner run) is
+  # bare, so a non-bare argument sent alongside others means the join already
+  # destroyed the program the wrapper intended.
+  remote_join_lossy=0
+  if [ "${remote_argc}" -gt 1 ]; then
+    for remote_arg in "$@"; do
+      case "${remote_arg}" in
+      '' | *[!A-Za-z0-9_@%+=:,./-]*) remote_join_lossy=1 ;;
+      esac
+    done
+  fi
+  set --
+  if [ "${remote_join_lossy}" -eq 1 ]; then
+    # Model the loss rather than assert against it, so the fixture reproduces
+    # the retained live failure instead of inventing a shim-only refusal. The
+    # only lossy shape the wrapper has ever produced is `sh <flags> -c <program>`:
+    # after the join the remote shell hands `sh` just the first word of the
+    # program as its -c operand. Both wrapper programs begin with `test`, which
+    # exits 1 with no operands and short-circuits the rest of the && chain, and
+    # nsc renders that as its generic remote status report.
+    case "${remote_command}" in
+    'sh '*' -c '*)
+      remote_operand="${remote_command#*' -c '}"
+      remote_operand="${remote_operand%%' '*}"
+      [ "${remote_operand}" = 'test' ] || {
+        echo "shim: unmodeled joined sh -c operand: ${remote_operand}" >&2
+        exit 75
+      }
+      printf '\n========================================\n' >&2
+      printf 'Failed: Process exited with status 1\n' >&2
+      printf '========================================\n\n' >&2
+      exit 1
+      ;;
+    *)
+      echo "shim: unmodeled lossy ssh serialization: ${remote_command}" >&2
+      exit 75
+      ;;
+    esac
+  fi
+  case "${remote_command}" in
+  hostname)
     if [ "${NSC_SHIM_FAIL_STAGE:-}" = 'hostname' ]; then
       printf 'wronghostname00\n'
     else
       printf '%s\n' "${id}"
     fi
-  elif [ "${1:-}" = 'sh' ] && [[ ${joined} == *source.tgz*sha256sum*check* ]]; then
+    ;;
+  *source.tgz*sha256sum*check*)
+    # The setup program holds spaces and quotes, so the wrapper must pack it as
+    # exactly one remote argument for the join to preserve its bytes.
+    [ "${remote_argc}" -eq 1 ] || {
+      echo 'shim: the setup program must be one remote argument after --' >&2
+      exit 76
+    }
     [ "${NSC_SHIM_FAIL_STAGE:-}" != 'setup' ] || exit 62
     mkdir -p "${state}/remote/result"
     tar -xzf "${state}/source.tgz" -C "${state}/remote"
     printf 'source.tgz: OK\n'
-  elif [ "${1:-}" = 'env' ] && [[ ${joined} == *--inner* ]]; then
+    ;;
+  env\ *--inner)
     [ "${NSC_SHIM_FAIL_STAGE:-}" != 'inner' ] || exit 63
     [ "${NSC_SHIM_FAIL_STAGE:-}" != 'wrong-k3s' ] || {
       echo 'built-in k3s version must be v1.33.1+k3s1, found v1.32.0+k3s1' >&2
       exit 64
     }
-    expected_head=''
-    for arg in "$@"; do
-      case "${arg}" in
-      FLEET_SIT_EXPECTED_HEAD=*) expected_head="${arg#*=}" ;;
-      esac
-    done
+    # Read the inner environment back out of the joined string, not out of the
+    # original argv: the instance only ever sees these words after the join.
+    expected_head="${remote_command#*FLEET_SIT_EXPECTED_HEAD=}"
+    expected_head="${expected_head%%' '*}"
     [[ ${expected_head} =~ ^[0-9a-f]{40}$ ]] || exit 65
     write_synthetic_report "${expected_head}"
-  elif [ "${1:-}" = 'sh' ] && [[ ${joined} == *sit-report.tgz* ]]; then
+    ;;
+  *sit-report.tgz*)
+    # Same packing contract as setup: one remote argument after --.
+    [ "${remote_argc}" -eq 1 ] || {
+      echo 'shim: the archive program must be one remote argument after --' >&2
+      exit 76
+    }
     [ "${NSC_SHIM_FAIL_STAGE:-}" != 'archive' ] || exit 66
     tar -czf "${state}/sit-report.tgz" -C "${state}/remote/result" sit-report
     sha256sum "${state}/sit-report.tgz" | sed 's#  .*#  /tmp/fleet-sit-fixture/result/sit-report.tgz#'
-  else
-    echo "shim: unmodeled ssh argv: ${joined}" >&2
+    ;;
+  *)
+    echo "shim: unmodeled ssh remote command: ${remote_command}" >&2
     exit 67
-  fi
+    ;;
+  esac
   ;;
 instance)
   subcommand="${1:-}"
@@ -2301,7 +2379,10 @@ NSL_SCHEMA_CASES
       fail "the committed ${label} mutant changed more than one production line"
   }
 
-  nsl_install_ssh_separator_mutant() {
+  # Rewrites exactly one reviewed production `nsc ssh` line. Both the separator
+  # mutants and the command-packing regression below are single-line rewrites of
+  # a reviewed call, so they share one installer; the label carries the defect.
+  nsl_install_exact_ssh_call_mutant() {
     local label="$1" exact_call="$2" mutant_call="$3"
     local proof_path='scripts/ci/fleet-sit-proof.sh'
     local expected_stat=$'1\t1\tscripts/ci/fleet-sit-proof.sh'
@@ -2312,25 +2393,25 @@ NSL_SCHEMA_CASES
       { print }
       END { if (found != 1) exit 89 }
     ' "${nsl_proof_baseline}" >"${nsl_fixture}/${proof_path}" ||
-      fail "could not install the exact ${label} ssh-separator mutation"
+      fail "could not install the exact ${label} ssh-call mutation"
     git -C "${nsl_fixture}" add "${proof_path}"
     if git -C "${nsl_fixture}" diff --cached --quiet; then
-      fail "the exact ${label} ssh-separator mutation changed no bytes"
+      fail "the exact ${label} ssh-call mutation changed no bytes"
     fi
     mutation_stat="$(git -C "${nsl_fixture}" diff --cached --numstat -- "${proof_path}")"
     [ "${mutation_stat}" = "${expected_stat}" ] ||
-      fail "the exact ${label} ssh-separator mutation did not replace one production line"
+      fail "the exact ${label} ssh-call mutation did not replace one production line"
     git -C "${nsl_fixture}" diff --cached --unified=0 -- "${proof_path}" |
       grep -qxF -- "-${exact_call}" ||
-      fail "the exact ${label} ssh-separator mutation did not remove its reviewed call"
+      fail "the exact ${label} ssh-call mutation did not remove its reviewed call"
     git -C "${nsl_fixture}" diff --cached --unified=0 -- "${proof_path}" |
       grep -qxF -- "+${mutant_call}" ||
-      fail "the exact ${label} ssh-separator mutation inserted unexpected bytes"
+      fail "the exact ${label} ssh-call mutation inserted unexpected bytes"
     git -C "${nsl_fixture}" commit --quiet \
-      -m "Remove ${label} ssh separator" --only "${proof_path}"
+      -m "Rewrite ${label} ssh call" --only "${proof_path}"
     mutation_stat="$(git -C "${nsl_fixture}" diff-tree --no-commit-id --numstat -r HEAD)"
     [ "${mutation_stat}" = "${expected_stat}" ] ||
-      fail "the committed ${label} ssh-separator mutant changed more than one production line"
+      fail "the committed ${label} ssh-call mutant changed more than one production line"
   }
 
   nsl_install_exact_proof_block_mutant() {
@@ -2431,6 +2512,18 @@ NSL_SCHEMA_CASES
     echo "    ${name}: exact production separator deletion failed closed at ${stage} ✓"
   }
 
+  nsl_assert_ssh_packing_refusal() {
+    local name="$1" stage="$2" retained_stderr="$3"
+    nsl_assert_closed_cleanup "${name}"
+    jq -e --arg stage "${stage}" '.failureStage == $stage' \
+      "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+      fail "Namespace lifecycle ${name}: the unpacked remote program did not fail at ${stage}"
+    grep -qF 'Failed: Process exited with status 1' \
+      "${nsl_report}/lifecycle/${retained_stderr}" ||
+      fail "Namespace lifecycle ${name}: retained stderr did not reproduce the live remote status-1 report"
+    echo "    ${name}: split remote command string failed closed at ${stage} ✓"
+  }
+
   nsl_assert_false_absence_mutant_pass() {
     local name="$1" form="$2"
     local listing="${nsl_report}/lifecycle/destroy-attempt-1/list-after-destroy-1.json"
@@ -2455,8 +2548,8 @@ NSL_SCHEMA_CASES
   # production call and require the fake client to reproduce the real
   # client-side refusal while exact cleanup and absence proof still complete.
   # shellcheck disable=SC1003,SC2016
-  nsl_install_ssh_separator_mutant \
-    hostname \
+  nsl_install_exact_ssh_call_mutant \
+    separator-hostname \
     '  nsc ssh --disable-pty "${instance_id}" -- hostname \' \
     '  nsc ssh --disable-pty "${instance_id}" hostname \'
   nsl_run mutation-ssh-separator-hostname fail
@@ -2465,18 +2558,18 @@ NSL_SCHEMA_CASES
   nsl_restore_list_proof
 
   # shellcheck disable=SC1003,SC2016
-  nsl_install_ssh_separator_mutant \
-    setup \
-    '  nsc ssh --disable-pty "${instance_id}" -- sh -eu -c "${setup_command}" \' \
-    '  nsc ssh --disable-pty "${instance_id}" sh -eu -c "${setup_command}" \'
+  nsl_install_exact_ssh_call_mutant \
+    separator-setup \
+    '  nsc ssh --disable-pty "${instance_id}" -- "${setup_command}" \' \
+    '  nsc ssh --disable-pty "${instance_id}" "${setup_command}" \'
   nsl_run mutation-ssh-separator-setup fail
   nsl_assert_ssh_separator_refusal \
     mutation-ssh-separator-setup snapshot-setup setup.stderr
   nsl_restore_list_proof
 
   # shellcheck disable=SC1003,SC2016
-  nsl_install_ssh_separator_mutant \
-    inner \
+  nsl_install_exact_ssh_call_mutant \
+    separator-inner \
     '    nsc ssh --disable-pty "${instance_id}" -- env \' \
     '    nsc ssh --disable-pty "${instance_id}" env \'
   nsl_run mutation-ssh-separator-inner fail
@@ -2485,13 +2578,42 @@ NSL_SCHEMA_CASES
   nsl_restore_list_proof
 
   # shellcheck disable=SC1003,SC2016
-  nsl_install_ssh_separator_mutant \
-    archive \
-    '  nsc ssh --disable-pty "${instance_id}" -- sh -eu -c "${archive_command}" \' \
-    '  nsc ssh --disable-pty "${instance_id}" sh -eu -c "${archive_command}" \'
+  nsl_install_exact_ssh_call_mutant \
+    separator-archive \
+    '  nsc ssh --disable-pty "${instance_id}" -- "${archive_command}" \' \
+    '  nsc ssh --disable-pty "${instance_id}" "${archive_command}" \'
   nsl_run mutation-ssh-separator-archive fail
   nsl_assert_ssh_separator_refusal \
     mutation-ssh-separator-archive remote-report-collection remote-report-archive.stderr
+  nsl_restore_list_proof
+
+  # Regression for the generation-11 live failure. nsc v0.0.532 InlineSsh joins
+  # the post-separator argv with single spaces, so the pre-repair
+  # `-- sh -eu -c "${program}"` form put an unquoted command string on the wire
+  # and the remote `sh -c` executed only its first word. Restoring exactly that
+  # line must fail at the stage the live run failed at, carrying the same
+  # generic remote status-1 report, while exact cleanup and absence proof still
+  # complete. The mutant text is the accepted pre-repair production line, so on
+  # that baseline the installer finds no packed line to replace and this case
+  # cannot pass: it is green only once both programs are packed correctly.
+  # shellcheck disable=SC1003,SC2016
+  nsl_install_exact_ssh_call_mutant \
+    packing-setup \
+    '  nsc ssh --disable-pty "${instance_id}" -- "${setup_command}" \' \
+    '  nsc ssh --disable-pty "${instance_id}" -- sh -eu -c "${setup_command}" \'
+  nsl_run mutation-ssh-packing-setup fail
+  nsl_assert_ssh_packing_refusal \
+    mutation-ssh-packing-setup snapshot-setup setup.stderr
+  nsl_restore_list_proof
+
+  # shellcheck disable=SC1003,SC2016
+  nsl_install_exact_ssh_call_mutant \
+    packing-archive \
+    '  nsc ssh --disable-pty "${instance_id}" -- "${archive_command}" \' \
+    '  nsc ssh --disable-pty "${instance_id}" -- sh -eu -c "${archive_command}" \'
+  nsl_run mutation-ssh-packing-archive fail
+  nsl_assert_ssh_packing_refusal \
+    mutation-ssh-packing-archive remote-report-collection remote-report-archive.stderr
   nsl_restore_list_proof
 
   nsl_install_list_guard_mutant \

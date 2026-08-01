@@ -825,11 +825,18 @@ run_outer() {
     >"${lifecycle_dir}/upload.stdout" 2>"${lifecycle_dir}/upload.stderr"
   upload_finished_epoch="$(date +%s)"
 
+  # nsc v0.0.532 InlineSsh puts the remote program on the wire as
+  # strings.Join(args, " ") and the remote login shell re-parses that single
+  # string, so a program containing spaces or quotes only survives when it is
+  # packed as exactly one argument after `--`. A nested `sh -eu -c "${program}"`
+  # is three arguments; the join leaves the program unquoted and `sh -c` then
+  # executes only its first word. Both remote programs below are complete `&&`
+  # chains that already fail closed, so pass the command string directly.
   failure_stage='snapshot-setup'
   local setup_command
   setup_command="test ! -e '${remote_root}/source' && mkdir -p '${remote_root}/result' && tar -xzf '${remote_archive}' -C '${remote_root}' && printf '%s  %s\\n' '${transfer_sha}' '${remote_archive}' | sha256sum --check"
   setup_started_epoch="$(date +%s)"
-  nsc ssh --disable-pty "${instance_id}" -- sh -eu -c "${setup_command}" \
+  nsc ssh --disable-pty "${instance_id}" -- "${setup_command}" \
     >"${lifecycle_dir}/setup.txt" 2>"${lifecycle_dir}/setup.stderr"
   setup_finished_epoch="$(date +%s)"
 
@@ -850,7 +857,8 @@ run_outer() {
   failure_stage='remote-report-collection'
   local archive_command
   archive_command="test -s '${remote_report}/sit-report.json' && tar -czf '${remote_report_archive}' -C '${remote_root}/result' sit-report && sha256sum '${remote_report_archive}'"
-  nsc ssh --disable-pty "${instance_id}" -- sh -eu -c "${archive_command}" \
+  # Packed as one remote argument for the same InlineSsh join reason as setup.
+  nsc ssh --disable-pty "${instance_id}" -- "${archive_command}" \
     >"${lifecycle_dir}/remote-report-sha256.txt" \
     2>"${lifecycle_dir}/remote-report-archive.stderr"
   remote_report_sha="$(awk 'NR == 1 {print $1}' "${lifecycle_dir}/remote-report-sha256.txt")"
