@@ -832,9 +832,15 @@ run_outer() {
   # is three arguments; the join leaves the program unquoted and `sh -c` then
   # executes only its first word. Both remote programs below are complete `&&`
   # chains that already fail closed, so pass the command string directly.
+  # The remote program runs against BusyBox v1.37.0 on the instance, whose
+  # sha256sum applet implements only `-c`; the GNU long option `--check` is
+  # rejected outright. Keep the short flag here. Host-side checksum calls in
+  # this wrapper run on GNU coreutils and are unaffected. (The intended image
+  # is the Wolfi userland, but the observed fact is the BusyBox version and its
+  # `-c`-only usage banner.)
   failure_stage='snapshot-setup'
   local setup_command
-  setup_command="test ! -e '${remote_root}/source' && mkdir -p '${remote_root}/result' && tar -xzf '${remote_archive}' -C '${remote_root}' && printf '%s  %s\\n' '${transfer_sha}' '${remote_archive}' | sha256sum --check"
+  setup_command="test ! -e '${remote_root}/source' && mkdir -p '${remote_root}/result' && tar -xzf '${remote_archive}' -C '${remote_root}' && printf '%s  %s\\n' '${transfer_sha}' '${remote_archive}' | sha256sum -c"
   setup_started_epoch="$(date +%s)"
   nsc ssh --disable-pty "${instance_id}" -- "${setup_command}" \
     >"${lifecycle_dir}/setup.txt" 2>"${lifecycle_dir}/setup.stderr"

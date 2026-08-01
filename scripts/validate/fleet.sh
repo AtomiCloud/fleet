@@ -1198,6 +1198,30 @@ sit-namespace-lifecycle | sit-proof-lifecycle)
   if rg -n -- '--[[:space:]]+sh[[:space:]]' "${proof_source}"; then
     fail 'a production Namespace ssh call reintroduced a nested remote shell that the nsc join would split'
   fi
+  # The remote programs execute against BusyBox v1.37.0 on the instance, whose
+  # sha256sum applet accepts only `-c`. The generation-11 live run
+  # fleet-g11-live-6ae04f0-20260801T082535Z reached the final checksum with
+  # correct command packing and then died at snapshot-setup on
+  # `sha256sum: unrecognized option '--check'`. That run retains the BusyBox
+  # version and its `-c`-only usage banner; it never reached inner platform
+  # evidence, so the distribution behind that userland is design intent here,
+  # not an independently proven fact. Pin the portable spelling on the remote
+  # setup program and refuse the GNU-only one there. Scoped to that one
+  # production line on purpose: this validator's own checksum calls run on the
+  # CI host's GNU coreutils and are deliberately left alone.
+  mapfile -t nsl_setup_program_lines < <(rg -N '^  setup_command=' "${proof_source}")
+  [ "${#nsl_setup_program_lines[@]}" -eq 1 ] ||
+    fail 'the production wrapper must define exactly one remote setup program'
+  nsl_setup_program_line="${nsl_setup_program_lines[0]}"
+  case "${nsl_setup_program_line}" in
+  *'sha256sum --check'*)
+    fail 'the remote setup program reintroduced the GNU-only sha256sum --check that remote BusyBox v1.37.0 rejects'
+    ;;
+  esac
+  case "${nsl_setup_program_line}" in
+  *'| sha256sum -c"') ;;
+  *) fail 'the remote setup program does not end in the portable BusyBox sha256sum -c form' ;;
+  esac
   if rg -n "script -q.*nsc list|nsc list.*script -q" "${proof_source}"; then
     fail 'the production Namespace list path still allocates a pseudo-terminal'
   fi
@@ -1767,6 +1791,30 @@ ssh)
       ;;
     esac
   fi
+  # The instance answers as BusyBox v1.37.0, whose sha256sum applet takes
+  # only `-c`. Model that refusal on the joined command string, before any
+  # dispatch, so no remote program can be blessed here with a GNU-only spelling
+  # the real instance rejects. The decisive lines reproduce the retained stderr
+  # of fleet-g11-live-6ae04f0-20260801T082535Z: the applet refusal, the version
+  # and usage banner, and nsc's generic remote status block. nsc's trailing
+  # docs footer is deliberately not reproduced — it is client boilerplate, not
+  # part of the failure signature — so this is not full-byte equality, and the
+  # command-packing model above omits it for the same reason.
+  case "${remote_command}" in
+  *'sha256sum --check'*)
+    printf "sha256sum: unrecognized option '--check'\n" >&2
+    printf 'BusyBox v1.37.0 (2026-05-22 13:39:12 UTC) multi-call binary.\n\n' >&2
+    printf 'Usage: sha256sum [-c[sw]] [FILE]...\n\n' >&2
+    printf 'Print or check SHA256 checksums\n\n' >&2
+    printf '\t-c\tCheck sums against list in FILEs\n' >&2
+    printf "\t-s\tDon't output anything, status code shows success\n" >&2
+    printf '\t-w\tWarn about improperly formatted checksum lines\n\n' >&2
+    printf '========================================\n' >&2
+    printf 'Failed: Process exited with status 1\n' >&2
+    printf '========================================\n\n' >&2
+    exit 1
+    ;;
+  esac
   case "${remote_command}" in
   hostname)
     if [ "${NSC_SHIM_FAIL_STAGE:-}" = 'hostname' ]; then
@@ -1775,7 +1823,12 @@ ssh)
       printf '%s\n' "${id}"
     fi
     ;;
-  *source.tgz*sha256sum*check*)
+  *source.tgz*'| sha256sum -c')
+    # Only the modeled portable spelling reaches the happy path. The GNU
+    # `--check` form is intercepted above with the exact live BusyBox stderr,
+    # and every other checksum spelling falls through to the unmodeled branch
+    # and fails closed rather than being blessed by a broad match.
+    #
     # The setup program holds spaces and quotes, so the wrapper must pack it as
     # exactly one remote argument for the join to preserve its bytes.
     [ "${remote_argc}" -eq 1 ] || {
@@ -2379,39 +2432,48 @@ NSL_SCHEMA_CASES
       fail "the committed ${label} mutant changed more than one production line"
   }
 
-  # Rewrites exactly one reviewed production `nsc ssh` line. Both the separator
-  # mutants and the command-packing regression below are single-line rewrites of
-  # a reviewed call, so they share one installer; the label carries the defect.
-  nsl_install_exact_ssh_call_mutant() {
+  # Rewrites exactly one reviewed production line. The separator mutants, the
+  # command-packing regressions, and the BusyBox checksum regression below are
+  # all single-line rewrites, so they share one installer; the label carries
+  # which defect is being restored.
+  nsl_install_exact_line_mutant() {
     local label="$1" exact_call="$2" mutant_call="$3"
     local proof_path='scripts/ci/fleet-sit-proof.sh'
     local expected_stat=$'1\t1\tscripts/ci/fleet-sit-proof.sh'
     local mutation_stat
-    awk -v exact_call="${exact_call}" -v mutant_call="${mutant_call}" '
-      BEGIN { found = 0 }
+    # Both strings travel through the environment, not `awk -v`: -v assignments
+    # are escape-processed, so a production line containing a literal backslash
+    # sequence (the setup program's `printf '%s  %s\\n'`) would arrive mangled
+    # and match nothing. ENVIRON values are passed through byte for byte.
+    MUTATION_EXACT_LINE="${exact_call}" MUTATION_MUTANT_LINE="${mutant_call}" awk '
+      BEGIN {
+        exact_call = ENVIRON["MUTATION_EXACT_LINE"]
+        mutant_call = ENVIRON["MUTATION_MUTANT_LINE"]
+        found = 0
+      }
       $0 == exact_call { found++; print mutant_call; next }
       { print }
       END { if (found != 1) exit 89 }
     ' "${nsl_proof_baseline}" >"${nsl_fixture}/${proof_path}" ||
-      fail "could not install the exact ${label} ssh-call mutation"
+      fail "could not install the exact ${label} production-line mutation"
     git -C "${nsl_fixture}" add "${proof_path}"
     if git -C "${nsl_fixture}" diff --cached --quiet; then
-      fail "the exact ${label} ssh-call mutation changed no bytes"
+      fail "the exact ${label} production-line mutation changed no bytes"
     fi
     mutation_stat="$(git -C "${nsl_fixture}" diff --cached --numstat -- "${proof_path}")"
     [ "${mutation_stat}" = "${expected_stat}" ] ||
-      fail "the exact ${label} ssh-call mutation did not replace one production line"
+      fail "the exact ${label} production-line mutation did not replace one production line"
     git -C "${nsl_fixture}" diff --cached --unified=0 -- "${proof_path}" |
       grep -qxF -- "-${exact_call}" ||
-      fail "the exact ${label} ssh-call mutation did not remove its reviewed call"
+      fail "the exact ${label} production-line mutation did not remove its reviewed call"
     git -C "${nsl_fixture}" diff --cached --unified=0 -- "${proof_path}" |
       grep -qxF -- "+${mutant_call}" ||
-      fail "the exact ${label} ssh-call mutation inserted unexpected bytes"
+      fail "the exact ${label} production-line mutation inserted unexpected bytes"
     git -C "${nsl_fixture}" commit --quiet \
-      -m "Rewrite ${label} ssh call" --only "${proof_path}"
+      -m "Rewrite ${label} production line" --only "${proof_path}"
     mutation_stat="$(git -C "${nsl_fixture}" diff-tree --no-commit-id --numstat -r HEAD)"
     [ "${mutation_stat}" = "${expected_stat}" ] ||
-      fail "the committed ${label} ssh-call mutant changed more than one production line"
+      fail "the committed ${label} production-line mutant changed more than one production line"
   }
 
   nsl_install_exact_proof_block_mutant() {
@@ -2524,6 +2586,20 @@ NSL_SCHEMA_CASES
     echo "    ${name}: split remote command string failed closed at ${stage} ✓"
   }
 
+  nsl_assert_busybox_checksum_refusal() {
+    local name="$1"
+    nsl_assert_closed_cleanup "${name}"
+    jq -e '.failureStage == "snapshot-setup"' \
+      "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+      fail "Namespace lifecycle ${name}: the GNU-only checksum spelling did not fail at snapshot-setup"
+    grep -qF "sha256sum: unrecognized option '--check'" \
+      "${nsl_report}/lifecycle/setup.stderr" ||
+      fail "Namespace lifecycle ${name}: retained stderr lost the BusyBox unrecognized-option signature"
+    grep -qF 'BusyBox v1.37.0' "${nsl_report}/lifecycle/setup.stderr" ||
+      fail "Namespace lifecycle ${name}: retained stderr did not identify the refusing BusyBox applet"
+    echo "    ${name}: GNU-only sha256sum --check failed closed at snapshot-setup ✓"
+  }
+
   nsl_assert_false_absence_mutant_pass() {
     local name="$1" form="$2"
     local listing="${nsl_report}/lifecycle/destroy-attempt-1/list-after-destroy-1.json"
@@ -2548,7 +2624,7 @@ NSL_SCHEMA_CASES
   # production call and require the fake client to reproduce the real
   # client-side refusal while exact cleanup and absence proof still complete.
   # shellcheck disable=SC1003,SC2016
-  nsl_install_exact_ssh_call_mutant \
+  nsl_install_exact_line_mutant \
     separator-hostname \
     '  nsc ssh --disable-pty "${instance_id}" -- hostname \' \
     '  nsc ssh --disable-pty "${instance_id}" hostname \'
@@ -2558,7 +2634,7 @@ NSL_SCHEMA_CASES
   nsl_restore_list_proof
 
   # shellcheck disable=SC1003,SC2016
-  nsl_install_exact_ssh_call_mutant \
+  nsl_install_exact_line_mutant \
     separator-setup \
     '  nsc ssh --disable-pty "${instance_id}" -- "${setup_command}" \' \
     '  nsc ssh --disable-pty "${instance_id}" "${setup_command}" \'
@@ -2568,7 +2644,7 @@ NSL_SCHEMA_CASES
   nsl_restore_list_proof
 
   # shellcheck disable=SC1003,SC2016
-  nsl_install_exact_ssh_call_mutant \
+  nsl_install_exact_line_mutant \
     separator-inner \
     '    nsc ssh --disable-pty "${instance_id}" -- env \' \
     '    nsc ssh --disable-pty "${instance_id}" env \'
@@ -2578,7 +2654,7 @@ NSL_SCHEMA_CASES
   nsl_restore_list_proof
 
   # shellcheck disable=SC1003,SC2016
-  nsl_install_exact_ssh_call_mutant \
+  nsl_install_exact_line_mutant \
     separator-archive \
     '  nsc ssh --disable-pty "${instance_id}" -- "${archive_command}" \' \
     '  nsc ssh --disable-pty "${instance_id}" "${archive_command}" \'
@@ -2597,7 +2673,7 @@ NSL_SCHEMA_CASES
   # that baseline the installer finds no packed line to replace and this case
   # cannot pass: it is green only once both programs are packed correctly.
   # shellcheck disable=SC1003,SC2016
-  nsl_install_exact_ssh_call_mutant \
+  nsl_install_exact_line_mutant \
     packing-setup \
     '  nsc ssh --disable-pty "${instance_id}" -- "${setup_command}" \' \
     '  nsc ssh --disable-pty "${instance_id}" -- sh -eu -c "${setup_command}" \'
@@ -2607,13 +2683,34 @@ NSL_SCHEMA_CASES
   nsl_restore_list_proof
 
   # shellcheck disable=SC1003,SC2016
-  nsl_install_exact_ssh_call_mutant \
+  nsl_install_exact_line_mutant \
     packing-archive \
     '  nsc ssh --disable-pty "${instance_id}" -- "${archive_command}" \' \
     '  nsc ssh --disable-pty "${instance_id}" -- sh -eu -c "${archive_command}" \'
   nsl_run mutation-ssh-packing-archive fail
   nsl_assert_ssh_packing_refusal \
     mutation-ssh-packing-archive remote-report-collection remote-report-archive.stderr
+  nsl_restore_list_proof
+
+  # Regression for the generation-11 BusyBox failure. With command packing
+  # already correct, the remote setup program reached its final checksum and
+  # remote BusyBox v1.37.0 refused the GNU long option. Restore exactly that
+  # spelling and require the same stage, the same refusal signature, and a
+  # completed exact-id destroy and strict absence proof.
+  #
+  # Both spellings are derived from the reviewed production line captured by the
+  # structural pin above rather than transcribed here, so the mutation cannot
+  # silently stop matching if unrelated bytes of that line ever change, and the
+  # `exact_call` is by construction the line the wrapper really ships. On the
+  # live-broken baseline that exact line does not exist, so the installer finds
+  # nothing to replace and this case cannot pass there.
+  nsl_setup_program_prefix="${nsl_setup_program_line%'| sha256sum -c"'}"
+  nsl_install_exact_line_mutant \
+    checksum-setup \
+    "${nsl_setup_program_prefix}"'| sha256sum -c"' \
+    "${nsl_setup_program_prefix}"'| sha256sum --check"'
+  nsl_run mutation-setup-gnu-checksum fail
+  nsl_assert_busybox_checksum_refusal mutation-setup-gnu-checksum
   nsl_restore_list_proof
 
   nsl_install_list_guard_mutant \
