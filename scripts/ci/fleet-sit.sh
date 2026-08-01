@@ -64,6 +64,17 @@ namespace_node_internal_ip=''
 namespace_installed_packages='[]'
 report_active=0
 cleanup_started=0
+# Harness-log FIFO state. Every one of these is finalizer-visible on purpose:
+# finalization must close and remove whatever setup managed to initialize, even
+# if it failed before a reader was ever launched.
+SIT_LOG_FIFO=''
+SIT_LOG_TEE_PID=''
+SIT_LOG_BOOT_FD=''
+SIT_LOG_WRITER_FD=''
+SIT_LOG_SAVED_OUT=''
+SIT_LOG_SAVED_ERR=''
+SIT_LOG_ARMED=0
+SIT_LOG_FINALIZED=0
 final_evidence_collected=0
 GIT_SERVER_PID=''
 PF_SERVER_PID=''
@@ -188,7 +199,7 @@ namespace_prepare_tools() {
     sit_fail "Namespace instance OS must be ${NSC_INSTANCE_OS_ID}, found ${os_id:-unknown}"
 
   local bootstrap
-  for bootstrap in apk awk bash curl docker git gzip head jq kubectl nproc sed sha256sum tar timeout tr; do
+  for bootstrap in apk awk bash curl docker git gzip head jq kubectl mkfifo nproc sed sha256sum tar tee timeout tr; do
     sit_require_command "${bootstrap}"
   done
   [ -x "${NSC_CONTAINERD_CTR}" ] ||
@@ -382,6 +393,16 @@ write_direct_input_inventory() {
   local records="${output}.records.$$"
   : >"${records}"
 
+  # Process substitution needs an openable /dev/fd, which the instance shell
+  # does not reliably provide. Produce into an explicit listing keyed off
+  # ${output} — this function also runs on the prepare-only path, where ${work}
+  # is not the applicable scratch root — and status-check the producer at its
+  # source, since a process substitution silently turns a failed producer into a
+  # successful empty loop.
+  local listing="${output}.ls-tree.$$"
+  git ls-tree -r -z "${commit}" -- "${SIT_DIRECT_INPUT_ROOTS[@]}" >"${listing}" ||
+    sit_fail "could not enumerate the direct-input roots at ${commit}"
+
   local mode type object path blob_sha content_sha disk_sha record
   while IFS= read -r -d '' record; do
     mode="${record%% *}"
@@ -403,7 +424,8 @@ write_direct_input_inventory() {
         sit_fail "direct input on disk differs from the recorded commit: ${path}"
     fi
     printf '%s,%s,%s,%s,%s\n' "${mode}" "${type}" "${blob_sha}" "${content_sha}" "${path}" >>"${records}"
-  done < <(git ls-tree -r -z "${commit}" -- "${SIT_DIRECT_INPUT_ROOTS[@]}")
+  done <"${listing}"
+  rm -f "${listing}"
 
   LC_ALL=C sort -t, -k5 "${records}" >"${output}"
   rm -f "${records}"
@@ -699,12 +721,22 @@ start_port_forwards() {
 
 wait_argo_rollouts() {
   local resource
+  # No process substitution on an instance-executed path. Each list gets its own
+  # file and its own refusal, so a failure names which list could not be
+  # produced. pipefail is global, so a failure in either pipeline member is
+  # observed here rather than becoming a successful empty wait.
+  local deployments="${work}/argo-deployments.txt"
+  local statefulsets="${work}/argo-statefulsets.txt"
+  kubectl -n argocd get deployments -o name | sort >"${deployments}" ||
+    sit_fail 'could not list argocd deployments for the rollout wait'
   while IFS= read -r resource; do
     kubectl -n argocd rollout status "${resource}" --timeout=300s
-  done < <(kubectl -n argocd get deployments -o name | sort)
+  done <"${deployments}"
+  kubectl -n argocd get statefulsets -o name | sort >"${statefulsets}" ||
+    sit_fail 'could not list argocd statefulsets for the rollout wait'
   while IFS= read -r resource; do
     kubectl -n argocd rollout status "${resource}" --timeout=300s
-  done < <(kubectl -n argocd get statefulsets -o name | sort)
+  done <"${statefulsets}"
 }
 
 configure_clocks() {
@@ -1128,6 +1160,12 @@ build_expected_child_apps() {
   local output="$1"
   local tsv="${work}/expected-child-apps.tsv"
   : >"${tsv}"
+  # No process substitution on an instance-executed path; the producer is
+  # status-checked so a failed find or sort cannot become an empty expectation.
+  local landscape_files="${work}/landscape-files.txt"
+  find "${FLEET_SOURCE}/platforms/canary/landscapes" \
+    -mindepth 2 -maxdepth 2 -type f -name '*.yaml' | sort >"${landscape_files}" ||
+    sit_fail 'could not enumerate the canary landscape files'
   local row platform landscape service tag cluster_name_value server matches
   while IFS= read -r row; do
     platform="$(yq -r '.platform' "${row}")"
@@ -1150,7 +1188,7 @@ build_expected_child_apps() {
     printf '%s\t%s\t%s\t%s\n' \
       "${platform}-${landscape}-${service}-${cluster_name_value}" \
       "${server}" "${tag}" "${landscape}" >>"${tsv}"
-  done < <(find "${FLEET_SOURCE}/platforms/canary/landscapes" -mindepth 2 -maxdepth 2 -type f -name '*.yaml' | sort)
+  done <"${landscape_files}"
   jq -Rn '
     [inputs | split("\t") | {name:.[0],server:.[1],targetRevision:.[2],landscape:.[3]}] |
     sort_by(.name)
@@ -1204,12 +1242,19 @@ expected_changed_names() {
   local landscape name
   local tsv="${work}/changed-names.tsv"
   : >"${tsv}"
+  # No process substitution on an instance-executed path; a failed jq must
+  # refuse rather than contribute nothing and look like a landscape with no
+  # changed names.
+  local names="${work}/changed-names.src.txt"
   for landscape in "$@"; do
+    jq -r --arg landscape "${landscape}" '.[] | select(.landscape == $landscape) | .name' \
+      "${report}/expected-child-apps.json" >"${names}" ||
+      sit_fail "could not read expected child-app names for landscape ${landscape}"
     while IFS= read -r name; do
       printf '%s\n' "${name}" >>"${tsv}"
-    done < <(jq -r --arg landscape "${landscape}" '.[] | select(.landscape == $landscape) | .name' \
-      "${report}/expected-child-apps.json")
+    done <"${names}"
   done
+  rm -f "${names}"
   jq -Rn '[inputs] | sort' <"${tsv}" >"${output}"
 }
 
@@ -1857,6 +1902,13 @@ kargo_runtime_assert_import_transcript() {
   # ctr's positive unpack marker binding its canonical tag to the PINNED
   # digest, so an empty, truncated, or silently short transcript is red too.
   local expected_tag digest ref actual_digest bound
+  # No process substitution on an instance-executed path. Extract once, with the
+  # producer status-checked, so a failed sed cannot read as "no unpack markers"
+  # and be blamed on the transcript.
+  local unpack_pairs="${transcript}.unpack-pairs.$$"
+  sed -n 's/^unpacking \(.*\) (\(sha256:[0-9a-f]\{64\}\))\.*done.*$/\1 \2/p' \
+    "${transcript}" >"${unpack_pairs}" ||
+    sit_fail "could not extract unpack markers from the import transcript: ${transcript}"
   while [ "$#" -ge 2 ]; do
     expected_tag="$(kargo_runtime_canonical_image_tag "$1")"
     digest="$2"
@@ -1869,10 +1921,11 @@ kargo_runtime_assert_import_transcript() {
         bound=1
         break
       fi
-    done < <(sed -n 's/^unpacking \(.*\) (\(sha256:[0-9a-f]\{64\}\))\.*done.*$/\1 \2/p' "${transcript}")
+    done <"${unpack_pairs}"
     [ "${bound}" -eq 1 ] ||
       sit_fail "the node import transcript does not bind ${expected_tag} to pinned digest ${digest}"
   done
+  rm -f "${unpack_pairs}"
   [ "$#" -eq 0 ] ||
     sit_fail 'kargo_runtime_assert_import_transcript takes <tag> <digest> pairs'
 }
@@ -1881,16 +1934,32 @@ kargo_runtime_verify_node_image() {
   local inventory="$1"
   local tag_ref="$2"
   local digest="$3"
-  local expected_tag ref media_type actual_digest _remainder
+  local expected_tag ref media_type actual_digest _remainder bound
   expected_tag="$(kargo_runtime_canonical_image_tag "${tag_ref}")"
+  # No process substitution on an instance-executed path, and a failed sed must
+  # refuse rather than present as an inventory with no matching entry. The loop
+  # keeps its unquoted word splitting, which a pipeline would break by running it
+  # in a subshell. The listing is keyed off the input rather than ${work}: this
+  # function is also driven standalone by extracted-bytes regressions where that
+  # global is not in scope, and depending on it would trade a portability defect
+  # for an unbound variable. Because the listing no longer lives in the
+  # cleanup-managed scratch root, the match sets a flag and breaks instead of
+  # returning from inside the loop, so removal is unconditional on every path.
+  local rows="${inventory}.rows.$$"
+  sed '1d' "${inventory}" >"${rows}" ||
+    sit_fail "could not read the platform containerd image inventory: ${inventory}"
+  bound=0
   while read -r ref media_type actual_digest _remainder; do
     [ -n "${media_type}" ] || continue
     if [ "$(kargo_runtime_canonical_image_tag "${ref}")" = "${expected_tag}" ] &&
       [ "${actual_digest}" = "${digest}" ]; then
-      return 0
+      bound=1
+      break
     fi
-  done < <(sed '1d' "${inventory}")
-  sit_fail "platform containerd does not bind ${tag_ref} to pinned digest ${digest}"
+  done <"${rows}"
+  rm -f "${rows}"
+  [ "${bound}" -eq 1 ] ||
+    sit_fail "platform containerd does not bind ${tag_ref} to pinned digest ${digest}"
 }
 
 # The name a `repo:tag@digest` reference actually resolves to inside the CRI.
@@ -4838,6 +4907,101 @@ stop_pid() {
   fi
 }
 
+# Duplicate the harness output to ${report}/harness.log while keeping the
+# caller's copy, which is what the outer wrapper retains as inner-run.log. A
+# process substitution would need an openable /dev/fd, which the instance shell
+# does not reliably provide.
+#
+# The bootstrap descriptor is the load-bearing part. Opening the FIFO O_RDWR
+# never blocks and keeps a reader attached for the whole of setup, so no later
+# open can block and nothing depends on the background reader winning a race. If
+# the reader dies instantly, the parent's writer open still succeeds instead of
+# hanging forever.
+start_harness_log() {
+  local log_path="$1"
+  # Preflight before mutating any descriptor state: a missing tool must refuse
+  # here, not halfway through initialization.
+  sit_require_command mkfifo
+  sit_require_command tee
+
+  # Arm finalization before anything can fail. From this point every partially
+  # initialized surface below is owned by finish_harness_log, which must run
+  # even if setup never reaches the reader launch.
+  SIT_LOG_ARMED=1
+  SIT_LOG_FIFO="${work}/harness-log.fifo"
+  exec {SIT_LOG_SAVED_OUT}>&1 {SIT_LOG_SAVED_ERR}>&2
+  mkfifo -m 600 "${SIT_LOG_FIFO}" ||
+    sit_fail "could not create the harness log FIFO: ${SIT_LOG_FIFO}"
+  exec {SIT_LOG_BOOT_FD}<>"${SIT_LOG_FIFO}"
+
+  # The reader gets its own read-only open, writes explicitly to the saved
+  # descriptors, and is denied the bootstrap fd. Without that close it would
+  # retain a writer-capable descriptor and could never observe EOF.
+  tee -a "${log_path}" \
+    <"${SIT_LOG_FIFO}" >&"${SIT_LOG_SAVED_OUT}" 2>&"${SIT_LOG_SAVED_ERR}" \
+    {SIT_LOG_BOOT_FD}>&- &
+  SIT_LOG_TEE_PID=$!
+
+  # Writer opened after the reader, so the reader can never inherit it.
+  exec {SIT_LOG_WRITER_FD}>"${SIT_LOG_FIFO}"
+  # Drop the bootstrap: EOF must depend only on the parent's writer descriptors.
+  exec {SIT_LOG_BOOT_FD}>&-
+  SIT_LOG_BOOT_FD=''
+
+  exec >&"${SIT_LOG_WRITER_FD}" 2>&1
+}
+
+# Returns non-zero only when a launched reader failed. Closing and removing
+# partially initialized state is unconditional: there is deliberately no early
+# return on an empty reader PID, because setup can fail after saving descriptors
+# or creating the FIFO and before ever launching one.
+finish_harness_log() {
+  [ "${SIT_LOG_FINALIZED}" -eq 0 ] || return 0
+  SIT_LOG_FINALIZED=1
+  [ "${SIT_LOG_ARMED}" -eq 1 ] || return 0
+  local tee_status=0
+
+  # Restore first, then close every writer-capable descriptor. Only then can the
+  # reader see EOF; waiting before that would deadlock the parent against its
+  # own reader.
+  if [ -n "${SIT_LOG_SAVED_OUT}" ]; then
+    exec 1>&"${SIT_LOG_SAVED_OUT}"
+  fi
+  if [ -n "${SIT_LOG_SAVED_ERR}" ]; then
+    exec 2>&"${SIT_LOG_SAVED_ERR}"
+  fi
+  if [ -n "${SIT_LOG_WRITER_FD}" ]; then
+    exec {SIT_LOG_WRITER_FD}>&-
+    SIT_LOG_WRITER_FD=''
+  fi
+  if [ -n "${SIT_LOG_BOOT_FD}" ]; then
+    exec {SIT_LOG_BOOT_FD}>&-
+    SIT_LOG_BOOT_FD=''
+  fi
+  if [ -n "${SIT_LOG_TEE_PID}" ]; then
+    wait "${SIT_LOG_TEE_PID}" || tee_status=$?
+    SIT_LOG_TEE_PID=''
+  fi
+  if [ -n "${SIT_LOG_FIFO}" ]; then
+    rm -f "${SIT_LOG_FIFO}"
+    SIT_LOG_FIFO=''
+  fi
+  if [ -n "${SIT_LOG_SAVED_OUT}" ]; then
+    exec {SIT_LOG_SAVED_OUT}>&-
+    SIT_LOG_SAVED_OUT=''
+  fi
+  if [ -n "${SIT_LOG_SAVED_ERR}" ]; then
+    exec {SIT_LOG_SAVED_ERR}>&-
+    SIT_LOG_SAVED_ERR=''
+  fi
+  SIT_LOG_ARMED=0
+
+  [ "${tee_status}" -eq 0 ] || {
+    echo "the harness log writer exited with status ${tee_status}" >&2
+    return 1
+  }
+}
+
 cleanup() {
   local rc=$?
   [ "${cleanup_started}" -eq 0 ] || return
@@ -4855,7 +5019,15 @@ cleanup() {
       sit_report_finish fail || true
     fi
   fi
+  # Finalize logging last, so every message above still reaches both the log and
+  # the caller. Status precedence: a primary body or signal status is preserved
+  # exactly; a log-writer-only failure still cannot produce success.
+  local log_rc=0
+  finish_harness_log || log_rc=1
   remove_sit_scratch "${work}" || rc=1
+  if [ "${rc}" -eq 0 ] && [ "${log_rc}" -ne 0 ]; then
+    rc=1
+  fi
   exit "${rc}"
 }
 
@@ -5208,11 +5380,14 @@ run_full() {
   write_direct_input_inventory "${report}/direct-input-inventory.sha256" "${SIT_SOURCE_HEAD}"
   sit_report_init "${report}" "$(sit_pins_json)" "$(sit_provenance_json true)"
   report_active=1
-  exec > >(tee -a "${report}/harness.log") 2>&1
+  # Traps are installed before the harness log is armed, so a failure inside
+  # start_harness_log is already covered by finalization and cannot leak a saved
+  # descriptor, the bootstrap descriptor, the writer, or the FIFO.
   trap cleanup EXIT
   trap on_error ERR
   trap 'exit 124' TERM
   trap 'exit 130' INT
+  start_harness_log "${report}/harness.log"
 
   sit_leg_begin 'L0-runtime-setup' \
     'namespace-platform.json' 'pins-verified.txt' 'manifest-contract.json' 'git-ls-remote.txt' \

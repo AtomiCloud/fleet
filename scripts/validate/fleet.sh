@@ -1257,6 +1257,41 @@ sit-namespace-lifecycle | sit-proof-lifecycle)
   if rg -qF -- 'rev-parse --git-dir >/dev/null 2>&1' "${proof_source}"; then
     fail 'the checkout preflight still discards the git diagnostic that made the g11 inner failure undiagnosable'
   fi
+  # Process substitution needs an openable /dev/fd. The instance shell does not
+  # reliably provide one — the generation-11 run at product 22bf742 died on
+  # `/dev/fd/63: No such file or directory` — so neither shipped script may use
+  # it anywhere. Scoped to the two files that execute on the instance: this
+  # validator runs only on the CI host and is deliberately not covered.
+  for nsl_instance_script in "${proof_source}" "${sit_source}"; do
+    if rg -n -- '<\(|>\(' "${nsl_instance_script}"; then
+      fail "process substitution is not portable to the instance shell: ${nsl_instance_script}"
+    fi
+  done
+  # Pin the replacement shape, so the refusal above cannot be satisfied by a
+  # line-oriented or pipeline rewrite that loses NUL safety or fail-closed
+  # status.
+  rg -qF -- 'ls-tree -r -z' "${proof_source}" ||
+    fail 'the wrapper direct-input enumeration is no longer NUL-delimited'
+  rg -qF -- 'ls-tree -r -z' "${sit_source}" ||
+    fail 'the SIT direct-input enumeration is no longer NUL-delimited'
+  rg -qF -- "read -r -d ''" "${proof_source}" ||
+    fail 'the wrapper direct-input loop no longer parses NUL-delimited records'
+  rg -qF -- "read -r -d ''" "${sit_source}" ||
+    fail 'the SIT direct-input loop no longer parses NUL-delimited records'
+  rg -qF -- 'could not enumerate the direct-input roots' "${proof_source}" ||
+    fail 'the wrapper direct-input producer is no longer status-checked'
+  rg -qF -- 'could not enumerate the direct-input roots' "${sit_source}" ||
+    fail 'the SIT direct-input producer is no longer status-checked'
+  # The harness log must still reach both the log file and the caller, via the
+  # FIFO lifecycle rather than a plain append.
+  rg -qF -- 'mkfifo -m 600' "${sit_source}" ||
+    fail 'the harness log no longer uses a named FIFO'
+  rg -qF -- 'finish_harness_log' "${sit_source}" ||
+    fail 'the harness log has no finalizer'
+  rg -qF -- 'start_harness_log' "${sit_source}" ||
+    fail 'the harness log has no guarded setup'
+  rg -qF -- 'mkfifo nproc sed sha256sum tar tee timeout tr' "${sit_source}" ||
+    fail 'the SIT bootstrap preflight no longer requires mkfifo and tee before the harness log is armed'
   if rg -n "script -q.*nsc list|nsc list.*script -q" "${proof_source}"; then
     fail 'the production Namespace list path still allocates a pseudo-terminal'
   fi
@@ -1273,7 +1308,7 @@ sit-namespace-lifecycle | sit-proof-lifecycle)
   if rg -n '(sha256sum|tar|timeout)[[:space:]]+--version' "${sit_source}"; then
     fail 'a Wolfi BusyBox applet receipt reverted to a non-portable GNU --version probe'
   fi
-  rg -qF 'apk awk bash curl docker git gzip head jq kubectl nproc sed sha256sum tar timeout tr' \
+  rg -qF 'apk awk bash curl docker git gzip head jq kubectl mkfifo nproc sed sha256sum tar tee timeout tr' \
     "${sit_source}" || fail 'the Namespace bootstrap gate no longer requires nproc before use'
   rg -qF 'sit_require_command "${bootstrap}"' "${sit_source}" ||
     fail 'the Namespace bootstrap command gate disappeared'
@@ -1427,6 +1462,522 @@ NSL_PROBE_DRIVER
     fail 'the absent-.git refusal reported an ownership cause, so the two causes are still not distinguished'
   fi
   echo '    checkout preflight keeps git diagnosis for both foreign ownership and an absent .git ✓'
+
+  # The wrapper's direct-input enumeration, driven as production bytes. Both
+  # properties the process-substitution form could not offer are asserted here:
+  # NUL-delimited paths survive intact, and a failed producer refuses at its
+  # source instead of yielding a successful empty inventory.
+  nsl_inv_fn="${tmp}/direct-input-inventory-fn.sh"
+  awk '
+    /^prepare_verified_snapshot\(\) \{$/ { capture = 1 }
+    capture && /^  LC_ALL=C sort -t, -k5 -o/ { capture = 0; print "}" }
+    capture { print }
+  ' "${proof_source}" >"${nsl_inv_fn}"
+  grep -qxF 'prepare_verified_snapshot() {' "${nsl_inv_fn}" &&
+    [ "$(tail -n 1 "${nsl_inv_fn}")" = '}' ] ||
+    fail 'could not extract the production direct-input enumeration'
+  grep -qF 'ls-tree -r -z' "${nsl_inv_fn}" ||
+    fail 'the extracted direct-input enumeration lost its NUL-delimited producer'
+
+  nsl_inv_repo="${tmp}/direct-input-repo"
+  rm -rf "${nsl_inv_repo}"
+  mkdir -p "${nsl_inv_repo}/platforms/canary"
+  git -C "${nsl_inv_repo}" init --quiet --initial-branch=main
+  git -C "${nsl_inv_repo}" config user.name fleet-direct-input
+  git -C "${nsl_inv_repo}" config user.email fleet-direct-input@invalid.example
+  printf '%s\n' plain >"${nsl_inv_repo}/platforms/canary/plain.yaml"
+  printf '%s\n' spaced >"${nsl_inv_repo}/platforms/canary/a file with spaces.yaml"
+  # A path git would C-quote without -z (embedded double quote plus non-ASCII).
+  # This is the case NUL delimiting actually protects here: without -z the
+  # producer emits an escaped, quoted path and the inventory records the wrong
+  # bytes. A newline-bearing path is deliberately NOT used — the production
+  # record parser splits fields with line-based `cut`, so it cannot represent
+  # one at all. That is a pre-existing limitation of the parser, unrelated to
+  # this portability change, and is reported rather than silently worked around.
+  printf '%s\n' quoted >"${nsl_inv_repo}/platforms/canary/naïve \"quoted\".yaml"
+  git -C "${nsl_inv_repo}" add -A
+  git -C "${nsl_inv_repo}" commit --quiet -m 'direct input fixture'
+
+  # The extracted function derives `commit` from FLEET_SIT_EXPECTED_HEAD in
+  # inner mode and makes its own `snapshot` under `proof_tmp_root`, so the
+  # driver seeds those production globals rather than passing them positionally.
+  cat >"${tmp}/direct-input-driver.sh" <<'NSL_INV_DRIVER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+fn_file="$1"
+checkout="$2"
+proof_tmp_root="$3"
+mode='inner'
+DIRECT_INPUT_ROOTS=('platforms/canary')
+canonical_inventory=''
+snapshot=''
+commit=''
+snapshot_tree=''
+fail() {
+  echo "fleet SIT proof failed: $*" >&2
+  exit 1
+}
+verify_wrapper_identity() { :; }
+# shellcheck source=/dev/null
+source "${fn_file}"
+prepare_verified_snapshot
+cat "${canonical_inventory}"
+NSL_INV_DRIVER
+
+  nsl_inv_tmp="${tmp}/direct-input-tmp"
+  mkdir -p "${nsl_inv_tmp}"
+  nsl_inv_commit="$(git -C "${nsl_inv_repo}" rev-parse HEAD)"
+  nsl_inv_status=0
+  env FLEET_SIT_EXPECTED_HEAD="${nsl_inv_commit}" \
+    bash "${tmp}/direct-input-driver.sh" "${nsl_inv_fn}" "${nsl_inv_repo}" "${nsl_inv_tmp}" \
+    >"${tmp}/direct-input.out" 2>"${tmp}/direct-input.err" || nsl_inv_status=$?
+  [ "${nsl_inv_status}" -eq 0 ] ||
+    fail "the production direct-input enumeration failed on a healthy fixture: $(tr '\n' ' ' <"${tmp}/direct-input.err")"
+
+  # Fidelity is asserted against an independent NUL-correct reader over the same
+  # stream rather than against a line count, since the inventory is LF-emitted
+  # and a record is not guaranteed to be one physical line.
+  git -C "${nsl_inv_repo}" ls-tree -r -z "${nsl_inv_commit}" -- 'platforms/canary' \
+    >"${tmp}/direct-input-stream.z" ||
+    fail 'could not build the direct-input reference stream'
+  nsl_inv_records="$(tr -dc '\0' <"${tmp}/direct-input-stream.z" | wc -c | tr -d ' ')"
+  [ "${nsl_inv_records}" -eq 3 ] ||
+    fail "the direct-input fixture did not produce three NUL records, got ${nsl_inv_records}"
+  : >"${tmp}/direct-input.expected"
+  while IFS= read -r -d '' nsl_inv_record; do
+    nsl_inv_mode="${nsl_inv_record%% *}"
+    nsl_inv_type="$(printf '%s' "${nsl_inv_record}" | cut -d' ' -f2)"
+    nsl_inv_object="$(printf '%s' "${nsl_inv_record}" | cut -d' ' -f3 | cut -f1)"
+    nsl_inv_path="${nsl_inv_record#*$'\t'}"
+    nsl_inv_content="$(git -C "${nsl_inv_repo}" cat-file blob "${nsl_inv_object}" |
+      sha256sum | awk '{print $1}')"
+    printf '%s,%s,%s,%s,%s\n' "${nsl_inv_mode}" "${nsl_inv_type}" "${nsl_inv_object}" \
+      "${nsl_inv_content}" "${nsl_inv_path}" >>"${tmp}/direct-input.expected"
+  done <"${tmp}/direct-input-stream.z"
+  cmp -s "${tmp}/direct-input.expected" "${tmp}/direct-input.out" ||
+    fail 'the production direct-input inventory differs from an independent NUL-correct reader over the same stream'
+  grep -qF 'a file with spaces.yaml' "${tmp}/direct-input.out" ||
+    fail 'the production direct-input enumeration lost a space-bearing path'
+
+  # Fail-closed: shadow git so only `ls-tree` fails. A process substitution
+  # would have swallowed this and produced a successful empty inventory.
+  mkdir -p "${tmp}/direct-input-stub"
+  nsl_inv_real_git="$(command -v git)"
+  cat >"${tmp}/direct-input-stub/git" <<NSL_INV_GIT_STUB
+#!/usr/bin/env bash
+for nsl_arg in "\$@"; do
+  if [ "\${nsl_arg}" = 'ls-tree' ]; then
+    echo 'stub: ls-tree refused' >&2
+    exit 1
+  fi
+done
+exec "${nsl_inv_real_git}" "\$@"
+NSL_INV_GIT_STUB
+  chmod +x "${tmp}/direct-input-stub/git"
+  nsl_inv_status=0
+  env PATH="${tmp}/direct-input-stub:${PATH}" FLEET_SIT_EXPECTED_HEAD="${nsl_inv_commit}" \
+    bash "${tmp}/direct-input-driver.sh" "${nsl_inv_fn}" "${nsl_inv_repo}" "${nsl_inv_tmp}" \
+    >"${tmp}/direct-input-fail.out" 2>"${tmp}/direct-input-fail.err" || nsl_inv_status=$?
+  [ "${nsl_inv_status}" -ne 0 ] ||
+    fail 'the production direct-input enumeration accepted a failed producer'
+  grep -qF 'could not enumerate the direct-input roots' "${tmp}/direct-input-fail.err" ||
+    fail 'a failed direct-input producer did not refuse at its source; a process substitution would have yielded an empty inventory'
+  echo '    direct-input enumeration matches a NUL-correct reference and refuses a failed producer ✓'
+
+  # The six full-mode-only textual producers, driven as production bytes. These
+  # sites never execute offline, so without this they would ship unexercised.
+  # Each category is proved in both directions: an empty successful producer
+  # must stay an empty loop, and a failed producer must reach its own
+  # site-specific refusal rather than becoming a successful empty iteration.
+  nsl_cat_fns="${tmp}/producer-category-fns.sh"
+  : >"${nsl_cat_fns}"
+  for nsl_cat_fn in wait_argo_rollouts build_expected_child_apps \
+    expected_changed_names kargo_runtime_verify_node_image \
+    kargo_runtime_assert_import_transcript write_direct_input_inventory; do
+    sed -n "/^${nsl_cat_fn}() {\$/,/^}\$/p" "${sit_source}" >"${tmp}/nsl-cat-fn.sh"
+    test -s "${tmp}/nsl-cat-fn.sh" ||
+      fail "could not extract ${nsl_cat_fn}() for the producer-category regression"
+    [ "$(tail -n 1 "${tmp}/nsl-cat-fn.sh")" = '}' ] ||
+      fail "the extracted ${nsl_cat_fn}() is unterminated"
+    cat "${tmp}/nsl-cat-fn.sh" >>"${nsl_cat_fns}"
+  done
+
+  cat >"${tmp}/producer-category-driver.sh" <<'NSL_CAT_DRIVER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+fn_file="$1"
+work="$2"
+category="$3"
+outcome="$4"
+mkdir -p "${work}/stub" "${work}/report"
+report="${work}/report"
+FLEET_SOURCE="${work}/source"
+mkdir -p "${FLEET_SOURCE}/platforms/canary/landscapes"
+sit_fail() {
+  echo "fixture refusal: $*" >&2
+  exit 1
+}
+kargo_runtime_canonical_image_tag() { printf '%s' "$1"; }
+
+# Call-sensitive stub: fails only when the invocation matches SELECTOR, and
+# otherwise defers to the real tool. Without this, a blanket-failing stub always
+# stops at the first producer and later sites in the same function are never
+# driven.
+# passthrough=real defers non-matching calls to the real tool; passthrough=quiet
+# returns empty success, which is what models "the producer legitimately found
+# nothing" for tools that cannot run offline at all.
+stub() {
+  local name="$1" selector="$2" passthrough="$3"
+  local real
+  real="$(command -v "${name}" || true)"
+  {
+    printf '#!/usr/bin/env bash\n'
+    if [ "${outcome}" = 'fail' ]; then
+      printf 'for a in "$@"; do [ "$a" = %q ] && { echo "stub: %s refused" >&2; exit 1; }; done\n' \
+        "${selector}" "${name}"
+    fi
+    if [ "${passthrough}" = 'real' ] && [ -n "${real}" ]; then
+      printf 'exec %q "$@"\n' "${real}"
+    else
+      printf 'exit 0\n'
+    fi
+  } >"${work}/stub/${name}"
+  chmod +x "${work}/stub/${name}"
+}
+
+case "${category}" in
+kubectl-deployments) stub kubectl deployments quiet ;;
+kubectl-statefulsets) stub kubectl statefulsets quiet ;;
+find) stub find "${FLEET_SOURCE}/platforms/canary/landscapes" quiet ;;
+jq) stub jq '.[] | select(.landscape == $landscape) | .name' quiet ;;
+sed-inventory | sed-inventory-match) stub sed '1d' "$([ "${category}" = 'sed-inventory-match' ] && echo real || echo quiet)" ;;
+sed-transcript) stub sed -n quiet ;;
+git-ls-tree) stub git ls-tree real ;;
+esac
+PATH="${work}/stub:${PATH}"
+export PATH
+# shellcheck source=/dev/null
+source "${fn_file}"
+case "${category}" in
+kubectl-deployments | kubectl-statefulsets) wait_argo_rollouts ;;
+find) build_expected_child_apps "${work}/child-apps.json" ;;
+jq)
+  printf '[]\n' >"${report}/expected-child-apps.json"
+  expected_changed_names "${work}/changed.json" canary
+  ;;
+sed-inventory)
+  printf 'HEADER\n' >"${work}/inventory.txt"
+  kargo_runtime_verify_node_image "${work}/inventory.txt" 'img:tag' 'sha256:deadbeef'
+  ;;
+sed-inventory-match)
+  # Successful match path: proves the listing is removed even when the loop
+  # stops early, now that it no longer lives in the cleanup-managed scratch.
+  printf 'HEADER\nimg:tag application/json sha256:deadbeef extra\n' >"${work}/inventory.txt"
+  kargo_runtime_verify_node_image "${work}/inventory.txt" 'img:tag' 'sha256:deadbeef'
+  ;;
+sed-transcript)
+  printf 'unpacking img:tag (sha256:%064d)...done\n' 1 >"${work}/transcript.txt"
+  kargo_runtime_assert_import_transcript "${work}/transcript.txt" 'img:tag' "sha256:$(printf '%064d' 1)"
+  ;;
+git-ls-tree)
+  SIT_DIRECT_INPUT_ROOTS=('.')
+  git init --quiet --initial-branch=main "${work}/repo"
+  git -C "${work}/repo" config user.name p
+  git -C "${work}/repo" config user.email p@invalid.example
+  printf 'x\n' >"${work}/repo/f.txt"
+  git -C "${work}/repo" add -A
+  git -C "${work}/repo" commit --quiet -m fixture
+  cd "${work}/repo"
+  write_direct_input_inventory "${work}/inv.sha256" "$(git rev-parse HEAD)" advisory
+  ;;
+esac
+echo 'category completed without a producer refusal'
+NSL_CAT_DRIVER
+
+  # ${3} is the refusal a failed producer must reach. ${4}, when given, is the
+  # downstream semantic refusal the empty-but-successful case must reach — that
+  # proves the empty loop was actually consumed rather than the case passing on
+  # any arbitrary failure.
+  nsl_cat_check() {
+    local category="$1" refusal="$2" empty_expect="${3:-}"
+    local w
+    for nsl_cat_outcome in empty fail; do
+      w="${tmp}/producer-${category}-${nsl_cat_outcome}"
+      rm -rf "${w}"
+      mkdir -p "${w}"
+      nsl_cat_status=0
+      timeout 60 bash "${tmp}/producer-category-driver.sh" \
+        "${nsl_cat_fns}" "${w}" "${category}" "${nsl_cat_outcome}" \
+        >"${w}/out.txt" 2>"${w}/err.txt" || nsl_cat_status=$?
+      if [ "${nsl_cat_outcome}" = 'fail' ]; then
+        [ "${nsl_cat_status}" -ne 0 ] ||
+          fail "producer ${category}: a failed producer was accepted"
+        grep -qF "${refusal}" "${w}/err.txt" ||
+          fail "producer ${category}: a failed producer did not reach its site-specific refusal"
+      else
+        if grep -qF "${refusal}" "${w}/err.txt"; then
+          fail "producer ${category}: an empty but successful producer was refused as a failure"
+        fi
+        if [ -n "${empty_expect}" ]; then
+          grep -qF "${empty_expect}" "${w}/err.txt" ||
+            fail "producer ${category}: the empty loop was not consumed into its expected downstream refusal"
+        fi
+      fi
+    done
+    echo "    producer ${category}: empty stays an empty loop, failure reaches its own refusal ✓"
+  }
+  nsl_cat_check kubectl-deployments 'could not list argocd deployments'
+  nsl_cat_check kubectl-statefulsets 'could not list argocd statefulsets'
+  nsl_cat_check find 'could not enumerate the canary landscape files'
+  nsl_cat_check jq 'could not read expected child-app names'
+  nsl_cat_check sed-inventory 'could not read the platform containerd image inventory' \
+    'platform containerd does not bind'
+  nsl_cat_check sed-transcript 'could not extract unpack markers from the import transcript' \
+    'does not bind'
+  nsl_cat_check git-ls-tree 'could not enumerate the direct-input roots'
+
+  # The successful-match path must leave no listing behind, now that it is keyed
+  # off the input rather than the cleanup-managed scratch root.
+  nsl_cat_match="${tmp}/producer-sed-inventory-match"
+  rm -rf "${nsl_cat_match}"
+  mkdir -p "${nsl_cat_match}"
+  nsl_cat_status=0
+  timeout 60 bash "${tmp}/producer-category-driver.sh" \
+    "${nsl_cat_fns}" "${nsl_cat_match}" sed-inventory-match empty \
+    >"${nsl_cat_match}/out.txt" 2>"${nsl_cat_match}/err.txt" || nsl_cat_status=$?
+  [ "${nsl_cat_status}" -eq 0 ] ||
+    fail "producer sed-inventory-match: a matching inventory was rejected: $(tr '\n' ' ' <"${nsl_cat_match}/err.txt")"
+  [ -z "$(find "${nsl_cat_match}" -name '*.rows.*' 2>/dev/null)" ] ||
+    fail 'producer sed-inventory-match: the successful match path leaked its listing file'
+  echo '    producer sed-inventory-match: early match still removes its listing ✓'
+
+  # The wrapper's report-evidence producer (the second converted wrapper site),
+  # extracted as the exact production block rather than driven through the whole
+  # of validate_finished_report, which would need a full report fixture.
+  nsl_ev_fn="${tmp}/evidence-producer-fn.sh"
+  {
+    printf 'validate_report_evidence() {\n'
+    awk '
+      /^  local evidence$/ { capture = 1 }
+      capture { print }
+      capture && /^  rm -f "\$\{evidence_listing\}"$/ { capture = 0 }
+    ' "${proof_source}"
+    printf '}\n'
+  } >"${nsl_ev_fn}"
+  grep -qF 'jq -r ' "${nsl_ev_fn}" ||
+    fail 'could not extract the wrapper report-evidence producer'
+  grep -qF 'could not read the declared evidence paths' "${nsl_ev_fn}" ||
+    fail 'the extracted wrapper report-evidence producer is not status-checked'
+  cat >"${tmp}/evidence-driver.sh" <<'NSL_EV_DRIVER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+fn_file="$1"
+report="$2"
+outcome="$3"
+report_file="${report}/sit-report.json"
+mkdir -p "${report}"
+printf '{"legs":[{"evidence":["ok.txt"]}]}\n' >"${report_file}"
+printf 'x\n' >"${report}/ok.txt"
+fail() {
+  echo "fleet SIT proof failed: $*" >&2
+  exit 1
+}
+if [ "${outcome}" = 'fail' ]; then
+  mkdir -p "${report}/stub"
+  printf '#!/usr/bin/env bash\nexit 1\n' >"${report}/stub/jq"
+  chmod +x "${report}/stub/jq"
+  PATH="${report}/stub:${PATH}"
+  export PATH
+fi
+# shellcheck source=/dev/null
+source "${fn_file}"
+validate_report_evidence
+echo 'evidence validation completed'
+NSL_EV_DRIVER
+  for nsl_ev_outcome in ok fail; do
+    nsl_ev_work="${tmp}/evidence-${nsl_ev_outcome}"
+    rm -rf "${nsl_ev_work}"
+    nsl_ev_status=0
+    timeout 60 bash "${tmp}/evidence-driver.sh" "${nsl_ev_fn}" "${nsl_ev_work}" "${nsl_ev_outcome}" \
+      >"${tmp}/evidence-${nsl_ev_outcome}.out" 2>"${tmp}/evidence-${nsl_ev_outcome}.err" ||
+      nsl_ev_status=$?
+    if [ "${nsl_ev_outcome}" = 'fail' ]; then
+      [ "${nsl_ev_status}" -ne 0 ] ||
+        fail 'the wrapper report-evidence producer accepted a failed jq'
+      grep -qF 'could not read the declared evidence paths' "${tmp}/evidence-fail.err" ||
+        fail 'a failed report-evidence producer did not refuse at its source'
+    else
+      [ "${nsl_ev_status}" -eq 0 ] ||
+        fail "the wrapper report-evidence producer failed on a healthy report: $(tr '\n' ' ' <"${tmp}/evidence-ok.err")"
+    fi
+  done
+  echo '    wrapper report-evidence producer refuses a failed jq ✓'
+
+  # The harness-log FIFO lifecycle, driven as production bytes. Every case runs
+  # under a bounded timeout, because the failure this design exists to prevent
+  # is a hang: an exit of 124 is a regression, not a slow test.
+  nsl_log_fns="${tmp}/harness-log-fns.sh"
+  : >"${nsl_log_fns}"
+  for nsl_log_fn in start_harness_log finish_harness_log; do
+    sed -n "/^${nsl_log_fn}() {\$/,/^}\$/p" "${sit_source}" >"${tmp}/nsl-log-fn.sh"
+    test -s "${tmp}/nsl-log-fn.sh" ||
+      fail "could not extract ${nsl_log_fn}() for the harness log regression"
+    [ "$(tail -n 1 "${tmp}/nsl-log-fn.sh")" = '}' ] ||
+      fail "the extracted ${nsl_log_fn}() is unterminated"
+    cat "${tmp}/nsl-log-fn.sh" >>"${nsl_log_fns}"
+  done
+  grep -qF '<>' "${nsl_log_fns}" ||
+    fail 'the extracted harness log setup no longer opens a bootstrap descriptor read-write, so a dead reader could block the writer open'
+
+  cat >"${tmp}/harness-log-driver.sh" <<'NSL_LOG_DRIVER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+fn_file="$1"
+work="$2"
+log_path="$3"
+scenario="$4"
+mkdir -p "${work}"
+
+SIT_LOG_FIFO=''
+SIT_LOG_TEE_PID=''
+SIT_LOG_BOOT_FD=''
+SIT_LOG_WRITER_FD=''
+SIT_LOG_SAVED_OUT=''
+SIT_LOG_SAVED_ERR=''
+SIT_LOG_ARMED=0
+SIT_LOG_FINALIZED=0
+FINALIZER_ENTRIES=0
+
+sit_fail() {
+  echo "fixture refusal: $*" >&2
+  exit 1
+}
+sit_require_command() {
+  command -v "$1" >/dev/null 2>&1 || sit_fail "required command is missing: $1"
+}
+# shellcheck source=/dev/null
+source "${fn_file}"
+
+# The reader is substituted only to model reader death; every other scenario
+# uses the production tee path.
+mkdir -p "${work}/stubdir"
+case "${scenario}" in
+reader-dies)
+  printf '#!/usr/bin/env bash\nexit 7\n' >"${work}/stubdir/tee"
+  ;;
+reader-missing)
+  printf '#!/usr/bin/env bash\nexec /nonexistent/reader\n' >"${work}/stubdir/tee"
+  ;;
+late-reader-fails | both-fail)
+  # Drains stdin normally, copies to the log, then fails at EOF. This is the
+  # late failure an early-death test cannot reach.
+  printf '#!/usr/bin/env bash\nshift\ncat >>"%s"\nexit 9\n' "${log_path}" \
+    >"${work}/stubdir/tee"
+  ;;
+esac
+if [ -f "${work}/stubdir/tee" ]; then
+  chmod +x "${work}/stubdir/tee"
+  PATH="${work}/stubdir:${PATH}"
+  export PATH
+fi
+
+finalize() {
+  local rc=$?
+  FINALIZER_ENTRIES=$((FINALIZER_ENTRIES + 1))
+  [ "${FINALIZER_ENTRIES}" -eq 1 ] || return
+  trap - EXIT ERR TERM INT
+  set +e
+  echo 'cleanup-stdout-marker'
+  echo 'cleanup-stderr-marker' >&2
+  local reader_pid="${SIT_LOG_TEE_PID}"
+  local log_rc=0
+  finish_harness_log || log_rc=1
+  if [ "${rc}" -eq 0 ] && [ "${log_rc}" -ne 0 ]; then
+    rc=1
+  fi
+  if [ -n "${reader_pid}" ] && kill -0 "${reader_pid}" 2>/dev/null; then
+    echo 'READER_SURVIVED=1' >&2
+  fi
+  echo "ENTRIES=${FINALIZER_ENTRIES} BODY=${rc} LOG=${log_rc}" >&2
+  exit "${rc}"
+}
+
+trap finalize EXIT
+trap 'exit 130' INT
+start_harness_log "${log_path}"
+
+echo 'body-stdout-marker'
+echo 'body-stderr-marker' >&2
+case "${scenario}" in
+body-fails) false ;;
+signal-int) kill -INT $$ ;;
+both-fail) exit 3 ;;
+esac
+NSL_LOG_DRIVER
+
+  nsl_log_run() {
+    local name="$1"
+    nsl_log_work="${tmp}/harness-log-${name}"
+    rm -rf "${nsl_log_work}"
+    mkdir -p "${nsl_log_work}"
+    nsl_log_file="${nsl_log_work}/harness.log"
+    nsl_log_status=0
+    timeout 30 bash "${tmp}/harness-log-driver.sh" \
+      "${nsl_log_fns}" "${nsl_log_work}" "${nsl_log_file}" "${name}" \
+      >"${nsl_log_work}/caller.out" 2>"${nsl_log_work}/caller.err" || nsl_log_status=$?
+    [ "${nsl_log_status}" -ne 124 ] ||
+      fail "harness log ${name}: timed out, which is the hang this design exists to prevent"
+    grep -qF 'ENTRIES=1' "${nsl_log_work}/caller.err" ||
+      fail "harness log ${name}: the finalizer did not run exactly once"
+    [ -z "$(find "${nsl_log_work}" -name '*.fifo' 2>/dev/null)" ] ||
+      fail "harness log ${name}: the FIFO survived finalization"
+    if grep -qF 'READER_SURVIVED=1' "${nsl_log_work}/caller.err"; then
+      fail "harness log ${name}: the reader was not reaped and outlived finalization"
+    fi
+  }
+
+  nsl_log_run normal
+  [ "${nsl_log_status}" -eq 0 ] ||
+    fail 'harness log normal: a healthy run did not succeed'
+  for nsl_log_marker in body-stdout-marker body-stderr-marker cleanup-stdout-marker; do
+    [ "$(grep -c "${nsl_log_marker}" "${nsl_log_work}/caller.out")" -eq 1 ] ||
+      fail "harness log normal: ${nsl_log_marker} did not reach the caller exactly once"
+    [ "$(grep -c "${nsl_log_marker}" "${nsl_log_file}")" -eq 1 ] ||
+      fail "harness log normal: ${nsl_log_marker} did not reach the log exactly once"
+  done
+
+  nsl_log_run body-fails
+  [ "${nsl_log_status}" -eq 1 ] ||
+    fail 'harness log body-fails: the primary body status was not preserved'
+
+  nsl_log_run signal-int
+  [ "${nsl_log_status}" -eq 130 ] ||
+    fail 'harness log signal-int: the signal status was not preserved'
+  grep -qF 'cleanup-stdout-marker' "${nsl_log_file}" ||
+    fail 'harness log signal-int: cleanup output was lost from the log'
+
+  # The two cases the bootstrap descriptor exists for. Without it the writer
+  # open would block forever on a reader that is already gone.
+  nsl_log_run reader-dies
+  [ "${nsl_log_status}" -ne 0 ] ||
+    fail 'harness log reader-dies: a dead log writer still produced success'
+  nsl_log_run reader-missing
+  [ "${nsl_log_status}" -ne 0 ] ||
+    fail 'harness log reader-missing: an unlaunchable log writer still produced success'
+
+  # A reader that drains normally and only fails at EOF — the late failure an
+  # early-death case cannot reach.
+  nsl_log_run late-reader-fails
+  [ "${nsl_log_status}" -ne 0 ] ||
+    fail 'harness log late-reader-fails: a log writer that failed at EOF still produced success'
+  grep -qF 'body-stdout-marker' "${nsl_log_file}" ||
+    fail 'harness log late-reader-fails: the drained output never reached the log'
+
+  # Status precedence when both the body and the reader fail: the body wins.
+  nsl_log_run both-fail
+  [ "${nsl_log_status}" -eq 3 ] ||
+    fail "harness log both-fail: the primary body status was not preserved over the log writer failure, got ${nsl_log_status}"
+  echo '    harness log FIFO: both destinations exactly once, single finalization, dead reader fails closed without hanging ✓'
 
   nsl_root="${tmp}/namespace-lifecycle"
   nsl_fixture="${nsl_root}/fixture"

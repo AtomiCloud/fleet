@@ -192,6 +192,16 @@ prepare_verified_snapshot() {
 
   canonical_inventory="${snapshot}/expected-direct-input-inventory.sha256"
   : >"${canonical_inventory}"
+  # Process substitution is not portable to the instance: it needs an openable
+  # /dev/fd, and the generation-11 run at product 22bf742 died on exactly that
+  # here with `line 159: /dev/fd/63: No such file or directory`. Produce into an
+  # explicit listing instead, outside ${snapshot}/source so the transfer cannot
+  # pick it up. The producer is status-checked at its source: a process
+  # substitution silently swallows producer failure and leaves an empty loop.
+  local direct_input_listing="${snapshot}/direct-input-ls-tree.z"
+  git -C "${checkout}" ls-tree -r -z "${commit}" -- "${DIRECT_INPUT_ROOTS[@]}" \
+    >"${direct_input_listing}" ||
+    fail "could not enumerate the direct-input roots at ${commit}"
   local record mode_bits type object path content_sha root
   while IFS= read -r -d '' record; do
     mode_bits="${record%% *}"
@@ -206,7 +216,8 @@ prepare_verified_snapshot() {
     content_sha="$(git -C "${checkout}" cat-file blob "${object}" | sha256sum | awk '{print $1}')"
     printf '%s,%s,%s,%s,%s\n' "${mode_bits}" "${type}" "${object}" "${content_sha}" "${path}" \
       >>"${canonical_inventory}"
-  done < <(git -C "${checkout}" ls-tree -r -z "${commit}" -- "${DIRECT_INPUT_ROOTS[@]}")
+  done <"${direct_input_listing}"
+  rm -f "${direct_input_listing}"
   LC_ALL=C sort -t, -k5 -o "${canonical_inventory}" "${canonical_inventory}"
   for root in "${DIRECT_INPUT_ROOTS[@]}"; do
     grep -q -- ",${root}\(/\|$\)" "${canonical_inventory}" ||
@@ -279,13 +290,20 @@ validate_finished_report() {
   cmp -s "${canonical_inventory}" "${report}/direct-input-inventory.sha256" ||
     fail 'the recorded direct-input inventory differs from the one independently derived from git'
 
+  # Same portability rule as the inventory loop above: no process substitution
+  # on an instance-executed path, and the producer is status-checked so a failed
+  # jq cannot masquerade as a report that declared no evidence.
   local evidence
+  local evidence_listing="${report_file}.evidence-paths"
+  jq -r '.legs[].evidence[]' "${report_file}" >"${evidence_listing}" ||
+    fail "could not read the declared evidence paths from ${report_file}"
   while IFS= read -r evidence; do
     case "${evidence}" in
     /* | .. | ../* | */.. | */../*) fail "invalid evidence path in report: ${evidence}" ;;
     esac
     [ -s "${report}/${evidence}" ] || fail "declared evidence is missing or empty: ${evidence}"
-  done < <(jq -r '.legs[].evidence[]' "${report_file}")
+  done <"${evidence_listing}"
+  rm -f "${evidence_listing}"
 }
 
 nsc_list_json() {
