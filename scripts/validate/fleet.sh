@@ -1303,24 +1303,62 @@ sit-namespace-lifecycle | sit-proof-lifecycle)
     fail 'the production Namespace outer preflight does not require iconv'
   rg -qF 'iconv -f UTF-8 -t UTF-8 "${raw}" >/dev/null' "${proof_source}" ||
     fail 'the production Namespace list path has no checked raw UTF-8 boundary'
-  # BusyBox applet paths are created by the busybox package trigger and are not
-  # in its file manifest, so apk cannot own them: the generation-11 run at
-  # product b67f0ba died on `apk info --who-owns /sbin/gzip`. The receipt must
-  # query the identity-proven busybox binary instead, and must never revert to
-  # the applet path.
-  rg -qF 'namespace_first_line_receipt apk info --who-owns "${busybox_path}"' "${sit_source}" ||
-    fail 'Wolfi BusyBox tool receipts no longer use fail-closed package ownership of the busybox binary'
-  if rg -qF 'apk info --who-owns "${path}"' "${sit_source}"; then
-    fail 'a Wolfi BusyBox applet receipt reverted to the unowned applet path that failed on the instance'
+  # BusyBox applets are trigger-created aliases, so the receipt binds both PATH
+  # and the applet inode to one reviewed canonical executable, then attributes
+  # that exact path to the exact busybox package. No list-only or alias-query
+  # substitute answers that file-to-package claim.
+  rg -qF 'NSC_BUSYBOX_PACKAGE=busybox' "${pins_source}" ||
+    fail 'the Namespace BusyBox package pin is not the reviewed literal busybox'
+  rg -qF 'NSC_BUSYBOX_CANONICAL=/usr/bin/busybox' "${pins_source}" ||
+    fail 'the Namespace BusyBox canonical-path pin is not /usr/bin/busybox'
+  rg -qF '[ "${NSC_BUSYBOX_PACKAGE}" = '\''busybox'\'' ] &&' "${sit_source}" ||
+    fail 'the inner input gate no longer validates the exact BusyBox package pin'
+  rg -qF '[ "${NSC_BUSYBOX_CANONICAL}" = '\''/usr/bin/busybox'\'' ] ||' "${sit_source}" ||
+    fail 'the inner input gate no longer validates the exact BusyBox canonical-path pin'
+  nsl_wolfi_production="${tmp}/namespace-wolfi-production.sh"
+  sed -n '/^namespace_wolfi_tool_receipt() {$/,/^}$/p' "${sit_source}" \
+    >"${nsl_wolfi_production}"
+  [ "$(tail -n 1 "${nsl_wolfi_production}")" = '}' ] ||
+    fail 'the production Wolfi BusyBox receipt is unterminated'
+  rg -qF 'apk info --who-owns "${NSC_BUSYBOX_CANONICAL}"' "${nsl_wolfi_production}" ||
+    fail 'Wolfi BusyBox receipts no longer query exact canonical package ownership'
+  if rg -n -- '--who-owns "\$\{(path|busybox_path)\}"' "${nsl_wolfi_production}"; then
+    fail 'a Wolfi BusyBox receipt reverted to an unowned applet or PATH-alias ownership query'
+  fi
+  if rg -n -- 'apk[[:space:]]+(--from[[:space:]]+installed[[:space:]]+)?info[[:space:]]+(-L|-v|-e)|apk[[:space:]]+list[[:space:]]+--installed|namespace_first_line_receipt[[:space:]]+apk[[:space:]]+(info|list)' \
+    "${nsl_wolfi_production}"; then
+    fail 'the canonical BusyBox success path added a prohibited manifest, list-only, or merged-stream APK receipt'
   fi
   rg -qF 'busybox_path="$(command -v busybox 2>/dev/null || true)"' "${sit_source}" ||
     fail 'the Wolfi applet receipt no longer resolves busybox from PATH fail-closed'
   rg -qF 'busybox is not on PATH for the applet ownership receipt' "${sit_source}" ||
     fail 'the Wolfi applet receipt no longer refuses a missing busybox binary'
-  rg -qF '[ "${path}" -ef "${busybox_path}" ] ||' "${sit_source}" ||
-    fail 'the Wolfi applet receipt no longer binds the applet to busybox by file identity'
-  rg -qF 'applet is not the same file as the busybox binary' "${sit_source}" ||
-    fail 'the Wolfi applet identity refusal no longer names the applet and the busybox binary'
+  rg -qF '[ "${busybox_path}" -ef "${NSC_BUSYBOX_CANONICAL}" ] ||' "${sit_source}" ||
+    fail 'the Wolfi receipt no longer binds PATH BusyBox to the canonical binary by file identity'
+  rg -qF '[ "${path}" -ef "${NSC_BUSYBOX_CANONICAL}" ] ||' "${sit_source}" ||
+    fail 'the Wolfi receipt no longer binds the applet to canonical BusyBox by file identity'
+  rg -qF 'PATH busybox is not the canonical busybox binary: ${busybox_path} vs ${NSC_BUSYBOX_CANONICAL}' \
+    "${sit_source}" || fail 'the PATH-shadow refusal no longer names both BusyBox paths'
+  rg -qF 'applet is not the canonical busybox binary: ${path} vs ${NSC_BUSYBOX_CANONICAL}' \
+    "${sit_source}" || fail 'the applet identity refusal no longer names both paths'
+  rg -qF '2>"${apk_stderr_file}" || apk_status=$?' "${sit_source}" ||
+    fail 'the canonical APK ownership query no longer preserves stderr and status separately'
+  rg -qF 'mapfile -t owner_rows <"${apk_stdout_file}"' "${sit_source}" ||
+    fail 'the canonical APK ownership query no longer validates complete stdout rows'
+  rg -qF '[ "${owner_name}" = "${NSC_BUSYBOX_PACKAGE}" ] ||' "${sit_source}" ||
+    fail 'the canonical APK owner token is no longer parsed to an exact package name'
+  mapfile -t nsl_apk_record_lines < <(rg -n '^[[:space:]]+namespace_tool_record apk ' "${sit_source}")
+  [ "${#nsl_apk_record_lines[@]}" -eq 1 ] ||
+    fail 'the Namespace APK platform receipt must be recorded exactly once'
+  rg -qF 'apk_version="$(namespace_first_line_receipt apk --version)" || return 1' "${sit_source}" ||
+    fail 'the Namespace APK version is no longer captured from one checked probe'
+  rg -qF 'printf '\''Namespace apk version: %s\n'\'' "${apk_version}"' "${sit_source}" ||
+    fail 'the Namespace APK version is no longer observable before BusyBox receipts'
+  rg -qF 'namespace_tool_record apk "${apk_path}" "${apk_version}"' "${sit_source}" ||
+    fail 'the checked Namespace APK probe is no longer the recorded APK row'
+  if rg -qF 'namespace_tool_command_record apk' "${sit_source}"; then
+    fail 'the Namespace platform capture reintroduced a duplicate APK version probe'
+  fi
   # The failing receipt command's own words are the only thing that separates an
   # unowned path from an unsupported ownership invocation. R1 of g11c made the
   # same repair for the git checkout predicate.
@@ -1405,7 +1443,6 @@ NSL_TOOL_RECEIPT_DRIVER
   : >"${nsl_wolfi_fns}"
   for nsl_wolfi_fn in \
     namespace_tool_record \
-    namespace_first_line_receipt \
     namespace_wolfi_tool_receipt \
     namespace_wolfi_tool_record; do
     sed -n "/^${nsl_wolfi_fn}() {\$/,/^}\$/p" "${sit_source}" >"${tmp}/nsl-wolfi-fn.sh"
@@ -1438,33 +1475,69 @@ source "${fn_file}"
 
 apk_bin="${work}/apkbin"
 bb_bin="${work}/bbbin"
+shadow_bin="${work}/shadowbin"
 applets="${work}/applets"
-mkdir -p "${apk_bin}" "${bb_bin}" "${applets}"
+mkdir -p "${apk_bin}" "${bb_bin}" "${shadow_bin}" "${applets}"
 
 printf '#!/bin/sh\nexit 0\n' >"${bb_bin}/busybox"
 chmod 755 "${bb_bin}/busybox"
-NSL_BUSYBOX_PATH="${bb_bin}/busybox"
-export NSL_BUSYBOX_PATH
+NSC_BUSYBOX_PACKAGE=busybox
+NSC_BUSYBOX_CANONICAL="${bb_bin}/busybox"
+NSL_CANONICAL="${NSC_BUSYBOX_CANONICAL}"
+export NSC_BUSYBOX_PACKAGE NSC_BUSYBOX_CANONICAL NSL_CANONICAL
 
-# Ownership is answered only for the busybox binary itself. An applet path is
-# refused exactly as the instance's apk refused /sbin/gzip.
+# Faithfully reproduce the live asymmetry: only the canonical packaged path has
+# an owner. Modes isolate every stdout, stderr, row-shape and owner-token edge.
 cat >"${apk_bin}/apk" <<'NSL_FAKE_APK'
 #!/bin/sh
-case "${NSL_APK_MODE:-owned}" in
-fail)
-  echo "apk fixture refuses ownership: $*" >&2
+if [ "$#" -ne 3 ] || [ "$1" != info ] || [ "$2" != --who-owns ]; then
+  echo "apk fixture rejects unexpected invocation: $*" >&2
+  exit 64
+fi
+if [ "$3" != "${NSL_CANONICAL}" ]; then
+  echo "ERROR: $3: could not find owner package" >&2
   exit 1
+fi
+case "${NSL_APK_MODE:-owned}" in
+owned)
+  echo "${NSL_CANONICAL} is owned by busybox-1.37.0-r59"
+  ;;
+nonzero)
+  echo "partial canonical owner stdout"
+  echo "apk fixture nonzero stderr" >&2
+  exit 23
   ;;
 empty)
-  exit 0
+  :
+  ;;
+multiline)
+  echo "${NSL_CANONICAL} is owned by busybox-1.37.0-r59"
+  echo "${NSL_CANONICAL} is owned by busybox-1.37.0-r60"
+  ;;
+stderr)
+  echo "${NSL_CANONICAL} is owned by busybox-1.37.0-r59"
+  echo "apk fixture warning stderr" >&2
+  ;;
+wrong-path)
+  echo "/wrong/canonical/busybox is owned by busybox-1.37.0-r59"
+  ;;
+wrong-static)
+  echo "${NSL_CANONICAL} is owned by busybox-static-1.37.0-r59"
+  ;;
+wrong-extras)
+  echo "${NSL_CANONICAL} is owned by busybox-extras-1.37.0-r59"
+  ;;
+malformed)
+  echo "${NSL_CANONICAL} is owned by busybox-1.37.0"
+  ;;
+whitespace)
+  echo "${NSL_CANONICAL} is owned by busybox 1.37.0-r59"
+  ;;
+*)
+  echo "apk fixture rejects unknown mode: ${NSL_APK_MODE}" >&2
+  exit 65
   ;;
 esac
-if [ "$3" = "${NSL_BUSYBOX_PATH}" ]; then
-  echo "${NSL_BUSYBOX_PATH} is owned by busybox-1.37.0-r59"
-  exit 0
-fi
-echo "ERROR: $3: could not find owner package" >&2
-exit 1
 NSL_FAKE_APK
 chmod 755 "${apk_bin}/apk"
 
@@ -1477,71 +1550,189 @@ ln -s "${bb_bin}/busybox" "${applets}/gzip"
 ln "${bb_bin}/busybox" "${applets}/sha256sum"
 printf '#!/bin/sh\nexit 0\n' >"${applets}/tar"
 chmod 755 "${applets}/tar"
+cp "${bb_bin}/busybox" "${applets}/busybox-copy"
+chmod 755 "${applets}/busybox-copy"
 ln -s "${applets}/no-such-busybox" "${applets}/dangling"
+cp "${bb_bin}/busybox" "${shadow_bin}/busybox"
+chmod 755 "${shadow_bin}/busybox"
+printf '#!/bin/sh\nexit 0\n' >"${work}/nonexec-busybox"
+chmod 644 "${work}/nonexec-busybox"
 
-owned_line="${NSL_BUSYBOX_PATH} is owned by busybox-1.37.0-r59"
+owned_line="${NSC_BUSYBOX_CANONICAL} is owned by busybox-1.37.0-r59"
 
-# 1. symlinked applet succeeds, and the row keeps the applet path.
+# 1. The canonical executable succeeds and records its exact original path.
+namespace_wolfi_tool_record busybox "${NSC_BUSYBOX_CANONICAL}" 2>"${work}/t1.err" ||
+  nsl_die 41 canonical-busybox-success
+grep -qxF "$(printf 'busybox\t%s\t%s' "${NSC_BUSYBOX_CANONICAL}" "${owned_line}")" \
+  "${work}/namespace-tools.tsv" ||
+  nsl_die 41 canonical-busybox-evidence
+
+# 2. A symlinked applet succeeds and keeps the applet path in evidence.
 namespace_wolfi_tool_record gzip "${applets}/gzip" 2>"${work}/t1.err" ||
-  nsl_die 41 symlink-applet-success
+  nsl_die 42 symlink-applet-success
 grep -qxF "$(printf 'gzip\t%s\t%s' "${applets}/gzip" "${owned_line}")" \
   "${work}/namespace-tools.tsv" ||
-  nsl_die 41 symlink-applet-evidence
+  nsl_die 42 symlink-applet-evidence
 
-# 2. hardlinked applet succeeds. This is the case a basename guard got wrong.
+# 3. A hardlinked applet succeeds. This is the case a basename guard got wrong.
 namespace_wolfi_tool_record sha256sum "${applets}/sha256sum" 2>"${work}/t2.err" ||
-  nsl_die 42 hardlink-applet-success
+  nsl_die 43 hardlink-applet-success
 grep -qxF "$(printf 'sha256sum\t%s\t%s' "${applets}/sha256sum" "${owned_line}")" \
   "${work}/namespace-tools.tsv" ||
-  nsl_die 42 hardlink-applet-evidence
+  nsl_die 43 hardlink-applet-evidence
 
-# 3. an unrelated regular file is refused, and the refusal names both paths.
+# 4. An unrelated executable is refused, naming applet and canonical paths.
 if namespace_wolfi_tool_record tar "${applets}/tar" 2>"${work}/t3.err"; then
-  nsl_die 43 unrelated-regular-file-refusal
+  nsl_die 44 unrelated-regular-file-refusal
 fi
-grep -qF "applet is not the same file as the busybox binary: ${applets}/tar vs ${NSL_BUSYBOX_PATH}" \
+grep -qF "applet is not the canonical busybox binary: ${applets}/tar vs ${NSC_BUSYBOX_CANONICAL}" \
   "${work}/t3.err" ||
-  nsl_die 43 unrelated-regular-file-refusal-message
+  nsl_die 44 unrelated-regular-file-refusal-message
 
-# 4. a non-zero apk carries its own diagnostic through the receipt.
-if NSL_APK_MODE=fail namespace_wolfi_tool_record gzip-apk-fail "${applets}/gzip" \
-  2>"${work}/t4.err"; then
-  nsl_die 44 apk-failure-refusal
+# 5. Byte-identical content is insufficient without inode identity.
+if namespace_wolfi_tool_record copy "${applets}/busybox-copy" 2>"${work}/t5.err"; then
+  nsl_die 45 byte-identical-copy-refusal
 fi
-grep -qF 'tool receipt command failed' "${work}/t4.err" ||
-  nsl_die 44 apk-failure-refusal-message
-grep -qF 'apk fixture refuses ownership' "${work}/t4.err" ||
-  nsl_die 44 apk-failure-diagnostic-preserved
+grep -qF "applet is not the canonical busybox binary: ${applets}/busybox-copy vs ${NSC_BUSYBOX_CANONICAL}" \
+  "${work}/t5.err" ||
+  nsl_die 45 byte-identical-copy-refusal-message
 
-# 5. a successful but empty apk is refused.
-if NSL_APK_MODE=empty namespace_wolfi_tool_record gzip-apk-empty "${applets}/gzip" \
-  2>"${work}/t5.err"; then
-  nsl_die 45 apk-empty-output-refusal
+# 6. A dangling applet link is refused rather than resolved.
+if namespace_wolfi_tool_record dangling "${applets}/dangling" 2>"${work}/t6.err"; then
+  nsl_die 46 dangling-applet-refusal
 fi
-grep -qF 'returned no version or ownership line' "${work}/t5.err" ||
-  nsl_die 45 apk-empty-output-refusal-message
+grep -qF "applet is not the canonical busybox binary: ${applets}/dangling vs ${NSC_BUSYBOX_CANONICAL}" \
+  "${work}/t6.err" ||
+  nsl_die 46 dangling-applet-refusal-message
 
-# 6. a missing busybox is refused before apk is ever consulted. Only Bash
-# builtins run on this path, so dropping the fixture directories is safe.
+# 7. Missing PATH BusyBox refuses before APK is consulted.
 if PATH="${apk_bin}" namespace_wolfi_tool_record gzip-no-busybox "${applets}/gzip" \
-  2>"${work}/t6.err"; then
-  nsl_die 46 missing-busybox-refusal
+  2>"${work}/t7.err"; then
+  nsl_die 47 missing-path-busybox-refusal
 fi
 grep -qF "busybox is not on PATH for the applet ownership receipt: ${applets}/gzip" \
-  "${work}/t6.err" ||
-  nsl_die 46 missing-busybox-refusal-message
-
-# 7. a dangling applet link is refused rather than resolved.
-if namespace_wolfi_tool_record dangling "${applets}/dangling" 2>"${work}/t7.err"; then
-  nsl_die 47 dangling-applet-refusal
-fi
-grep -qF "applet is not the same file as the busybox binary: ${applets}/dangling vs ${NSL_BUSYBOX_PATH}" \
   "${work}/t7.err" ||
-  nsl_die 47 dangling-applet-refusal-message
+  nsl_die 47 missing-path-busybox-refusal-message
 
-# Only the two accepted applets may have produced evidence rows.
-[ "$(wc -l <"${work}/namespace-tools.tsv" | tr -d ' ')" -eq 2 ] ||
-  nsl_die 48 accepted-applet-row-count
+# 8. A PATH-shadowed byte-identical BusyBox is not canonical.
+if PATH="${shadow_bin}:${apk_bin}:${bb_bin}:${nsl_outer_path}" \
+  namespace_wolfi_tool_record gzip-shadow "${applets}/gzip" 2>"${work}/t8.err"; then
+  nsl_die 48 path-shadow-refusal
+fi
+grep -qF "PATH busybox is not the canonical busybox binary: ${shadow_bin}/busybox vs ${NSC_BUSYBOX_CANONICAL}" \
+  "${work}/t8.err" ||
+  nsl_die 48 path-shadow-refusal-message
+
+# 9. A missing canonical executable is refused.
+nsl_saved_canonical="${NSC_BUSYBOX_CANONICAL}"
+NSC_BUSYBOX_CANONICAL="${work}/missing/busybox"
+if namespace_wolfi_tool_record gzip-missing-canonical "${applets}/gzip" 2>"${work}/t9.err"; then
+  nsl_die 49 missing-canonical-refusal
+fi
+grep -qF "canonical busybox pin is not an absolute executable path: ${NSC_BUSYBOX_CANONICAL}" \
+  "${work}/t9.err" ||
+  nsl_die 49 missing-canonical-refusal-message
+NSC_BUSYBOX_CANONICAL="${nsl_saved_canonical}"
+
+# 10. A present but non-executable canonical file is refused.
+NSC_BUSYBOX_CANONICAL="${work}/nonexec-busybox"
+if namespace_wolfi_tool_record gzip-nonexec-canonical "${applets}/gzip" 2>"${work}/t10.err"; then
+  nsl_die 50 nonexecutable-canonical-refusal
+fi
+grep -qF "canonical busybox pin is not an absolute executable path: ${NSC_BUSYBOX_CANONICAL}" \
+  "${work}/t10.err" ||
+  nsl_die 50 nonexecutable-canonical-refusal-message
+NSC_BUSYBOX_CANONICAL="${nsl_saved_canonical}"
+
+# 11. APK nonzero preserves both a partial stdout and its stderr diagnostic.
+if NSL_APK_MODE=nonzero namespace_wolfi_tool_record gzip-apk-fail "${applets}/gzip" \
+  2>"${work}/t4.err"; then
+  nsl_die 51 apk-nonzero-refusal
+fi
+grep -qF 'canonical busybox ownership query exited 23' "${work}/t4.err" ||
+  nsl_die 51 apk-nonzero-refusal-message
+grep -qF 'partial canonical owner stdout' "${work}/t4.err" ||
+  nsl_die 51 apk-nonzero-stdout-preserved
+grep -qF 'apk fixture nonzero stderr' "${work}/t4.err" ||
+  nsl_die 51 apk-nonzero-stderr-preserved
+
+# 12. Exit-zero empty stdout is refused.
+if NSL_APK_MODE=empty namespace_wolfi_tool_record gzip-apk-empty "${applets}/gzip" \
+  2>"${work}/t5.err"; then
+  nsl_die 52 apk-empty-stdout-refusal
+fi
+grep -qF 'canonical busybox ownership query returned empty stdout' "${work}/t5.err" ||
+  nsl_die 52 apk-empty-stdout-refusal-message
+
+# 13. Exit-zero multi-row stdout is refused.
+if NSL_APK_MODE=multiline namespace_wolfi_tool_record gzip-apk-multiline \
+  "${applets}/gzip" 2>"${work}/t13.err"; then
+  nsl_die 53 apk-multiline-refusal
+fi
+grep -qF 'canonical busybox ownership query returned 2 rows' "${work}/t13.err" ||
+  nsl_die 53 apk-multiline-refusal-message
+
+# 14. Exit-zero valid stdout plus any stderr warning is refused.
+if NSL_APK_MODE=stderr namespace_wolfi_tool_record gzip-apk-stderr \
+  "${applets}/gzip" 2>"${work}/t14.err"; then
+  nsl_die 54 apk-nonempty-stderr-refusal
+fi
+grep -qF 'canonical busybox ownership query wrote stderr' "${work}/t14.err" ||
+  nsl_die 54 apk-nonempty-stderr-refusal-message
+grep -qF 'apk fixture warning stderr' "${work}/t14.err" ||
+  nsl_die 54 apk-warning-stderr-preserved
+
+# 15. The returned owner row must name the exact canonical path.
+if NSL_APK_MODE=wrong-path namespace_wolfi_tool_record gzip-wrong-path \
+  "${applets}/gzip" 2>"${work}/t15.err"; then
+  nsl_die 55 wrong-canonical-path-row-refusal
+fi
+grep -qF 'canonical busybox ownership row has the wrong path or shape' \
+  "${work}/t15.err" ||
+  nsl_die 55 wrong-canonical-path-row-refusal-message
+
+# 16-17. Prefix-sharing BusyBox families are not the literal package.
+if NSL_APK_MODE=wrong-static namespace_wolfi_tool_record gzip-static \
+  "${applets}/gzip" 2>"${work}/t16.err"; then
+  nsl_die 56 wrong-owner-family-static-refusal
+fi
+grep -qF 'wrong package family: busybox-static' "${work}/t16.err" ||
+  nsl_die 56 wrong-owner-family-static-refusal-message
+if NSL_APK_MODE=wrong-extras namespace_wolfi_tool_record gzip-extras \
+  "${applets}/gzip" 2>"${work}/t17.err"; then
+  nsl_die 57 wrong-owner-family-extras-refusal
+fi
+grep -qF 'wrong package family: busybox-extras' "${work}/t17.err" ||
+  nsl_die 57 wrong-owner-family-extras-refusal-message
+
+# 18-19. Missing release fields and whitespace-bearing tokens are malformed.
+if NSL_APK_MODE=malformed namespace_wolfi_tool_record gzip-malformed \
+  "${applets}/gzip" 2>"${work}/t18.err"; then
+  nsl_die 58 malformed-owner-token-refusal
+fi
+grep -qF 'malformed release field' "${work}/t18.err" ||
+  nsl_die 58 malformed-owner-token-refusal-message
+if NSL_APK_MODE=whitespace namespace_wolfi_tool_record gzip-whitespace \
+  "${applets}/gzip" 2>"${work}/t19.err"; then
+  nsl_die 59 whitespace-owner-token-refusal
+fi
+grep -qF 'malformed package token' "${work}/t19.err" ||
+  nsl_die 59 whitespace-owner-token-refusal-message
+
+# Only the canonical path and two accepted applets may produce evidence rows,
+# and every row must retain its caller-supplied original path.
+[ "$(wc -l <"${work}/namespace-tools.tsv" | tr -d ' ')" -eq 3 ] ||
+  nsl_die 60 accepted-applet-row-count
+grep -qxF "$(printf 'busybox\t%s\t%s' "${NSC_BUSYBOX_CANONICAL}" "${owned_line}")" \
+  "${work}/namespace-tools.tsv" ||
+  nsl_die 60 canonical-original-path
+grep -qxF "$(printf 'gzip\t%s\t%s' "${applets}/gzip" "${owned_line}")" \
+  "${work}/namespace-tools.tsv" ||
+  nsl_die 60 symlink-original-path
+grep -qxF "$(printf 'sha256sum\t%s\t%s' "${applets}/sha256sum" "${owned_line}")" \
+  "${work}/namespace-tools.tsv" ||
+  nsl_die 60 hardlink-original-path
+printf 'NSL-WOLFI-BASELINE-PASS: canonical-and-applet-cases\n'
 NSL_WOLFI_RECEIPT_DRIVER
 
   nsl_wolfi_predicate() {
@@ -1556,35 +1747,54 @@ NSL_WOLFI_RECEIPT_DRIVER
     fail 'the extracted BusyBox applet receipt helpers are not valid Bash'
   nsl_wolfi_predicate "${nsl_wolfi_fns}" baseline ||
     fail 'the BusyBox applet ownership receipt baseline did not pass its own acceptance predicate'
+  [ ! -s "${tmp}/nsl-wolfi-baseline.err" ] ||
+    fail 'the BusyBox applet ownership baseline emitted unexpected stderr'
+  grep -qxF 'NSL-WOLFI-BASELINE-PASS: canonical-and-applet-cases' \
+    "${tmp}/nsl-wolfi-baseline.out" ||
+    fail 'the BusyBox applet ownership baseline did not reach its exact completion witness'
+  echo '    NSL-WOLFI baseline status=0 witness=canonical-and-applet-cases ✓'
 
-  # M1: remove only the -ef identity guard.
+  nsl_wolfi_assert_mutant() {
+    local label="$1" mutant="$2" expected_status="$3" expected_witness="$4"
+    local mutant_status=0
+    if cmp -s "${nsl_wolfi_fns}" "${mutant}"; then
+      fail "the ${label} mutation did not change the extracted BusyBox receipt"
+    fi
+    bash -n "${mutant}" ||
+      fail "the ${label} mutant is not valid Bash, so its failure would be vacuous"
+    nsl_wolfi_predicate "${mutant}" "${label}" || mutant_status="$?"
+    [ "${mutant_status}" -ne 0 ] ||
+      fail "the ${label} mutant still satisfied the shared baseline predicate"
+    case "${mutant_status}" in
+    2 | 126 | 127)
+      fail "the ${label} mutant died vacuously with shell/exec status ${mutant_status}"
+      ;;
+    esac
+    [ "${mutant_status}" -eq "${expected_status}" ] ||
+      fail "the ${label} mutant failed with status ${mutant_status}, expected ${expected_status}"
+    [ "$(wc -l <"${tmp}/nsl-wolfi-${label}.err" | tr -d ' ')" -eq 1 ] ||
+      fail "the ${label} mutant emitted an unrelated failure beside its named witness"
+    grep -qxF "NSL-WOLFI-ASSERTION-FAILED: ${expected_witness}" \
+      "${tmp}/nsl-wolfi-${label}.err" ||
+      fail "the ${label} mutant did not die at ${expected_witness}"
+    echo "    NSL-WOLFI ${label} status=${mutant_status} witness=${expected_witness} ✓"
+  }
+
+  # M1: remove only the applet-to-canonical inode guard.
   nsl_wolfi_m1="${tmp}/namespace-wolfi-receipt-fns-m1.sh"
   awk '
-    index($0, "-ef \"${busybox_path}\" ] ||") { skip = 1; next }
+    index($0, "[ \"${path}\" -ef \"${NSC_BUSYBOX_CANONICAL}\" ] ||") { skip = 1; next }
     skip && $0 == "  }" { skip = 0; next }
     skip { next }
     { print }
   ' "${nsl_wolfi_fns}" >"${nsl_wolfi_m1}"
-  if cmp -s "${nsl_wolfi_fns}" "${nsl_wolfi_m1}"; then
-    fail 'the M1 mutation did not change the extracted applet receipt, so it proves nothing'
-  fi
-  bash -n "${nsl_wolfi_m1}" ||
-    fail 'the M1 mutant is not valid Bash, so its failure would not be on point'
-  nsl_wolfi_m1_status=0
-  nsl_wolfi_predicate "${nsl_wolfi_m1}" m1 || nsl_wolfi_m1_status="$?"
-  [ "${nsl_wolfi_m1_status}" -ne 0 ] ||
-    fail 'removing the -ef identity guard still passed: the applet binding is not load-bearing'
-  [ "${nsl_wolfi_m1_status}" -eq 43 ] ||
-    fail "the M1 mutant failed with status ${nsl_wolfi_m1_status}, not the unrelated-file assertion"
-  grep -qF 'NSL-WOLFI-ASSERTION-FAILED: unrelated-regular-file-refusal' \
-    "${tmp}/nsl-wolfi-m1.err" ||
-    fail 'the M1 mutant did not fail at the named unrelated-file assertion'
+  nsl_wolfi_assert_mutant m1 "${nsl_wolfi_m1}" 44 unrelated-regular-file-refusal
 
-  # M2: change only the ownership query back to the applet path.
+  # M2: query the applet alias instead of the reviewed canonical path.
   nsl_wolfi_m2="${tmp}/namespace-wolfi-receipt-fns-m2.sh"
   awk '
     {
-      from = "--who-owns \"${busybox_path}\""
+      from = "--who-owns \"${NSC_BUSYBOX_CANONICAL}\""
       to = "--who-owns \"${path}\""
       i = index($0, from)
       if (i > 0) {
@@ -1593,20 +1803,51 @@ NSL_WOLFI_RECEIPT_DRIVER
       print
     }
   ' "${nsl_wolfi_fns}" >"${nsl_wolfi_m2}"
-  if cmp -s "${nsl_wolfi_fns}" "${nsl_wolfi_m2}"; then
-    fail 'the M2 mutation did not change the extracted applet receipt, so it proves nothing'
-  fi
-  bash -n "${nsl_wolfi_m2}" ||
-    fail 'the M2 mutant is not valid Bash, so its failure would not be on point'
-  nsl_wolfi_m2_status=0
-  nsl_wolfi_predicate "${nsl_wolfi_m2}" m2 || nsl_wolfi_m2_status="$?"
-  [ "${nsl_wolfi_m2_status}" -ne 0 ] ||
-    fail 'querying ownership of the applet path still passed: the live g11 defect is not covered'
-  [ "${nsl_wolfi_m2_status}" -eq 41 ] ||
-    fail "the M2 mutant failed with status ${nsl_wolfi_m2_status}, not the symlink assertion"
-  grep -qF 'NSL-WOLFI-ASSERTION-FAILED: symlink-applet-success' \
-    "${tmp}/nsl-wolfi-m2.err" ||
-    fail 'the M2 mutant did not fail at the named symlink assertion'
+  nsl_wolfi_assert_mutant m2 "${nsl_wolfi_m2}" 42 symlink-applet-success
+
+  # M3: remove only the PATH-BusyBox-to-canonical inode guard.
+  nsl_wolfi_m3="${tmp}/namespace-wolfi-receipt-fns-m3.sh"
+  awk '
+    index($0, "[ \"${busybox_path}\" -ef \"${NSC_BUSYBOX_CANONICAL}\" ] ||") { skip = 1; next }
+    skip && $0 == "  }" { skip = 0; next }
+    skip { next }
+    { print }
+  ' "${nsl_wolfi_fns}" >"${nsl_wolfi_m3}"
+  nsl_wolfi_assert_mutant m3 "${nsl_wolfi_m3}" 48 path-shadow-refusal
+
+  # M4: retain only the row prefix and remove exact owner-token parsing.
+  nsl_wolfi_m4="${tmp}/namespace-wolfi-receipt-fns-m4.sh"
+  awk '
+    index($0, "  owner_token=\"${owner_line#") == 1 { skip = 1; next }
+    skip && index($0, "  printf '\''%s\\n'\'' \"${owner_line}\"") == 1 {
+      skip = 0
+      print
+      next
+    }
+    skip { next }
+    { print }
+  ' "${nsl_wolfi_fns}" >"${nsl_wolfi_m4}"
+  nsl_wolfi_assert_mutant m4 "${nsl_wolfi_m4}" 56 wrong-owner-family-static-refusal
+
+  # M5: drop the separate non-empty stderr refusal.
+  nsl_wolfi_m5="${tmp}/namespace-wolfi-receipt-fns-m5.sh"
+  awk '
+    index($0, "[ -z \"${apk_error}\" ] ||") { skip = 1; next }
+    skip && $0 == "  }" { skip = 0; next }
+    skip { next }
+    { print }
+  ' "${nsl_wolfi_fns}" >"${nsl_wolfi_m5}"
+  nsl_wolfi_assert_mutant m5 "${nsl_wolfi_m5}" 54 apk-nonempty-stderr-refusal
+
+  # M6: drop the exactly-one-stdout-row refusal.
+  nsl_wolfi_m6="${tmp}/namespace-wolfi-receipt-fns-m6.sh"
+  awk '
+    index($0, "[ \"${#owner_rows[@]}\" -eq 1 ] ||") { skip = 1; next }
+    skip && $0 == "  }" { skip = 0; next }
+    skip { next }
+    { print }
+  ' "${nsl_wolfi_fns}" >"${nsl_wolfi_m6}"
+  nsl_wolfi_assert_mutant m6 "${nsl_wolfi_m6}" 53 apk-multiline-refusal
 
   # The recursive hard-deadline seam, executed for real against a PATH-first
   # timeout spy. The seam `exec`s timeout, so the spy terminates the run before

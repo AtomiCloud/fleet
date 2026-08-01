@@ -162,6 +162,9 @@ validate_inputs() {
     sit_fail 'Namespace Kubernetes version pin must remain 1.33'
   [ "${NSC_K3S_VERSION}" = 'v1.33.1+k3s1' ] ||
     sit_fail 'built-in k3s version pin must remain v1.33.1+k3s1'
+  [ "${NSC_BUSYBOX_PACKAGE}" = 'busybox' ] &&
+    [ "${NSC_BUSYBOX_CANONICAL}" = '/usr/bin/busybox' ] ||
+    sit_fail 'Namespace BusyBox package and canonical-path pins changed'
   [ "${NSC_CONTAINERD_CTR}" = '/vendor/containerd/ctr' ] &&
     [ "${NSC_CONTAINERD_ADDRESS}" = '/var/run/containerd/containerd.sock' ] &&
     [ "${NSC_CONTAINERD_NAMESPACE}" = 'k8s.io' ] ||
@@ -274,26 +277,97 @@ namespace_tool_command_record() {
 }
 
 # BusyBox applets such as gzip, sha256sum, tar and timeout are materialised by
-# the busybox package trigger, not listed in its file manifest, so apk cannot
-# answer `--who-owns` for the applet path itself. Bind the applet to the
-# packaged binary by file identity -- `-ef` compares device and inode after
-# following symlinks, so a symlinked or hardlinked applet is accepted while an
-# unrelated regular file, a byte-identical copy and a dangling link are all
-# refused -- then ask apk about the path that a package can actually own.
-# `command -v` and `[ -ef ]` are Bash builtins, so this adds no new instance
-# dependency; only `busybox` itself, which the bootstrap gate now requires.
+# the busybox package trigger rather than listed in its file manifest. Bind the
+# PATH BusyBox and each applet to the reviewed canonical binary by device and
+# inode, then ask apk for that canonical path's exact package attribution.
+# Symlinked and hardlinked applets pass; unrelated files, byte-identical copies,
+# dangling links and PATH shadows fail. Bash captures and validates both APK
+# streams without adding a new success-path dependency.
 namespace_wolfi_tool_receipt() {
-  local path="$1" busybox_path
+  local path="$1" busybox_path apk_stdout_file apk_stderr_file apk_status
+  local apk_output apk_error owner_line owner_prefix owner_token
+  local owner_without_release owner_release owner_name owner_version
+  local -a owner_rows=()
   busybox_path="$(command -v busybox 2>/dev/null || true)"
   [ -n "${busybox_path}" ] || {
     sit_fail "busybox is not on PATH for the applet ownership receipt: ${path}"
     return 1
   }
-  [ "${path}" -ef "${busybox_path}" ] || {
-    sit_fail "applet is not the same file as the busybox binary: ${path} vs ${busybox_path}"
+  case "${NSC_BUSYBOX_CANONICAL}" in
+  /*) ;;
+  *)
+    sit_fail "canonical busybox pin is not an absolute executable path: ${NSC_BUSYBOX_CANONICAL}"
+    return 1
+    ;;
+  esac
+  [ -x "${NSC_BUSYBOX_CANONICAL}" ] || {
+    sit_fail "canonical busybox pin is not an absolute executable path: ${NSC_BUSYBOX_CANONICAL}"
     return 1
   }
-  namespace_first_line_receipt apk info --who-owns "${busybox_path}"
+  [ "${busybox_path}" -ef "${NSC_BUSYBOX_CANONICAL}" ] || {
+    sit_fail "PATH busybox is not the canonical busybox binary: ${busybox_path} vs ${NSC_BUSYBOX_CANONICAL}"
+    return 1
+  }
+  [ "${path}" -ef "${NSC_BUSYBOX_CANONICAL}" ] || {
+    sit_fail "applet is not the canonical busybox binary: ${path} vs ${NSC_BUSYBOX_CANONICAL}"
+    return 1
+  }
+
+  apk_stdout_file="${work}/namespace-apk-who-owns.stdout"
+  apk_stderr_file="${work}/namespace-apk-who-owns.stderr"
+  apk_status=0
+  apk info --who-owns "${NSC_BUSYBOX_CANONICAL}" >"${apk_stdout_file}" \
+    2>"${apk_stderr_file}" || apk_status=$?
+  apk_output="$(<"${apk_stdout_file}")"
+  apk_error="$(<"${apk_stderr_file}")"
+  [ "${apk_status}" -eq 0 ] || {
+    sit_fail "canonical busybox ownership query exited ${apk_status}; stdout: ${apk_output:-<empty>}; stderr: ${apk_error:-<empty>}"
+    return 1
+  }
+  [ -z "${apk_error}" ] || {
+    sit_fail "canonical busybox ownership query wrote stderr; stdout: ${apk_output:-<empty>}; stderr: ${apk_error:-<empty>}"
+    return 1
+  }
+  [ -n "${apk_output}" ] || {
+    sit_fail "canonical busybox ownership query returned empty stdout; stdout: ${apk_output:-<empty>}; stderr: ${apk_error:-<empty>}"
+    return 1
+  }
+  mapfile -t owner_rows <"${apk_stdout_file}"
+  [ "${#owner_rows[@]}" -eq 1 ] || {
+    sit_fail "canonical busybox ownership query returned ${#owner_rows[@]} rows; stdout: ${apk_output:-<empty>}; stderr: ${apk_error:-<empty>}"
+    return 1
+  }
+
+  owner_line="${owner_rows[0]}"
+  owner_prefix="${NSC_BUSYBOX_CANONICAL} is owned by "
+  [[ ${owner_line} == "${owner_prefix}"* ]] || {
+    sit_fail "canonical busybox ownership row has the wrong path or shape; stdout: ${apk_output:-<empty>}; stderr: ${apk_error:-<empty>}"
+    return 1
+  }
+  owner_token="${owner_line#"${owner_prefix}"}"
+  [ -n "${owner_token}" ] && [[ ${owner_token} != *[[:space:]]* ]] || {
+    sit_fail "canonical busybox ownership row has a malformed package token; stdout: ${apk_output:-<empty>}; stderr: ${apk_error:-<empty>}"
+    return 1
+  }
+  owner_without_release="${owner_token%-*}"
+  owner_release="${owner_token##*-}"
+  [ "${owner_without_release}" != "${owner_token}" ] &&
+    [[ ${owner_release} =~ ^r[0-9]+$ ]] || {
+    sit_fail "canonical busybox ownership row has a malformed release field; stdout: ${apk_output:-<empty>}; stderr: ${apk_error:-<empty>}"
+    return 1
+  }
+  owner_name="${owner_without_release%-*}"
+  owner_version="${owner_without_release##*-}"
+  [ "${owner_name}" != "${owner_without_release}" ] &&
+    [ -n "${owner_version}" ] || {
+    sit_fail "canonical busybox ownership row has a malformed version field; stdout: ${apk_output:-<empty>}; stderr: ${apk_error:-<empty>}"
+    return 1
+  }
+  [ "${owner_name}" = "${NSC_BUSYBOX_PACKAGE}" ] || {
+    sit_fail "canonical busybox ownership row names the wrong package family: ${owner_name}; stdout: ${apk_output:-<empty>}; stderr: ${apk_error:-<empty>}"
+    return 1
+  }
+  printf '%s\n' "${owner_line}"
 }
 
 namespace_wolfi_tool_record() {
@@ -324,7 +398,11 @@ namespace_capture_platform() {
     sit_fail "Ready node InternalIP is not IPv4: ${namespace_node_internal_ip}"
 
   : >"${work}/namespace-tools.tsv"
-  namespace_tool_command_record apk "$(command -v apk)" apk --version
+  local apk_path apk_version
+  apk_path="$(command -v apk)"
+  apk_version="$(namespace_first_line_receipt apk --version)" || return 1
+  printf 'Namespace apk version: %s\n' "${apk_version}"
+  namespace_tool_record apk "${apk_path}" "${apk_version}"
   namespace_tool_command_record bash "$(command -v bash)" bash --version
   namespace_tool_command_record bun "$(command -v bun)" bun --version
   namespace_tool_command_record curl "$(command -v curl)" curl --version
