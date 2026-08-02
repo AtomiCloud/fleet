@@ -4738,7 +4738,7 @@ kargo_runtime_install_soak_project() {
   yq ea -o=json '[.]' "${report}/kargo-runtime-soak-rendered.yaml" \
     >"${KARGO_RUNTIME_DIR}/kargo-runtime-soak-rendered.json"
   jq -e '
-    ([.[] | select(.kind == "Stage")] | length) == 4 and
+    ([.[] | select(.kind == "Stage")] | length) == 3 and
     ([.[] | select(.kind == "Stage" and .metadata.name == "canary-sitsoak-dummy-ampharos")][0] |
       .spec.requestedFreight[0].sources.stages == [
         "canary-sitsoak-dummy-pikachu", "canary-sitsoak-dummy-raichu"
@@ -4924,7 +4924,6 @@ kargo_runtime_finalize_git_oracle() {
     platforms/canary/landscapes/pikachu/dummy.yaml \
     platforms/canary/landscapes/raichu/dummy.yaml \
     platforms/canary-sitsoak/landscapes/ampharos/dummy.yaml \
-    platforms/canary-sitsoak/landscapes/pichu/dummy.yaml \
     platforms/canary-sitsoak/landscapes/pikachu/dummy.yaml \
     platforms/canary-sitsoak/landscapes/raichu/dummy.yaml |
     LC_ALL=C sort >"${KARGO_RUNTIME_DIR}/kargo-runtime-expected-paths.txt"
