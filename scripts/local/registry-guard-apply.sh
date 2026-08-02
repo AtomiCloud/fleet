@@ -111,6 +111,34 @@ validate_protected_environment() {
   fi
 }
 
+# Shared post-apply comparison shape. This must never rewrite a value GitHub
+# actually returned: it only drops server-side bookkeeping fields and orders
+# the sets that GitHub is free to return in any order.
+canonical_policy() {
+  jq -cS '
+    {name, target, enforcement, bypass_actors, conditions, rules}
+    | .bypass_actors |= sort_by(.actor_type, .actor_id, .bypass_mode)
+    | .conditions.ref_name.include |= sort
+    | .conditions.ref_name.exclude |= sort
+    | .rules |= sort_by(.type)
+  '
+}
+
+# Only the rendered payload omits these keys; GitHub materialises explicit
+# defaults for them. Fill them in on the desired side alone so a live
+# dismissal_restriction or required_reviewers drift stays visible instead of
+# being normalised away on both sides of the comparison.
+desired_policy_defaults() {
+  jq -c '
+    .rules |= map(
+      if .type == "pull_request" then
+        .parameters.dismissal_restriction //= {allowed_actors: [], enabled: false}
+        | .parameters.required_reviewers //= []
+      else . end
+    )
+  '
+}
+
 # Offline entry point used by scripts/validate/registry-guard.sh. It exercises
 # the same fail-closed metadata checks as apply mode without calling GitHub.
 if [ "${1:-}" = '--validate-a33-metadata' ]; then
@@ -124,6 +152,23 @@ if [ "${1:-}" = '--validate-protected-environment' ]; then
   [ "$#" -eq 5 ] ||
     fail "usage: $0 --validate-protected-environment ENVIRONMENT BRANCH_POLICIES REPOSITORY_SECRETS TEAM_ID"
   validate_protected_environment "$(<"$2")" "$(<"$3")" "$(<"$4")" "$5"
+  exit 0
+fi
+
+# Offline entry point for the same post-apply drift comparison apply mode runs,
+# so the validator can prove live drift is still detected without GitHub.
+if [ "${1:-}" = '--compare-policies' ]; then
+  [ "$#" -eq 3 ] ||
+    fail "usage: $0 --compare-policies DESIRED LIVE"
+  compare_desired="$(desired_policy_defaults <"$2" | canonical_policy)"
+  compare_live="$(canonical_policy <"$3")"
+  # Bind both sides first: an empty canonicalisation must never compare equal
+  # to another empty canonicalisation inside the test itself.
+  if [ -z "${compare_desired}" ] || [ -z "${compare_live}" ]; then
+    fail 'policy comparison input did not canonicalise to a policy'
+  fi
+  [ "${compare_desired}" = "${compare_live}" ] ||
+    fail 'live ruleset policy differs from the desired payload'
   exit 0
 fi
 
@@ -272,29 +317,13 @@ for rendered in "${rendered_payloads[@]}"; do
   fi
 done
 
-canonical_policy() {
-  jq -cS '
-    {name, target, enforcement, bypass_actors, conditions, rules}
-    | .bypass_actors |= sort_by(.actor_type, .actor_id, .bypass_mode)
-    | .conditions.ref_name.include |= sort
-    | .conditions.ref_name.exclude |= sort
-    | .rules |= map(
-        if .type == "pull_request" then
-          .parameters.dismissal_restriction = {allowed_actors: [], enabled: false}
-          | .parameters.required_reviewers = []
-        else . end
-      )
-    | .rules |= sort_by(.type)
-  '
-}
-
 rulesets="$(gh api --paginate --slurp "repos/${repo}/rulesets?per_page=100" | jq -c 'add // []')"
 for rendered in "${rendered_payloads[@]}"; do
   name="$(jq -r '.name' "${rendered}")"
   matching_count="$(jq --arg name "${name}" '[.[] | select(.name == $name)] | length' <<<"${rulesets}")"
   [ "${matching_count}" -eq 1 ] || fail "ruleset ${name} is absent or duplicated after apply"
   live_id="$(jq -r --arg name "${name}" '.[] | select(.name == $name) | .id' <<<"${rulesets}")"
-  desired_policy="$(canonical_policy <"${rendered}")"
+  desired_policy="$(desired_policy_defaults <"${rendered}" | canonical_policy)"
   live_policy="$(gh api "repos/${repo}/rulesets/${live_id}" | canonical_policy)"
   if [ "${desired_policy}" != "${live_policy}" ]; then
     echo "❌ live ruleset ${name} differs after apply" >&2

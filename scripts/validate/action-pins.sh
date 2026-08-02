@@ -13,7 +13,16 @@ jq -e '.schemaVersion == 1 and (.actions | type == "object") and ([.actions[] | 
 
 tmp="$(mktemp)"
 trap 'rm -f "${tmp}"' EXIT
-rg -n --no-heading '^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]+[^[:space:]]+' .github/workflows >"${tmp}" || true
+[ -d .github/workflows ] || {
+  echo "❌ '.github/workflows' is missing" >&2
+  exit 1
+}
+rg_status=0
+rg -n --no-heading '^[[:space:]]*(-[[:space:]]+)?uses:[[:space:]]+[^[:space:]]+' .github/workflows >"${tmp}" || rg_status=$?
+[ "${rg_status}" -le 1 ] || {
+  echo "❌ could not scan '.github/workflows' for action references (rg exited ${rg_status})" >&2
+  exit 1
+}
 
 while IFS=: read -r file line body; do
   [ -n "${body}" ] || continue

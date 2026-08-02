@@ -40,7 +40,7 @@ classify_policy_denial() {
           end)
       ] | join("\n");
     denial_text as $text
-    | (($text | test("(?i)(not[[:space:]-]*found|resource[[:space:]-]*not[[:space:]-]*accessible|reference[[:space:]-]*already[[:space:]-]*exists|validation[[:space:]-]*failed)")) | not)
+    | (($text | test("(?i)(not[[:space:]-]*found|resource[[:space:]-]*not[[:space:]-]*accessible|reference[[:space:]-]*already[[:space:]-]*exists)")) | not)
     and ($text | test("(?i)(repository[[:space:]-]*(rule|ruleset)|ruleset|protected[[:space:]-]*(branch|ref|tag)|bypass)"))
   ' "${body_file}" >/dev/null
 }

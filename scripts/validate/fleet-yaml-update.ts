@@ -69,6 +69,13 @@ if (!match) {
   console.error(`❌ target line is not a scalar mapping: ${line}`);
   process.exit(1);
 }
+// A key carrying no inline scalar is either a nested block header or an empty
+// value. Rewriting it would strand the child lines under a now-scalar key (or
+// invent a scalar where the document had none), so refuse instead.
+if (match[2].trim() === '') {
+  console.error(`❌ target '${dottedKey}' opens a nested block or holds no scalar value: ${line}`);
+  process.exit(1);
+}
 lines[targetLine] = `${match[1]}${newValue}`;
 
 await Bun.write(file, lines.join('\n'));
