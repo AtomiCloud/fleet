@@ -1198,6 +1198,230 @@ sit-namespace-lifecycle | sit-proof-lifecycle)
   if rg -n -- '--[[:space:]]+sh[[:space:]]' "${proof_source}"; then
     fail 'a production Namespace ssh call reintroduced a nested remote shell that the nsc join would split'
   fi
+
+  # ---------------------------------------------------------------------
+  # SESSION-HANG lane source law.
+  #
+  # The generation-13 live attempt emitted correct hostname bytes and then the
+  # nsc ssh client failed to terminate. The pre-repair preflight carried no
+  # timeout and no closed stdin, so it hung unboundedly. These pins refuse a
+  # reversion to that shape and pin the lane that replaced it. The behavioural
+  # matrix further down is the real gate; every pin here is additionally proven
+  # non-vacuous by a mutant that must go red.
+  # ---------------------------------------------------------------------
+
+  # EVERY production ssh call must be bounded and stdin-closed, not just the
+  # hostname preflight: an unbounded setup or report-archive call hangs the proof
+  # exactly as the hostname call did. One bound per call site, each with its own
+  # reviewed pin, and one `</dev/null` per site.
+  # Asserted PER CALL SITE rather than by a raw count: a count would be
+  # satisfied by five timeouts anywhere in the file, including five on one call
+  # and none on another. Each `nsc ssh` line must have its own `timeout` opener
+  # within the preceding four lines (the opener, the kill-after, the duration,
+  # then the call), and its own `</dev/null` somewhere in the REST OF ITS OWN
+  # logical command. The scan runs to the end of the backslash continuation
+  # rather than a fixed window, because the inner run carries several
+  # environment-assignment lines between the call and its redirects.
+  # Defined as a function so the gate self-tests further down can run THE SAME
+  # scanner against deliberately broken copies. A self-test that re-implemented
+  # this logic could pass while the real gate was vacuous.
+  nsl_ssh_bound_scan() {
+    awk '
+      /^[[:space:]]+timeout --verbose --signal=TERM \\$/ { last_timeout = NR }
+      /^[[:space:]]+nsc ssh[[:space:]]/ {
+        sites++
+        if (last_timeout == 0 || NR - last_timeout > 4) unbounded = unbounded " " NR
+        pending[NR] = 1
+        pending_line = NR
+        if ($0 !~ /\\$/) pending_line = 0
+        next
+      }
+      pending_line {
+        if (index($0, "</dev/null") > 0) { closed[pending_line] = 1; pending_line = 0 }
+        else if ($0 !~ /\\$/) pending_line = 0
+      }
+      END {
+        for (n in pending) if (!(n in closed)) open_stdin = open_stdin " " n
+        printf "%d|%s|%s", sites, unbounded, open_stdin
+      }
+    ' "$1"
+  }
+  # Refuses when any ssh site is unbounded or leaves stdin open. Used by the
+  # gate self-tests; the real gate below reports the offending line numbers.
+  nsl_ssh_bounds_ok() {
+    local report
+    report="$(nsl_ssh_bound_scan "$1")"
+    [ "$(printf '%s' "${report}" | cut -d'|' -f2)" = '' ] &&
+      [ "$(printf '%s' "${report}" | cut -d'|' -f3)" = '' ]
+  }
+  nsl_ssh_bound_report="$(nsl_ssh_bound_scan "${proof_source}")"
+  nsl_ssh_sites="${nsl_ssh_bound_report%%|*}"
+  nsl_ssh_unbounded="$(printf '%s' "${nsl_ssh_bound_report}" | cut -d'|' -f2)"
+  nsl_ssh_open_stdin="$(printf '%s' "${nsl_ssh_bound_report}" | cut -d'|' -f3)"
+  [ "${nsl_ssh_sites}" -eq 4 ] ||
+    fail "the production wrapper must carry exactly four nsc ssh call sites, found ${nsl_ssh_sites}"
+  [ -z "${nsl_ssh_unbounded}" ] ||
+    fail "a production ssh call site is not preceded by its own explicit hard timeout, at line(s):${nsl_ssh_unbounded}"
+  [ -z "${nsl_ssh_open_stdin}" ] ||
+    fail "a production ssh call site does not close stdin against an interactive session, at line(s):${nsl_ssh_open_stdin}"
+  # The liveness/list client call is bounded too, and is the fifth and last
+  # timeout site. Nothing else in the wrapper may acquire one silently.
+  nsl_timeout_sites="$(rg -c -- '^[[:space:]]+timeout --verbose --signal=TERM \\$' "${proof_source}" || true)"
+  [ "${nsl_timeout_sites}" -eq 5 ] ||
+    fail "the wrapper must bound exactly the four ssh calls and the list call, found ${nsl_timeout_sites} timeout sites"
+  for nsl_ssh_bound in \
+    NSC_SESSION_HANG_PER_CALL_TIMEOUT_SECONDS \
+    NSC_SSH_SETUP_TIMEOUT_SECONDS \
+    NSC_SSH_INNER_TIMEOUT_SECONDS \
+    NSC_SSH_REPORT_ARCHIVE_TIMEOUT_SECONDS; do
+    rg -qF "\${${nsl_ssh_bound}}s" "${proof_source}" ||
+      fail "a production ssh call site is not bounded by its reviewed pin ${nsl_ssh_bound}"
+  done
+
+  rg -qF 'enter_session_hang_lane' "${proof_source}" ||
+    fail 'the wrapper has no same-live-instance SESSION-HANG lane'
+  rg -qF 'session_hang_outcome=' "${proof_source}" ||
+    fail 'the SESSION-HANG lane records no closed outcome'
+  rg -qF 'instance_present_and_reviewed_in' "${proof_source}" ||
+    fail 'liveness re-proof does not reuse the reviewed live-row predicate'
+  rg -qF 'consumesInstanceOrdinal:false' "${proof_source}" ||
+    fail 'the SESSION-HANG receipt no longer denies instance-ordinal consumption'
+  # The liveness probe must stay TRI-state. A boolean would map every list
+  # failure onto "instance lost", which is exactly the ordinal-consuming claim
+  # ruling item 7 forbids uncertainty from manufacturing.
+  rg -qF 'probe_instance_liveness' "${proof_source}" ||
+    fail 'liveness is no longer a distinct probe'
+  rg -qF 'instance_present_in' "${proof_source}" ||
+    fail 'present-but-drifted liveness is no longer separable from proven absence'
+  rg -qF 'liveness-unproven' "${proof_source}" ||
+    fail 'liveness uncertainty no longer has its own terminal class'
+  rg -qF 'close_lane_terminally' "${proof_source}" ||
+    fail 'the lane has no outcome-branching terminal close'
+
+  # The terminal close must branch on the CLOSED OUTCOME, never on the lane's
+  # bare return status: the lane returns 1 for a closed session lane, for proven
+  # instance loss, and for unproven liveness, and those are three different
+  # terminal classes that must not collapse onto one signature.
+  nsl_close_body="${tmp}/close-lane-terminally.sh"
+  sed -n '/^close_lane_terminally() {$/,/^}$/p' "${proof_source}" >"${nsl_close_body}"
+  [ "$(tail -n 1 "${nsl_close_body}")" = '}' ] ||
+    fail 'the terminal close body is unterminated'
+  for nsl_terminal_stage in \
+    session-hang-exhausted session-hang-instance-lost session-hang-liveness-unproven; do
+    rg -qF "failure_stage='${nsl_terminal_stage}'" "${nsl_close_body}" ||
+      fail "the terminal close does not classify ${nsl_terminal_stage}"
+  done
+  for nsl_terminal_status in \
+    NSC_SESSION_HANG_EXHAUSTED_STATUS NSC_INSTANCE_LOST_STATUS NSC_LIVENESS_UNPROVEN_STATUS; do
+    rg -qF "${nsl_terminal_status}" "${nsl_close_body}" ||
+      fail "the terminal close does not emit the reserved ${nsl_terminal_status}"
+  done
+  # Cleanup must be ATTEMPTED before the process leaves the lane, or a terminal
+  # lane close leaks the instance.
+  rg -qF 'destroy_instance_and_prove_absent' "${nsl_close_body}" ||
+    fail 'the terminal close does not destroy the instance and prove absence'
+  # The receipt must NOT be written here. The reserved terminals defer their one
+  # receipt to the EXIT cleanup, which retries cleanup first and therefore writes
+  # cleanup booleans that are facts rather than a pre-cleanup snapshot. A receipt
+  # written inside this function would permanently record the first attempt.
+  if rg -qF 'write_lifecycle_report' "${nsl_close_body}"; then
+    fail 'the terminal close writes its own receipt, so a retried cleanup can never be reflected in it'
+  fi
+  # ...and the EXIT cleanup must be the writer, and must preserve the reserved
+  # status. If a snapshot or cleanup failure could rewrite rc, the external
+  # driver would read an ordinary refusal where a reserved terminal occurred.
+  nsl_cleanup_body="${tmp}/cleanup-body.sh"
+  sed -n '/^cleanup() {$/,/^}$/p' "${proof_source}" >"${nsl_cleanup_body}"
+  [ "$(tail -n 1 "${nsl_cleanup_body}")" = '}' ] ||
+    fail 'the cleanup body is unterminated'
+  rg -qF 'write_lifecycle_report' "${nsl_cleanup_body}" ||
+    fail 'the EXIT cleanup does not write the reserved-terminal receipt'
+  rg -qF 'preserve_reserved_terminal' "${nsl_cleanup_body}" ||
+    fail 'the EXIT cleanup does not preserve the reserved terminal status'
+  rg -qF 'rc="${reserved_terminal_status}"' "${nsl_cleanup_body}" ||
+    fail 'the EXIT cleanup does not adopt the reserved terminal status as its exit code'
+
+  # The liveness call must itself be bounded: it is a client call against the
+  # same client that just failed to terminate, so nothing may assume it cannot
+  # hang. The reviewed non-TTY redirect form must survive the rewrite verbatim.
+  rg -qF 'nsc list --output json </dev/null >"${raw}" 2>"${output}.stderr"' "${proof_source}" ||
+    fail 'the production Namespace list path lost its non-TTY redirect form'
+  rg -qF 'NSC_LIST_TIMEOUT_SECONDS' "${proof_source}" ||
+    fail 'the Namespace list path is not bounded by an explicit hard timeout'
+
+  # Byte-exactness of the hostname predicate. The replaced production line used
+  # `tr -d '[:space:]'`, which accepts leading, trailing and internal whitespace
+  # and accepts multiple lines — any of which could let padded stdout "prove"
+  # reachability, which is precisely the claim this lane escalates on.
+  # shellcheck disable=SC2016
+  rg -qF -- '. == $id or . == ($id + "\n")' "${proof_source}" ||
+    fail 'the hostname predicate is no longer byte-exact'
+  if rg -n -- "tr -d '\[:space:\]'" "${proof_source}"; then
+    fail 'the hostname predicate reverted to the whitespace-stripping form that accepts padded or multi-line stdout'
+  fi
+
+  # The lane must never create, destroy or mint a second instance: the wrapper
+  # owns exactly one instance for its whole life, and a lane outcome is not an
+  # instance event.
+  nsl_lane_body="${tmp}/session-hang-lane.sh"
+  sed -n '/^enter_session_hang_lane() {$/,/^}$/p' "${proof_source}" >"${nsl_lane_body}"
+  [ "$(tail -n 1 "${nsl_lane_body}")" = '}' ] ||
+    fail 'the SESSION-HANG lane body is unterminated'
+  if rg -n 'nsc create|nsc destroy' "${nsl_lane_body}"; then
+    fail 'the SESSION-HANG lane reached an instance lifecycle mutation'
+  fi
+
+  # The bounds are reviewed pins, recomputed here rather than trusted.
+  rg -qF 'NSC_SESSION_HANG_MAX_REINVOCATIONS=3' "${pins_source}" ||
+    fail 'the ratified three-re-invocation SESSION-HANG bound is not pinned'
+  rg -qF 'NSC_SESSION_HANG_PER_CALL_TIMEOUT_SECONDS=60' "${pins_source}" ||
+    fail 'the ratified 60-second per-call SESSION-HANG bound is not pinned'
+  rg -qF 'NSC_SESSION_HANG_LANE_BUDGET_SECONDS=300' "${pins_source}" ||
+    fail 'the ratified five-minute SESSION-HANG lane budget is not pinned'
+  rg -qF 'NSC_LIST_TIMEOUT_SECONDS=20' "${pins_source}" ||
+    fail 'the bounded liveness-proof timeout is not pinned'
+  rg -qF 'NSC_LIST_KILL_AFTER_SECONDS=5' "${pins_source}" ||
+    fail 'the bounded liveness-proof kill allowance is not pinned'
+  for nsl_terminal_pin in \
+    'NSC_SESSION_HANG_EXHAUSTED_STATUS=75' \
+    'NSC_INSTANCE_LOST_STATUS=76' \
+    'NSC_LIVENESS_UNPROVEN_STATUS=77'; do
+    rg -qF "${nsl_terminal_pin}" "${pins_source}" ||
+      fail "the reserved terminal status pin is missing or drifted: ${nsl_terminal_pin}"
+  done
+
+  # The lane begins AFTER the initial readiness call, so that call is not
+  # charged. Each of the MAX_REINVOCATIONS iterations pays for one bounded
+  # liveness proof PLUS one bounded ssh call; charging the ssh calls alone would
+  # ignore all three liveness calls and understate the worst case.
+  # With the ratified pins: 3 * ((20 + 5) + (60 + 10)) = 3 * 95 = 285 <= 300.
+  (
+    # shellcheck source=/dev/null
+    . "${pins_source}"
+    nsl_worst=$((NSC_SESSION_HANG_MAX_REINVOCATIONS * ((\
+      NSC_LIST_TIMEOUT_SECONDS + NSC_LIST_KILL_AFTER_SECONDS) + (\
+      NSC_SESSION_HANG_PER_CALL_TIMEOUT_SECONDS + NSC_SESSION_HANG_KILL_AFTER_SECONDS))))
+    [ "${nsl_worst}" -eq 285 ] &&
+      [ "${nsl_worst}" -le "${NSC_SESSION_HANG_LANE_BUDGET_SECONDS}" ]
+  ) ||
+    fail 'the pinned SESSION-HANG per-iteration budget is not the ratified 3 x 95 = 285 within 300'
+  # The structural formula and the wrapper's runtime formula must agree, or this
+  # gate could accept pins the wrapper itself refuses, or worse, the reverse.
+  #
+  # SCOPED to the extracted validate_session_hang_bounds body on purpose. Both
+  # of these substrings also occur in enter_session_hang_lane and in a comment,
+  # so a whole-file scan would stay green even if the bounds check itself were
+  # rewritten to charge the ssh calls alone — which is exactly the defect this
+  # pin exists to catch.
+  nsl_bounds_body="${tmp}/validate-session-hang-bounds.sh"
+  sed -n '/^validate_session_hang_bounds() {$/,/^}$/p' "${proof_source}" >"${nsl_bounds_body}"
+  [ "$(tail -n 1 "${nsl_bounds_body}")" = '}' ] ||
+    fail 'the session-hang bounds validator body is unterminated'
+  rg -qF 'NSC_SESSION_HANG_MAX_REINVOCATIONS *' "${nsl_bounds_body}" ||
+    fail 'the wrapper no longer recomputes its worst case from MAX_REINVOCATIONS'
+  rg -qF 'NSC_LIST_TIMEOUT_SECONDS + NSC_LIST_KILL_AFTER_SECONDS' "${nsl_bounds_body}" ||
+    fail 'the wrapper worst case no longer charges the bounded liveness proofs'
+  echo '    SESSION-HANG lane source law: four bounded stdin-closed ssh sites, tri-state liveness, three distinct reserved terminals, deferred receipt, 3 x 95 = 285 <= 300 ✓'
   # The remote programs execute against BusyBox v1.37.0 on the instance, whose
   # sha256sum applet accepts only `-c`. The generation-11 live run
   # fleet-g11-live-6ae04f0-20260801T082535Z reached the final checksum with
@@ -2666,12 +2890,123 @@ exit 0
 NSL_SLEEP_SHIM
   chmod +x "${nsl_bin}/sleep"
 
+  # Scripted epoch source, so the five-minute SESSION-HANG lane budget can be
+  # driven to exhaustion without any real waiting. Real sleeping scaled to the
+  # ratified budgets is forbidden in this harness, and the budget pins cannot be
+  # shrunk instead: validate_session_hang_bounds hard-asserts 60 and 300.
+  #
+  # Unarmed it execs the real date, so every pre-existing lifecycle case is
+  # byte-for-byte unaffected. Armed by NSL_DATE_OFFSETS it adds an offset once a
+  # named lane event has occurred. Arming is keyed to the OBSERVED CALL COUNTERS
+  # the fake client maintains, never to this shim's own call ordinal: the number
+  # of `date +%s` calls the wrapper makes before the lane is an implementation
+  # detail that would silently drift, whereas the counters are lane events with
+  # fixed meaning.
+  #   hN — once the Nth hostname invocation has happened
+  #        (N=1 readiness, N=2 lane re-invocation 1, ...)
+  #   lN — once the Nth list invocation has happened
+  #        (N=1 the pre-use liveness proof, N=2 lane liveness proof 1, ...)
+  # Offsets are cumulative and permanent once reached, so the modelled clock is
+  # monotonic non-decreasing — the lifecycle receipt asserts
+  # finishedEpoch >= startedEpoch and a one-shot spike would violate it.
+  nsl_real_date="$(command -v date)"
+  case "${nsl_real_date}" in
+  /*) ;;
+  *) fail 'could not resolve the real date executable for the Namespace lifecycle shim' ;;
+  esac
+  # The real date path is BAKED IN as a default rather than relied upon from the
+  # environment. This shim shadows `date` for every caller that puts nsl_bin on
+  # PATH, including the prepare-only fixture, and a missing variable would turn
+  # an unrelated case into a confusing shim failure.
+  cat >"${nsl_bin}/date" <<NSL_DATE_HEAD
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+NSL_REAL_DATE="\${NSL_REAL_DATE:-${nsl_real_date}}"
+NSL_DATE_HEAD
+  cat >>"${nsl_bin}/date" <<'NSL_DATE_SHIM'
+
+if [ "${1:-}" != '+%s' ] || [ -z "${NSL_DATE_OFFSETS:-}" ]; then
+  exec "${NSL_REAL_DATE:?}" "$@"
+fi
+
+state="${NSC_SHIM_STATE:?}"
+mkdir -p "${state}"
+
+offset=0
+IFS=',' read -r -a nsl_date_pairs <<<"${NSL_DATE_OFFSETS}"
+for nsl_date_pair in "${nsl_date_pairs[@]}"; do
+  [ -n "${nsl_date_pair}" ] || continue
+  nsl_date_when="${nsl_date_pair%%:*}"
+  nsl_date_add="${nsl_date_pair##*:}"
+  case "${nsl_date_when}" in
+  h*) nsl_date_counter="${state}/hostname-calls" ;;
+  l*) nsl_date_counter="${state}/list-calls" ;;
+  *)
+    echo "date shim: unmodeled arming key ${nsl_date_when}" >&2
+    exit 90
+    ;;
+  esac
+  nsl_date_seen=0
+  [ ! -f "${nsl_date_counter}" ] || nsl_date_seen="$(cat "${nsl_date_counter}")"
+  [ "${nsl_date_seen}" -ge "${nsl_date_when#?}" ] || continue
+  offset=$((offset + nsl_date_add))
+done
+printf '%s\n' "$(("$("${NSL_REAL_DATE:?}" +%s)" + offset))"
+NSL_DATE_SHIM
+  chmod +x "${nsl_bin}/date"
+
   cat >"${nsl_bin}/script" <<'NSL_SCRIPT_SHIM'
 #!/usr/bin/env sh
 echo 'the lifecycle fixture forbids pseudo-terminal allocation' >&2
 exit 97
 NSL_SCRIPT_SHIM
   chmod +x "${nsl_bin}/script"
+
+  # Accelerated-duration `timeout` seam.
+  #
+  # A bounded list hang must reach full-wrapper liveness-unproven exit 77, but
+  # the ratified 20s+5s list allowance can be neither waited out nor shrunk:
+  # validate_session_hang_bounds hard-asserts both values, so a mutated pin is
+  # refused before any client call. This shim leaves the pins, the wrapper source
+  # and the validated argv completely untouched and rewrites ONLY the duration
+  # actually forwarded to the real timeout, and only for the production list
+  # invocation, and only when explicitly armed. Unarmed it is the real timeout.
+  nsl_real_timeout="$(command -v timeout)"
+  case "${nsl_real_timeout}" in
+  /*) ;;
+  *) fail 'could not resolve the real timeout executable for the Namespace lifecycle shim' ;;
+  esac
+  cat >"${nsl_bin}/timeout" <<NSL_TIMEOUT_HEAD
+#!/usr/bin/env bash
+set -Eeuo pipefail
+
+NSL_REAL_TIMEOUT="\${NSL_REAL_TIMEOUT:-${nsl_real_timeout}}"
+NSL_TIMEOUT_HEAD
+  cat >>"${nsl_bin}/timeout" <<'NSL_TIMEOUT_SHIM'
+
+if [ "${NSC_SHIM_ACCELERATE_LIST_TIMEOUT:-0}" -ne 1 ]; then
+  exec "${NSL_REAL_TIMEOUT:?}" "$@"
+fi
+
+# Recognize EXACTLY the production list invocation, in its reviewed argv shape:
+#   timeout --verbose --signal=TERM --kill-after=<k>s <d>s nsc list --output json
+# Anything else — including all four ssh call sites — is forwarded untouched, so
+# this seam cannot silently accelerate a bound it was not pointed at.
+if [ "$#" -eq 8 ] &&
+  [ "${1:-}" = '--verbose' ] && [ "${2:-}" = '--signal=TERM' ] &&
+  [ "${3:-}" = "--kill-after=${NSC_LIST_KILL_AFTER_SECONDS:-5}s" ] &&
+  [ "${4:-}" = "${NSC_LIST_TIMEOUT_SECONDS:-20}s" ] &&
+  [ "${5:-}" = 'nsc' ] && [ "${6:-}" = 'list' ] &&
+  [ "${7:-}" = '--output' ] && [ "${8:-}" = 'json' ]; then
+  shift 4
+  exec "${NSL_REAL_TIMEOUT:?}" --verbose --signal=TERM \
+    --kill-after=1s 1s "$@"
+fi
+
+exec "${NSL_REAL_TIMEOUT:?}" "$@"
+NSL_TIMEOUT_SHIM
+  chmod +x "${nsl_bin}/timeout"
 
   nsl_real_grep="$(command -v grep)"
   case "${nsl_real_grep}" in
@@ -2747,6 +3082,24 @@ emit_list_form() {
   case "${form}" in
   array) active_instance_json ;;
   null) printf 'null\n' ;;
+  # A schema-valid empty reviewed array. This is a POSITIVE proof that the exact
+  # id is absent — the one and only condition the external driver may read as
+  # consuming an instance ordinal.
+  empty-array) printf '[]\n' ;;
+  # The exact id is PRESENT but disagrees with the reviewed generation label.
+  # Disagreement is not absence, so this must reach liveness-unproven and can
+  # never be promoted into an ordinal-consuming loss. Applied independently of
+  # NSC_SHIM_LIST_LABELS so the pre-use liveness proof can still succeed and the
+  # lane is genuinely entered before the drift appears.
+  drifted) active_instance_json | jq -cM '.[0].labels["ratchet-generation"] = "7"' ;;
+  # A client that emits nothing and never terminates. Blocks on a reader-only
+  # FIFO, so it costs no CPU and writes nothing to stderr; the only stderr bytes
+  # the wrapper retains are its own timeout diagnostic. Killed by the real
+  # production bound, whose forwarded duration the timeout seam accelerates.
+  block)
+    [ -p "${state}/list-block.fifo" ] || mkfifo -m 600 "${state}/list-block.fifo"
+    exec cat -- "${state}/list-block.fifo"
+    ;;
   empty) : ;;
   nonzero-valid)
     active_instance_json
@@ -3026,6 +3379,24 @@ list)
     exit 53
   }
   printf 'fixture direct-list stderr\n' >&2
+  # Per-call counter, so a lane liveness re-proof can be scripted independently
+  # of the pre-use proof, and so the date shim can arm on list events.
+  list_calls=0
+  [ ! -f "${state}/list-calls" ] || list_calls="$(cat "${state}/list-calls")"
+  list_calls=$((list_calls + 1))
+  printf '%s\n' "${list_calls}" >"${state}/list-calls"
+  # Scripted liveness outcomes for the lane, applied only AFTER the given call
+  # ordinal so the pre-use liveness proof still succeeds and the lane is really
+  # entered. `empty-array` is a schema-valid POSITIVE proof of absence, which is
+  # the only condition that may be read as instance loss; every other form here
+  # is uncertainty and must never reach that class.
+  if [ -f "${state}/destroyed" ]; then
+    :
+  elif [ -n "${NSC_SHIM_LIVENESS_FORM_AFTER:-}" ] &&
+    [ "${list_calls}" -gt "${NSC_SHIM_LIVENESS_FORM_AFTER}" ]; then
+    emit_list_form "${NSC_SHIM_LIVENESS_FORM:?}"
+    exit "${NSC_SHIM_LIVENESS_STATUS:-0}"
+  fi
   if [ -f "${state}/destroyed" ]; then
     if [ "${NSC_SHIM_FAIL_STAGE:-}" = 'absence' ]; then
       emit_list_form array
@@ -3137,11 +3508,41 @@ ssh)
   esac
   case "${remote_command}" in
   hostname)
+    # The shim is a fresh process per call, so per-call scripting needs a
+    # counter file. It is also what the date shim arms against.
+    hostname_calls=0
+    [ ! -f "${state}/hostname-calls" ] || hostname_calls="$(cat "${state}/hostname-calls")"
+    hostname_calls=$((hostname_calls + 1))
+    printf '%s\n' "${hostname_calls}" >"${state}/hostname-calls"
     if [ "${NSC_SHIM_FAIL_STAGE:-}" = 'hostname' ]; then
       printf 'wronghostname00\n'
-    else
-      printf '%s\n' "${id}"
+      exit 0
     fi
+    # Byte-exactness corpus. Bytes are supplied as an escaped string and emitted
+    # with %b so a fixture can inject padding, extra lines, CR, tabs, internal
+    # whitespace or empty stdout exactly. Paired with a nonzero status this is
+    # what proves the lane keys on EXACT bytes and cannot be widened into "any
+    # failing call retries".
+    if [ -n "${NSC_SHIM_HOSTNAME_BYTES:-}" ]; then
+      printf '%b' "${NSC_SHIM_HOSTNAME_BYTES//@ID@/${id}}"
+      exit "${NSC_SHIM_HOSTNAME_STATUS:-137}"
+    fi
+    if [ "${NSC_SHIM_HOSTNAME_EMPTY:-0}" -eq 1 ]; then
+      exit "${NSC_SHIM_HOSTNAME_STATUS:-137}"
+    fi
+    # Model the exact generation-13 signature: correct hostname bytes on stdout,
+    # then a client that fails to terminate and is killed by the wrapper's hard
+    # timeout. The status the wrapper observes for a TERM/KILL is 124/137, so the
+    # fixture reports one of those rather than inventing a code. The shim never
+    # actually blocks here — real waiting scaled to the ratified 60s bound is
+    # forbidden, and the bound's real mechanism is proven separately by the
+    # extracted-function case below.
+    if [ "${hostname_calls}" -le "${NSC_SHIM_SSH_HANG_CALLS:-0}" ]; then
+      printf '%s\n' "${id}"
+      printf 'timeout: sending signal TERM to command \xe2\x80\x98nsc\xe2\x80\x99\n' >&2
+      exit "${NSC_SHIM_SSH_HANG_STATUS:-137}"
+    fi
+    printf '%s\n' "${id}"
     ;;
   *source.tgz*'| sha256sum -c')
     # Only the modeled portable spelling reaches the happy path. The GNU
@@ -3266,11 +3667,17 @@ NSL_NSC_SHIM
       NSC_SHIM_STATE="${nsl_state}" \
       NSC_SHIM_ID="${nsl_id}" \
       NSC_SHIM_REAL_GREP="${nsl_real_grep}" \
+      NSL_REAL_DATE="${nsl_real_date}" \
       FLEET_SIT_REPORT="${nsl_report}" \
       "$@" \
       bash "${nsl_fixture}/scripts/ci/fleet-sit-proof.sh" --full \
       >"${nsl_root}/cases/${name}/stdout.txt" \
       2>"${nsl_root}/cases/${name}/stderr.txt" || nsl_status=$?
+    # Retain the observed wrapper process status as an artifact, not just as a
+    # transient variable. The reserved lane terminals are distinguished from an
+    # ordinary refusal by status alone, so that number is evidence in its own
+    # right and must survive the case rather than only being asserted on.
+    printf '%s\n' "${nsl_status}" >"${nsl_root}/cases/${name}/wrapper.exit-status"
     if [ "${expected}" = 'pass' ]; then
       [ "${nsl_status}" -eq 0 ] ||
         fail "Namespace lifecycle ${name}: expected pass, got ${nsl_status}: $(tr '\n' ' ' <"${nsl_root}/cases/${name}/stderr.txt")"
@@ -3940,6 +4347,85 @@ NSL_SCHEMA_CASES
     echo "    ${name}: split remote command string failed closed at ${stage} ✓"
   }
 
+  # ---- SESSION-HANG lane assertions ------------------------------------
+  #
+  # Exit status alone is NEVER sufficient evidence here. The fake client already
+  # uses internal status 75 for an unmodeled lossy ssh serialization, the same
+  # number as NSC_SESSION_HANG_EXHAUSTED_STATUS. A production 75 is therefore
+  # authenticated by three independent things: the status, the failure stage,
+  # and the closed outcome in the receipt.
+  nsl_assert_terminal_signature() {
+    local name="$1" expected_status="$2" expected_stage="$3" expected_outcome="$4"
+    [ "${nsl_status}" -eq "${expected_status}" ] ||
+      fail "Namespace lifecycle ${name}: expected exit ${expected_status}, got ${nsl_status}: $(tr '\n' ' ' <"${nsl_root}/cases/${name}/stderr.txt")"
+    test -s "${nsl_report}/lifecycle/lifecycle.json" ||
+      fail "Namespace lifecycle ${name}: reserved terminal ${expected_status} retained no receipt"
+    jq -e --arg stage "${expected_stage}" --arg outcome "${expected_outcome}" \
+      --argjson status "${expected_status}" '
+      .failureStage == $stage and
+      .sessionHang.outcome == $outcome and
+      .sessionHang.terminalStatus == $status
+    ' "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+      fail "Namespace lifecycle ${name}: exit ${expected_status} was not authenticated by stage ${expected_stage} and outcome ${expected_outcome}: $(jq -c '{failureStage,sessionHang:{outcome:.sessionHang.outcome,terminalStatus:.sessionHang.terminalStatus}}' "${nsl_report}/lifecycle/lifecycle.json")"
+  }
+
+  nsl_assert_session_hang_receipt() {
+    local name="$1" outcome="$2" reinvocations="$3" exhausted="$4"
+    local report="${nsl_report}/lifecycle/lifecycle.json"
+    test -s "${report}" ||
+      fail "Namespace lifecycle ${name}: no lifecycle receipt"
+    jq -e --arg outcome "${outcome}" \
+      --argjson reinvocations "${reinvocations}" \
+      --argjson exhausted "${exhausted}" '
+        .schemaVersion == 2 and
+        .sessionHang.entered == true and
+        .sessionHang.outcome == $outcome and
+        .sessionHang.reinvocations == $reinvocations and
+        .sessionHang.maxReinvocations == 3 and
+        .sessionHang.perCallTimeoutSeconds == 60 and
+        .sessionHang.killAfterSeconds == 10 and
+        .sessionHang.laneBudgetSeconds == 300 and
+        .sessionHang.worstCaseLaneSeconds == 285 and
+        .sessionHang.livenessTimeoutSeconds == 20 and
+        .sessionHang.livenessKillAfterSeconds == 5 and
+        .sessionHang.exhausted == ($exhausted == 1) and
+        .sessionHang.consumesInstanceOrdinal == false
+      ' "${report}" >/dev/null ||
+      fail "Namespace lifecycle ${name}: SESSION-HANG receipt is wrong: $(jq -c '.sessionHang' "${report}")"
+  }
+
+  # Every recorded ssh row must be the bounded non-interactive form. The shim's
+  # own exit 60/68/69 guards refuse a missing --disable-pty or separator at call
+  # time; this asserts the RECORDED argv shape independently, so a lane that
+  # smuggled in a differently-shaped call is visible in the retained evidence.
+  nsl_assert_ssh_call_shape() {
+    local name="$1"
+    local row
+    while IFS= read -r row; do
+      case "${row}" in
+      $'ssh\t--disable-pty '*" -- "*) ;;
+      *) fail "Namespace lifecycle ${name}: an ssh call was not bounded non-interactive: ${row}" ;;
+      esac
+    done < <(grep '^ssh' "${nsl_state}/calls.log")
+  }
+
+  # A resolved lane and an exhausted lane each consume exactly one instance, so
+  # no lane outcome may mint or destroy a second one.
+  nsl_assert_single_instance_lifecycle() {
+    local name="$1"
+    local creates destroys
+    creates="$(grep -c '^create' "${nsl_state}/calls.log" || true)"
+    destroys="$(grep -c '^destroy' "${nsl_state}/calls.log" || true)"
+    [ "${creates}" -eq 1 ] ||
+      fail "Namespace lifecycle ${name}: expected exactly one create, found ${creates}"
+    [ "${destroys}" -eq 1 ] ||
+      fail "Namespace lifecycle ${name}: expected exactly one destroy, found ${destroys}"
+  }
+
+  nsl_count_ssh_calls() {
+    grep -c '^ssh' "${nsl_state}/calls.log" || true
+  }
+
   nsl_assert_busybox_checksum_refusal() {
     local name="$1"
     nsl_assert_closed_cleanup "${name}"
@@ -3994,8 +4480,8 @@ NSL_SCHEMA_CASES
   # shellcheck disable=SC1003,SC2016
   nsl_install_exact_line_mutant \
     separator-hostname \
-    '  nsc ssh --disable-pty "${instance_id}" -- hostname \' \
-    '  nsc ssh --disable-pty "${instance_id}" hostname \'
+    '    nsc ssh --disable-pty "${instance_id}" -- hostname \' \
+    '    nsc ssh --disable-pty "${instance_id}" hostname \'
   nsl_run mutation-ssh-separator-hostname fail
   nsl_assert_ssh_separator_refusal \
     mutation-ssh-separator-hostname hostname-preflight hostname.stderr
@@ -4004,8 +4490,8 @@ NSL_SCHEMA_CASES
   # shellcheck disable=SC1003,SC2016
   nsl_install_exact_line_mutant \
     separator-setup \
-    '  nsc ssh --disable-pty "${instance_id}" -- "${setup_command}" \' \
-    '  nsc ssh --disable-pty "${instance_id}" "${setup_command}" \'
+    '    nsc ssh --disable-pty "${instance_id}" -- "${setup_command}" \' \
+    '    nsc ssh --disable-pty "${instance_id}" "${setup_command}" \'
   nsl_run mutation-ssh-separator-setup fail
   nsl_assert_ssh_separator_refusal \
     mutation-ssh-separator-setup snapshot-setup setup.stderr
@@ -4024,8 +4510,8 @@ NSL_SCHEMA_CASES
   # shellcheck disable=SC1003,SC2016
   nsl_install_exact_line_mutant \
     separator-archive \
-    '  nsc ssh --disable-pty "${instance_id}" -- "${archive_command}" \' \
-    '  nsc ssh --disable-pty "${instance_id}" "${archive_command}" \'
+    '    nsc ssh --disable-pty "${instance_id}" -- "${archive_command}" \' \
+    '    nsc ssh --disable-pty "${instance_id}" "${archive_command}" \'
   nsl_run mutation-ssh-separator-archive fail
   nsl_assert_ssh_separator_refusal \
     mutation-ssh-separator-archive remote-report-collection remote-report-archive.stderr
@@ -4043,8 +4529,8 @@ NSL_SCHEMA_CASES
   # shellcheck disable=SC1003,SC2016
   nsl_install_exact_line_mutant \
     packing-setup \
-    '  nsc ssh --disable-pty "${instance_id}" -- "${setup_command}" \' \
-    '  nsc ssh --disable-pty "${instance_id}" -- sh -eu -c "${setup_command}" \'
+    '    nsc ssh --disable-pty "${instance_id}" -- "${setup_command}" \' \
+    '    nsc ssh --disable-pty "${instance_id}" -- sh -eu -c "${setup_command}" \'
   nsl_run mutation-ssh-packing-setup fail
   nsl_assert_ssh_packing_refusal \
     mutation-ssh-packing-setup snapshot-setup setup.stderr
@@ -4053,8 +4539,8 @@ NSL_SCHEMA_CASES
   # shellcheck disable=SC1003,SC2016
   nsl_install_exact_line_mutant \
     packing-archive \
-    '  nsc ssh --disable-pty "${instance_id}" -- "${archive_command}" \' \
-    '  nsc ssh --disable-pty "${instance_id}" -- sh -eu -c "${archive_command}" \'
+    '    nsc ssh --disable-pty "${instance_id}" -- "${archive_command}" \' \
+    '    nsc ssh --disable-pty "${instance_id}" -- sh -eu -c "${archive_command}" \'
   nsl_run mutation-ssh-packing-archive fail
   nsl_assert_ssh_packing_refusal \
     mutation-ssh-packing-archive remote-report-collection remote-report-archive.stderr
@@ -4469,6 +4955,789 @@ NSL_ROW_SCHEMA_MUTANTS
     FLEET_SIT_NSC_CREATE_RECEIPT="${nsl_precreated_receipt}"
   ! grep -q '^destroy' "${nsl_state}/calls.log" 2>/dev/null ||
     fail 'malformed instance id produced a destructive selector'
+
+  # =====================================================================
+  # SESSION-HANG lane behavioural matrix.
+  #
+  # The generation-13 live signature was: correct hostname bytes on stdout, then
+  # an nsc ssh client that never terminated. Exact stdout proves the instance is
+  # ready and reachable, so that event is NOT an instance-readiness failure, not
+  # a Fleet defect, not a subject result, and never consumes an instance
+  # ordinal. It enters a separately bounded same-instance lane.
+  #
+  # Every case below runs the REAL production wrapper bytes from the committed
+  # fixture through nsl_run. The fixture is at baseline here; each mutation case
+  # restores it afterwards.
+  #
+  # HERMETIC LAW. Nothing here sleeps for a duration derived from the ratified
+  # budgets, and no full-wrapper case overrides a production pin — every timing
+  # pin the lane depends on is hard-asserted by the wrapper's own
+  # validate_session_hang_bounds, so an overridden pin would be refused before
+  # any client call and the case would go red for the wrong reason. (A detached
+  # structural COPY of the pins is deliberately mutated further down, purely to
+  # prove the arithmetic gate refuses a set that cannot fit its own budget; no
+  # wrapper is ever run against it.) Time is driven three ways instead:
+  #   - the 60s per-call and 300s lane bounds, by a scripted epoch shim armed on
+  #     observed hostname/list call counters;
+  #   - the ssh timeout MECHANISM, by extracting run_hostname_attempt from the
+  #     shipped bytes and driving it at an accelerated bound in isolation;
+  #   - the list timeout, by a `timeout` seam that rewrites only the duration
+  #     forwarded to the real timeout, and only for the exact production list
+  #     argv, leaving pins, wrapper source and validated argv untouched.
+  # Every such case asserts its own elapsed time, so a bound that silently
+  # stopped firing would be caught rather than waited out.
+  # =====================================================================
+
+  # NOTE ON PIN OVERRIDES. There are deliberately none. Every timing pin the
+  # lane depends on — 60, 10, 300, 20, 5 — is hard-asserted by the wrapper's own
+  # validate_session_hang_bounds, so a mutated pin is refused before any client
+  # call is made. A case built on an overridden pin would go red for that reason
+  # rather than for the behaviour under test, which is worthless evidence. The
+  # ratified values are therefore left untouched everywhere, and the two cases
+  # that must prove a bound really fires do so on extracted production functions
+  # at an accelerated bound instead.
+
+  # ---- T1: resolved on the first re-invocation -------------------------
+  nsl_run session-hang-resolved-first-retry pass NSC_SHIM_SSH_HANG_CALLS=1
+  nsl_assert_session_hang_receipt session-hang-resolved-first-retry resolved 1 0
+  nsl_assert_ssh_call_shape session-hang-resolved-first-retry
+  nsl_assert_single_instance_lifecycle session-hang-resolved-first-retry
+  jq -e '
+    .status == "pass" and .failureStage == "complete" and
+    .sessionHang.exhausted == false and
+    .sessionHang.classification == null and
+    .sessionHang.instanceLossProven == false and
+    .sessionHang.livenessUnproven == false and
+    .sessionHang.livenessProofs >= 1
+  ' "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+    fail 'session-hang-resolved-first-retry: a resolved lane did not leave the proof passing and unclassified'
+  # Four staged calls plus exactly one re-invocation. This is also what proves
+  # the clean path is unchanged: the success case below still makes exactly 4.
+  nsl_resolved_ssh="$(nsl_count_ssh_calls)"
+  [ "${nsl_resolved_ssh}" -eq 5 ] ||
+    fail "session-hang-resolved-first-retry: expected 5 ssh calls, found ${nsl_resolved_ssh}"
+  echo '    session-hang-resolved-first-retry: exact bytes plus a hung client resolved on re-invocation 1, proof still passes ✓'
+
+  # ---- T2: resolved on the THIRD re-invocation (bound is inclusive) ----
+  nsl_run session-hang-resolved-third-retry pass NSC_SHIM_SSH_HANG_CALLS=3
+  nsl_assert_session_hang_receipt session-hang-resolved-third-retry resolved 3 0
+  nsl_assert_single_instance_lifecycle session-hang-resolved-third-retry
+  nsl_third_ssh="$(nsl_count_ssh_calls)"
+  [ "${nsl_third_ssh}" -eq 7 ] ||
+    fail "session-hang-resolved-third-retry: expected 7 ssh calls, found ${nsl_third_ssh}"
+  echo '    session-hang-resolved-third-retry: the third re-invocation is admitted, so the bound is inclusive and not off by one ✓'
+
+  # ---- T3: three-call exhaustion, exit 75, exact classification --------
+  nsl_run session-hang-exhausted fail NSC_SHIM_SSH_HANG_CALLS=9
+  nsl_assert_terminal_signature \
+    session-hang-exhausted 75 session-hang-exhausted exhausted-calls
+  nsl_assert_session_hang_receipt session-hang-exhausted exhausted-calls 3 1
+  nsl_assert_exact_destroy session-hang-exhausted
+  nsl_assert_ssh_call_shape session-hang-exhausted
+  nsl_assert_single_instance_lifecycle session-hang-exhausted
+  # The whole classification object, compared as one value rather than grepped,
+  # so a partially-correct or widened verdict cannot pass.
+  nsl_expected_classification='{"verdict":"SESSION-HANG-EXHAUSTED","instanceReadinessResult":false,"fleetDefect":false,"proofFailure":false,"subjectResult":false,"consumesInstanceOrdinal":false}'
+  nsl_observed_classification="$(jq -cS '.sessionHang.classification' \
+    "${nsl_report}/lifecycle/lifecycle.json")"
+  [ "${nsl_observed_classification}" = "$(printf '%s' "${nsl_expected_classification}" | jq -cS '.')" ] ||
+    fail "session-hang-exhausted: classification object is not the exact ratified verdict: ${nsl_observed_classification}"
+  # Cleanup facts must be CURRENT, not a pre-cleanup snapshot. The reserved
+  # terminals defer their only receipt to the EXIT cleanup for exactly this.
+  jq -e '
+    .status == "fail" and
+    .cleanup.destroySucceeded == true and
+    .cleanup.exactIdAbsenceProven == true and
+    .sessionHang.reinvocations == 3
+  ' "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+    fail 'session-hang-exhausted: the deferred receipt did not carry current cleanup facts'
+  # Retain the terminal artifacts rather than only asserting on them.
+  cp "${nsl_report}/lifecycle/lifecycle.json" "${nsl_root}/T3-exhausted-lifecycle.json"
+  printf '%s\n' "${nsl_status}" >"${nsl_root}/T3-exhausted.exit-status"
+  echo '    session-hang-exhausted: three re-invocations then exit 75 with the exact SESSION-HANG-EXHAUSTED verdict and current cleanup facts ✓'
+
+  # ---- Reserved terminal survives a cleanup FAILURE --------------------
+  # The reserved terminals defer their only receipt to the EXIT cleanup so that
+  # cleanup booleans are final facts. This is the case that proves the deferral
+  # actually buys something: the instance is still listed after destroy, so
+  # absence can never be proven, the EXIT trap RETRIES, and the receipt records
+  # what really happened — without the failure rewriting the terminal class.
+  # A cleanup failure must not turn 75 into 1, or the external driver would read
+  # an ordinary refusal where a closed session lane occurred.
+  nsl_run session-hang-exhausted-cleanup-fails fail \
+    NSC_SHIM_SSH_HANG_CALLS=9 \
+    NSC_SHIM_FAIL_STAGE=absence
+  nsl_assert_terminal_signature \
+    session-hang-exhausted-cleanup-fails 75 session-hang-exhausted exhausted-calls
+  nsl_assert_session_hang_receipt \
+    session-hang-exhausted-cleanup-fails exhausted-calls 3 1
+  jq -e '
+    .status == "fail" and
+    .cleanup.destroyAttempts == 2 and
+    .cleanup.destroySucceeded == true and
+    .cleanup.exactIdAbsenceProven == false
+  ' "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+    fail "session-hang-exhausted-cleanup-fails: the retried cleanup facts were not recorded: $(jq -c '.cleanup' "${nsl_report}/lifecycle/lifecycle.json")"
+  cp "${nsl_report}/lifecycle/lifecycle.json" \
+    "${nsl_root}/T3b-cleanup-failure-preserves-75-lifecycle.json"
+  printf '%s\n' "${nsl_status}" >"${nsl_root}/T3b-cleanup-failure-preserves-75.exit-status"
+  echo '    session-hang-exhausted-cleanup-fails: EXIT cleanup retried, recorded unproven absence, and still exited 75 rather than an ordinary refusal ✓'
+
+  # The contrast that makes the above meaningful: the SAME cleanup failure on an
+  # ORDINARY (non-reserved) refusal must still collapse to status 1, so the
+  # preservation above is specific to the reserved lane terminals.
+  nsl_run ordinary-cleanup-failure-stays-1 fail NSC_SHIM_FAIL_STAGE=absence
+  [ "${nsl_status}" -eq 1 ] ||
+    fail "ordinary-cleanup-failure-stays-1: an ordinary cleanup failure reported ${nsl_status}, not 1"
+  jq -e '
+    .sessionHang.entered == false and
+    .sessionHang.terminalStatus == null and
+    .cleanup.exactIdAbsenceProven == false
+  ' "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+    fail 'ordinary-cleanup-failure-stays-1: an ordinary cleanup failure claimed a reserved terminal'
+  echo '    ordinary-cleanup-failure-stays-1: the same cleanup failure outside the lane still exits 1, so reserved-status preservation is lane-specific ✓'
+
+  # ---- T10: separate stdout/stderr/status custody for every attempt ----
+  # Asserted on T3, which is the only case exercising all four attempts. Bound to
+  # that case's EXPLICIT report path rather than to ${nsl_report}, which every
+  # later nsl_run silently repoints — a custody claim must not depend on which
+  # case happened to run last.
+  nsl_custody_report="${nsl_root}/cases/session-hang-exhausted/report"
+  for nsl_attempt in readiness-1 session-hang-1 session-hang-2 session-hang-3; do
+    for nsl_stream in txt stderr exit-status; do
+      test -f "${nsl_custody_report}/lifecycle/hostname-attempt-${nsl_attempt}.${nsl_stream}" ||
+        fail "session-hang-exhausted: attempt ${nsl_attempt} lost its ${nsl_stream} custody"
+    done
+    # stdout must never be merged into stderr: the exact bytes are what proves
+    # reachability, and the timeout diagnostic is what distinguishes the two
+    # exhaustion signatures. Merging them would destroy both claims.
+    grep -qxF "${nsl_id}" "${nsl_custody_report}/lifecycle/hostname-attempt-${nsl_attempt}.txt" ||
+      fail "session-hang-exhausted: attempt ${nsl_attempt} did not retain the exact hostname bytes"
+    grep -qF 'timeout: sending signal TERM' \
+      "${nsl_custody_report}/lifecycle/hostname-attempt-${nsl_attempt}.stderr" ||
+      fail "session-hang-exhausted: attempt ${nsl_attempt} lost its separate timeout diagnostic"
+    grep -qxF '137' "${nsl_custody_report}/lifecycle/hostname-attempt-${nsl_attempt}.exit-status" ||
+      fail "session-hang-exhausted: attempt ${nsl_attempt} did not retain its own observed status"
+    # No two attempts may share a file: separate custody means separate bytes.
+    test ! "${nsl_custody_report}/lifecycle/hostname-attempt-${nsl_attempt}.txt" \
+      -ef "${nsl_custody_report}/lifecycle/hostname-attempt-${nsl_attempt}.stderr" ||
+      fail "session-hang-exhausted: attempt ${nsl_attempt} merged its stdout and stderr into one file"
+  done
+  # stderr NEVER authorizes success: every attempt above carried a non-empty
+  # stderr and none of them was accepted.
+  echo '    session-hang-custody: initial and all three re-invocations kept separate stdout, stderr and status, and stderr never authorized acceptance ✓'
+
+  # ---- T4: independently proven instance loss, exit 76 -----------------
+  # The lane liveness proof observes a schema-valid EMPTY reviewed array, which
+  # is a positive absence proof. This is the only outcome the external driver may
+  # read as consuming an instance ordinal, and it must never report 75.
+  nsl_run session-hang-instance-lost fail \
+    NSC_SHIM_SSH_HANG_CALLS=9 \
+    NSC_SHIM_LIVENESS_FORM_AFTER=1 \
+    NSC_SHIM_LIVENESS_FORM=empty-array
+  nsl_assert_terminal_signature \
+    session-hang-instance-lost 76 session-hang-instance-lost instance-lost
+  jq -e '
+    .sessionHang.instanceLossProven == true and
+    .sessionHang.livenessUnproven == false and
+    .sessionHang.exhausted == false and
+    .sessionHang.reinvocations < 3 and
+    .sessionHang.livenessProofs >= 1 and
+    .sessionHang.consumesInstanceOrdinal == false
+  ' "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+    fail 'session-hang-instance-lost: proven loss was not reported as its own terminal class'
+  cp "${nsl_report}/lifecycle/lifecycle.json" "${nsl_root}/T4-instance-lost-lifecycle.json"
+  printf '%s\n' "${nsl_status}" >"${nsl_root}/T4-instance-lost.exit-status"
+  echo '    session-hang-instance-lost: a positive absence proof closes the lane as exit 76, never 75 or 77 ✓'
+
+  # ---- T4a/T4b/T4c: liveness UNPROVEN, exit 77, never instance loss ----
+  # Three distinct uncertainties. None of them is absence, so none of them may
+  # manufacture an ordinal-consuming loss claim.
+  nsl_assert_liveness_unproven() {
+    local name="$1"
+    nsl_assert_terminal_signature \
+      "${name}" 77 session-hang-liveness-unproven liveness-unproven
+    jq -e '
+      .sessionHang.instanceLossProven == false and
+      .sessionHang.livenessUnproven == true and
+      .sessionHang.exhausted == false and
+      .sessionHang.consumesInstanceOrdinal == false
+    ' "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+      fail "${name}: uncertain liveness was not held apart from proven instance loss"
+    nsl_assert_exact_destroy "${name}"
+  }
+
+  nsl_run liveness-unproven-list-nonzero fail \
+    NSC_SHIM_SSH_HANG_CALLS=9 \
+    NSC_SHIM_LIVENESS_FORM_AFTER=1 \
+    NSC_SHIM_LIVENESS_FORM=array \
+    NSC_SHIM_LIVENESS_STATUS=29
+  nsl_assert_liveness_unproven liveness-unproven-list-nonzero
+  cp "${nsl_report}/lifecycle/lifecycle.json" "${nsl_root}/T4a-liveness-unproven-lifecycle.json"
+  printf '%s\n' "${nsl_status}" >"${nsl_root}/T4a-liveness-unproven.exit-status"
+  echo '    liveness-unproven-list-nonzero: a nonzero list command can never become a proven loss ✓'
+
+  nsl_run liveness-unproven-list-malformed fail \
+    NSC_SHIM_SSH_HANG_CALLS=9 \
+    NSC_SHIM_LIVENESS_FORM_AFTER=1 \
+    NSC_SHIM_LIVENESS_FORM=malformed
+  nsl_assert_liveness_unproven liveness-unproven-list-malformed
+  echo '    liveness-unproven-list-malformed: an unparseable listing is uncertainty, not absence ✓'
+
+  nsl_run liveness-unproven-row-drifted fail \
+    NSC_SHIM_SSH_HANG_CALLS=9 \
+    NSC_SHIM_LIVENESS_FORM_AFTER=1 \
+    NSC_SHIM_LIVENESS_FORM=drifted
+  nsl_assert_liveness_unproven liveness-unproven-row-drifted
+  echo '    liveness-unproven-row-drifted: the exact id present but disagreeing is disagreement, never absence ✓'
+
+  # ---- T4d: the liveness call is itself really bounded -----------------
+  # The production wrapper hard-pins NSC_LIST_TIMEOUT_SECONDS to 20 and its TERM
+  # grace to 5 in validate_session_hang_bounds, so those values CANNOT be shrunk
+  # for a full-wrapper run: a mutated pin is refused before any client call, and
+  # a case built that way would go red for the wrong reason entirely. Waiting the
+  # real 20s out is equally forbidden.
+  #
+  # So the two claims are proven separately and honestly:
+  #   (a) the MECHANISM — nsc_list_json is extracted from the shipped wrapper and
+  #       driven in isolation at a 1s bound against a client that genuinely never
+  #       terminates, so the elapsed time does not scale with the ratified 20s;
+  #   (b) the CLASSIFICATION — the full-wrapper cases above already prove that a
+  #       list which fails to produce a usable answer reaches liveness-unproven
+  #       and exit 77, never a proven loss.
+  # A bounded-out list arrives at (b) through exactly the same nonzero-status
+  # branch that (a) produces, which is what joins the two halves.
+  nsl_list_fn="${tmp}/nsc-list-json.sh"
+  sed -n '/^nsc_list_json() {$/,/^}$/p' "${proof_source}" >"${nsl_list_fn}"
+  test -s "${nsl_list_fn}" ||
+    fail 'could not extract nsc_list_json() for the bounded-liveness proof'
+  [ "$(tail -n 1 "${nsl_list_fn}")" = '}' ] ||
+    fail 'the extracted nsc_list_json() is unterminated'
+  mkdir -p "${nsl_root}/listbound/bin" "${nsl_root}/listbound/state"
+  cat >"${nsl_root}/listbound/bin/nsc" <<'NSL_BLOCKING_LIST'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+block="${NSC_SHIM_STATE:?}/list-block.fifo"
+mkdir -p "${NSC_SHIM_STATE}"
+[ -p "${block}" ] || mkfifo -m 600 "${block}"
+exec cat -- "${block}"
+NSL_BLOCKING_LIST
+  chmod +x "${nsl_root}/listbound/bin/nsc"
+  cat >"${nsl_root}/listbound/drive.sh" <<'NSL_LIST_DRIVER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+fn_file="$1"
+out="$2"
+# shellcheck source=/dev/null
+source "${fn_file}"
+status=0
+nsc_list_json "${out}" >/dev/null 2>"${out}.driver-stderr" || status=$?
+printf '%s\n' "${status}"
+NSL_LIST_DRIVER
+  nsl_listbound_started="$(date +%s)"
+  nsl_listbound_status="$(
+    env PATH="${nsl_root}/listbound/bin:${PATH}" \
+      NSC_SHIM_STATE="${nsl_root}/listbound/state" \
+      instance_id="${nsl_id}" \
+      NSC_LIST_TIMEOUT_SECONDS=1 \
+      NSC_LIST_KILL_AFTER_SECONDS=1 \
+      bash "${nsl_root}/listbound/drive.sh" "${nsl_list_fn}" \
+      "${nsl_root}/listbound/listing.json"
+  )"
+  nsl_listbound_elapsed=$(($(date +%s) - nsl_listbound_started))
+  [ "${nsl_listbound_status}" -ne 0 ] ||
+    fail 'liveness-bounded-out: a never-terminating list client was accepted as a valid listing'
+  [ "${nsl_listbound_elapsed}" -lt 15 ] ||
+    fail "liveness-bounded-out: the list bound did not fire, ${nsl_listbound_elapsed}s elapsed"
+  # The bounded-out listing must NOT be published as validated evidence: a
+  # timeout is uncertainty, and an absence claim can never be read from it.
+  test ! -s "${nsl_root}/listbound/listing.json" ||
+    fail 'liveness-bounded-out: a bounded-out list published a validated listing'
+  grep -qF 'nsc list exited' "${nsl_root}/listbound/listing.json.driver-stderr" ||
+    fail 'liveness-bounded-out: the bounded-out list did not refuse on the authoritative command status'
+  echo "    liveness-bounded-out-mechanism: production bytes killed a never-terminating list client in ${nsl_listbound_elapsed}s and refused it on command status, publishing no listing ✓"
+
+  # ...and the CLASSIFICATION half, through the whole wrapper. The blocking list
+  # client is driven by the real production list path; only the duration the
+  # real timeout actually receives is accelerated, by the seam above. Pins,
+  # wrapper source and validated argv are untouched, so this is the genuine
+  # bounded-out list reaching its terminal class.
+  nsl_wrapper_block_started="$(date +%s)"
+  nsl_run liveness-bounded-out-classification fail \
+    NSC_SHIM_SSH_HANG_CALLS=9 \
+    NSC_SHIM_LIVENESS_FORM_AFTER=1 \
+    NSC_SHIM_LIVENESS_FORM=block \
+    NSC_SHIM_ACCELERATE_LIST_TIMEOUT=1
+  nsl_wrapper_block_elapsed=$(($(date +%s) - nsl_wrapper_block_started))
+  nsl_assert_liveness_unproven liveness-bounded-out-classification
+  [ "${nsl_wrapper_block_elapsed}" -lt 20 ] ||
+    fail "liveness-bounded-out-classification: took ${nsl_wrapper_block_elapsed}s, so the accelerated bound did not fire"
+  # The bounded-out liveness proof must retain its own killed status and the
+  # timeout diagnostic, as evidence rather than prose.
+  nsl_block_listing="${nsl_report}/lifecycle/session-hang-liveness-1.json"
+  # Exactly 124, not 124-or-137. This case is fully deterministic: GNU timeout
+  # sends TERM, and a blocking `cat` dies on TERM immediately, so the KILL grace
+  # is never reached. Accepting 137 here would weaken the observed witness to
+  # "something signalled it". 137 is admitted only where the modelled real nsc
+  # signature explicitly produces it.
+  nsl_block_status="$(cat "${nsl_block_listing}.exit-status" 2>/dev/null || echo missing)"
+  [ "${nsl_block_status}" = '124' ] ||
+    fail "liveness-bounded-out-classification: the killed list retained status ${nsl_block_status}, not the exact TERM-kill status 124"
+  grep -qF 'timeout: sending signal TERM' "${nsl_block_listing}.stderr" ||
+    fail 'liveness-bounded-out-classification: the bounded-out list lost its timeout diagnostic'
+  test ! -s "${nsl_block_listing}" ||
+    fail 'liveness-bounded-out-classification: a bounded-out list was published as a validated listing'
+  cp "${nsl_report}/lifecycle/lifecycle.json" "${nsl_root}/T4d-bounded-out-lifecycle.json"
+  printf '%s\n' "${nsl_status}" >"${nsl_root}/T4d-bounded-out.exit-status"
+  echo "    liveness-bounded-out-classification: a real bounded-out list reaches exit 77 with retained status ${nsl_block_status} and its timeout diagnostic, never an absence claim ✓"
+
+  # ---- T6b: the ssh bound really fires, on production bytes ------------
+  # The lane's 60s per-call bound cannot be waited out, and cannot be shrunk
+  # because validate_session_hang_bounds hard-asserts 60. So run_hostname_attempt
+  # is EXTRACTED from the shipped wrapper and driven in isolation at a 1s bound
+  # against a client that genuinely never terminates — the same extract-and-drive
+  # pattern this validator already uses for the tool-receipt helpers. This proves
+  # the mechanism; the pin above proves the ratified value.
+  nsl_attempt_fn="${tmp}/run-hostname-attempt.sh"
+  sed -n '/^run_hostname_attempt() {$/,/^}$/p' "${proof_source}" >"${nsl_attempt_fn}"
+  test -s "${nsl_attempt_fn}" ||
+    fail 'could not extract run_hostname_attempt() for the bounded-call proof'
+  [ "$(tail -n 1 "${nsl_attempt_fn}")" = '}' ] ||
+    fail 'the extracted run_hostname_attempt() is unterminated'
+  mkdir -p "${nsl_root}/bound/bin" "${nsl_root}/bound/lifecycle" "${nsl_root}/bound/state"
+  cat >"${nsl_root}/bound/bin/nsc" <<'NSL_BLOCKING_NSC'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+# The exact generation-13 signature: correct hostname bytes, then a client that
+# never terminates. Blocks on a reader-only FIFO, so it costs no CPU and emits
+# nothing on stderr; the only stderr bytes are the wrapper's own diagnostic.
+printf '%s\n' "${NSC_SHIM_ID:?}"
+block="${NSC_SHIM_STATE:?}/ssh-block.fifo"
+mkdir -p "${NSC_SHIM_STATE}"
+[ -p "${block}" ] || mkfifo -m 600 "${block}"
+exec cat -- "${block}"
+NSL_BLOCKING_NSC
+  chmod +x "${nsl_root}/bound/bin/nsc"
+  cat >"${nsl_root}/bound/drive.sh" <<'NSL_BOUND_DRIVER'
+#!/usr/bin/env bash
+set -Eeuo pipefail
+fn_file="$1"
+# shellcheck source=/dev/null
+source "${fn_file}"
+status=0
+run_hostname_attempt bounded-probe || status=$?
+printf '%s\n' "${status}"
+NSL_BOUND_DRIVER
+  nsl_bound_started="$(date +%s)"
+  nsl_bound_status="$(
+    env PATH="${nsl_root}/bound/bin:${PATH}" \
+      NSC_SHIM_ID="${nsl_id}" \
+      NSC_SHIM_STATE="${nsl_root}/bound/state" \
+      instance_id="${nsl_id}" \
+      lifecycle_dir="${nsl_root}/bound/lifecycle" \
+      NSC_SESSION_HANG_PER_CALL_TIMEOUT_SECONDS=1 \
+      NSC_SESSION_HANG_KILL_AFTER_SECONDS=1 \
+      bash "${nsl_root}/bound/drive.sh" "${nsl_attempt_fn}"
+  )"
+  nsl_bound_elapsed=$(($(date +%s) - nsl_bound_started))
+  case "${nsl_bound_status}" in
+  124 | 137) ;;
+  *) fail "hostname-attempt-really-bounded: a never-terminating client returned ${nsl_bound_status}, not a terminal-signal status" ;;
+  esac
+  [ "${nsl_bound_elapsed}" -lt 15 ] ||
+    fail "hostname-attempt-really-bounded: the bound did not fire, ${nsl_bound_elapsed}s elapsed"
+  # The exact bytes survive the kill: that is the whole semantic split.
+  grep -qxF "${nsl_id}" "${nsl_root}/bound/lifecycle/hostname-attempt-bounded-probe.txt" ||
+    fail 'hostname-attempt-really-bounded: the exact hostname bytes were lost when the client was killed'
+  grep -qxF "${nsl_bound_status}" "${nsl_root}/bound/lifecycle/hostname-attempt-bounded-probe.exit-status" ||
+    fail 'hostname-attempt-really-bounded: the observed status was not retained as an artifact'
+  test -s "${nsl_root}/bound/lifecycle/hostname-attempt-bounded-probe.stderr" ||
+    fail 'hostname-attempt-really-bounded: the timeout diagnostic was not retained on its own stderr'
+  echo "    hostname-attempt-really-bounded: production bytes killed a never-terminating client in ${nsl_bound_elapsed}s, keeping exact stdout, separate stderr and status ${nsl_bound_status} ✓"
+
+  # ---- T5a: an iteration never STARTS without budget for both calls ----
+  # The clock jumps once the lane's first re-invocation has happened, leaving
+  # less than liveness_allowance + call_allowance (95s). A bare `now >= deadline`
+  # test would still admit the next iteration and overrun the ratified lane.
+  nsl_run budget-refuses-late-start fail \
+    NSC_SHIM_SSH_HANG_CALLS=9 \
+    NSL_DATE_OFFSETS=h2:215
+  nsl_assert_terminal_signature \
+    budget-refuses-late-start 75 session-hang-exhausted exhausted-budget
+  nsl_assert_session_hang_receipt budget-refuses-late-start exhausted-budget 1 1
+  jq -e '.sessionHang.livenessProofs == .sessionHang.reinvocations' \
+    "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+    fail 'budget-refuses-late-start: the refused iteration still paid for a liveness proof, so the check did not precede it'
+  # Exactly two ssh calls: the readiness call, plus the ONE lane re-invocation
+  # that had budget. Iteration 2 is refused before its liveness proof and before
+  # its ssh call, and a lane that closes terminally never reaches snapshot-setup,
+  # inner-run or report-archive — so two is the whole ssh population, and any
+  # third call would mean an iteration started without sufficient budget.
+  nsl_late_ssh="$(nsl_count_ssh_calls)"
+  [ "${nsl_late_ssh}" -eq 2 ] ||
+    fail "budget-refuses-late-start: expected 2 ssh calls (readiness plus one funded re-invocation), found ${nsl_late_ssh}"
+  echo '    budget-refuses-late-start: an iteration is admitted only when the remaining budget covers BOTH bounded calls ✓'
+
+  # ---- T5b: the deadline is re-read AFTER the liveness proof -----------
+  # The pre-liveness check passes, the liveness proof itself consumes the
+  # budget, and the ssh call it exists to authorize is then correctly refused.
+  # livenessProofs is exactly one GREATER than reinvocations — the only
+  # observable that distinguishes "the second check exists" from "it does not".
+  nsl_run budget-refuses-after-liveness fail \
+    NSC_SHIM_SSH_HANG_CALLS=9 \
+    NSL_DATE_OFFSETS=l3:260
+  nsl_assert_terminal_signature \
+    budget-refuses-after-liveness 75 session-hang-exhausted exhausted-budget
+  jq -e '
+    .sessionHang.outcome == "exhausted-budget" and
+    .sessionHang.reinvocations < 3 and
+    .sessionHang.livenessProofs == (.sessionHang.reinvocations + 1)
+  ' "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+    fail "budget-refuses-after-liveness: the post-liveness re-read did not refuse the call: $(jq -c '.sessionHang|{outcome,reinvocations,livenessProofs}' "${nsl_report}/lifecycle/lifecycle.json")"
+  echo '    budget-refuses-after-liveness: the deadline is re-read after the liveness proof, so the last iteration cannot overrun ✓'
+
+  # ---- T13/T15: byte-exact acceptance and refusal ----------------------
+  # MEASURED, not assumed: the new byte-exact predicate and the removed loose
+  # `tr -d '[:space:]'` form agree on `<id>x`, `<id>\nother\n` and empty stdout,
+  # so those three prove nothing about byte-exactness on their own. The six
+  # fixtures marked discriminating below are the ones that actually separate the
+  # two predicates, and they are what makes the loose-form mutant go red.
+  nsl_assert_no_lane_entry() {
+    local name="$1"
+    jq -e '
+      .sessionHang.entered == false and
+      .sessionHang.outcome == "not-entered" and
+      .sessionHang.reinvocations == 0
+    ' "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+      fail "${name}: non-exact hostname bytes entered the SESSION-HANG lane"
+    grep -qF 'Namespace hostname does not equal the exact instance id' \
+      "${nsl_root}/cases/${name}/stderr.txt" ||
+      fail "${name}: non-exact bytes did not keep the ordinary readiness refusal"
+    [ "${nsl_status}" -eq 1 ] ||
+      fail "${name}: an ordinary readiness refusal reported ${nsl_status} instead of 1"
+  }
+
+  # Discriminating fixtures: refused by the byte-exact predicate, ACCEPTED by
+  # the loose one. These are the load-bearing rows.
+  for nsl_bytes_case in \
+    'trailing-space:@ID@ ' \
+    'leading-space: @ID@' \
+    'extra-line:@ID@\n\n' \
+    'carriage-return:@ID@\r\n' \
+    'tab-padded:\t@ID@\n' \
+    'internal-space:abcdefg hijklm'; do
+    nsl_bytes_name="${nsl_bytes_case%%:*}"
+    nsl_bytes_value="${nsl_bytes_case#*:}"
+    nsl_run "hostname-bytes-${nsl_bytes_name}" fail \
+      "NSC_SHIM_HOSTNAME_BYTES=${nsl_bytes_value}"
+    nsl_assert_no_lane_entry "hostname-bytes-${nsl_bytes_name}"
+  done
+  # Non-discriminating but still required: both predicates refuse these, so they
+  # guard the refusal itself rather than the byte-exactness.
+  for nsl_bytes_case in \
+    'second-line:@ID@\nother\n' \
+    'suffixed:@ID@x'; do
+    nsl_bytes_name="${nsl_bytes_case%%:*}"
+    nsl_bytes_value="${nsl_bytes_case#*:}"
+    nsl_run "hostname-bytes-${nsl_bytes_name}" fail \
+      "NSC_SHIM_HOSTNAME_BYTES=${nsl_bytes_value}"
+    nsl_assert_no_lane_entry "hostname-bytes-${nsl_bytes_name}"
+  done
+  nsl_run hostname-bytes-empty fail NSC_SHIM_HOSTNAME_EMPTY=1
+  nsl_assert_no_lane_entry hostname-bytes-empty
+  echo '    hostname-bytes-adversarial: padded, internal-whitespace, extra-line, CR, tab, wrong and empty stdout all stay ordinary readiness refusals and never enter the lane ✓'
+
+  # T15 — both ratified exact forms DO enter the lane, paired with a nonzero
+  # status. `<id>\n` is the retained generation-13 witness; bare `<id>` is the
+  # other form the reviewed driver predicate accepts.
+  nsl_run hostname-bytes-exact-newline fail \
+    'NSC_SHIM_HOSTNAME_BYTES=@ID@\n' NSC_SHIM_SSH_HANG_CALLS=9
+  jq -e '.sessionHang.entered == true' \
+    "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+    fail 'hostname-bytes-exact-newline: the retained witness form did not enter the lane'
+  nsl_run hostname-bytes-exact-bare fail \
+    'NSC_SHIM_HOSTNAME_BYTES=@ID@' NSC_SHIM_SSH_HANG_CALLS=9
+  jq -e '.sessionHang.entered == true' \
+    "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+    fail 'hostname-bytes-exact-bare: the bare exact form did not enter the lane'
+  echo '    hostname-bytes-both-exact-forms: exactly the two ratified byte sequences enter the lane ✓'
+
+  # ---- T12: schema v2 and the ordinal denial, in EVERY lane outcome ----
+  for nsl_v2_case in \
+    session-hang-resolved-first-retry session-hang-exhausted \
+    session-hang-instance-lost liveness-unproven-list-nonzero; do
+    jq -e '
+      .schemaVersion == 2 and
+      .sessionHang.consumesInstanceOrdinal == false and
+      (.sessionHangLaw | contains("never consumes an instance ordinal"))
+    ' "${nsl_root}/cases/${nsl_v2_case}/report/lifecycle/lifecycle.json" >/dev/null ||
+      fail "${nsl_v2_case}: schema v2 or the instance-ordinal denial is missing"
+  done
+  echo '    session-hang-schema-v2: every lane outcome, including resolved, denies instance-ordinal consumption under schema 2 ✓'
+
+  # =====================================================================
+  # Mutation cases. Each must go RED, and for the RIGHT reason: the installers
+  # already refuse a no-op diff and enforce an exact numstat, and each assertion
+  # below names the specific behaviour that must break. A mutant that merely
+  # dies of a syntax error, exit 89 or 127 is not evidence.
+  # =====================================================================
+
+  # ---- T7: the lane itself is load-bearing -----------------------------
+  # The lane's only call site is the body of an `elif`, so DELETING it leaves an
+  # empty branch and the mutant dies of a bash syntax error before reaching any
+  # production logic — a vacuous mutant that proves nothing. It is therefore
+  # REWRITTEN to the exact pre-repair behaviour instead: the generation-13
+  # signature falls back to the ordinary readiness refusal it used to get.
+  nsl_install_exact_line_mutant \
+    session-hang-lane-entry \
+    '    enter_session_hang_lane || close_lane_terminally' \
+    "    fail 'Namespace hostname does not equal the exact instance id'"
+  nsl_run mutation-session-hang-lane-removed fail NSC_SHIM_SSH_HANG_CALLS=1
+  # Without the lane, exact-bytes-plus-hang falls through to the ordinary
+  # readiness refusal that the repair exists to replace.
+  # Authenticate the INTENDED pre-repair semantics, not merely "it went red".
+  # Without the lane, the generation-13 signature — exact bytes plus a client
+  # that failed to terminate — is misreported as an ordinary readiness refusal:
+  # exit exactly 1, the original message, and a lane that was never entered.
+  jq -e '.sessionHang.entered == false and .sessionHang.reinvocations == 0' \
+    "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+    fail 'mutation-session-hang-lane-removed: the lane still ran after its only call site was replaced'
+  [ "${nsl_status}" -eq 1 ] ||
+    fail "mutation-session-hang-lane-removed: expected the ordinary refusal status 1, got ${nsl_status}"
+  grep -qF 'Namespace hostname does not equal the exact instance id' \
+    "${nsl_root}/cases/mutation-session-hang-lane-removed/stderr.txt" ||
+    fail 'mutation-session-hang-lane-removed: the pre-repair readiness refusal message is missing, so the red is not the intended semantic'
+  nsl_restore_list_proof
+  echo '    mutation-session-hang-lane-removed: without the lane, exact bytes plus a hung client are misreported as an ordinary readiness refusal (exit 1) ✓'
+
+  # ---- T8: the split keys on EXACT BYTES, not on "any failure" ---------
+  # shellcheck disable=SC2016
+  nsl_install_exact_line_mutant \
+    session-hang-widened-guard \
+    '  elif hostname_bytes_are_exact "${readiness_out}"; then' \
+    '  elif true; then'
+  nsl_run mutation-wrong-bytes-enter-lane fail NSC_SHIM_FAIL_STAGE=hostname
+  # wronghostname00 must NEVER prove reachability. Under the mutant it does, and
+  # a wrong-byte readiness failure is wrongly escalated into the lane.
+  jq -e '.sessionHang.entered == true' \
+    "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+    fail 'mutation-wrong-bytes-enter-lane: the widened guard did not admit wrong bytes, so the byte predicate is not what gates the lane'
+  nsl_restore_list_proof
+  # ...and on the real bytes it stays out, which is the pairing that makes the
+  # mutant meaningful rather than merely red.
+  nsl_run wrong-bytes-stay-out-of-lane fail NSC_SHIM_FAIL_STAGE=hostname
+  nsl_assert_no_lane_entry wrong-bytes-stay-out-of-lane
+  echo '    mutation-wrong-bytes-enter-lane: only exact bytes enter the lane; widening the guard admits wronghostname00 ✓'
+
+  # ---- T14: byte-exactness is load-bearing -----------------------------
+  # Restore the removed loose predicate and require the six DISCRIMINATING
+  # fixtures to flip. Driving this with `<id>x` or empty stdout would leave the
+  # mutant green and prove nothing, because both predicates refuse those.
+  # shellcheck disable=SC1003,SC2016
+  nsl_install_exact_line_mutant \
+    hostname-loose-bytes \
+    '  jq -eRs --arg id "${instance_id}" '\''. == $id or . == ($id + "\n")'\'' \' \
+    '  [ "$(tr -d '\''[:space:]'\'' <"$1")" = "${instance_id}" ] || return 1; : \'
+  for nsl_loose_case in \
+    'trailing-space:@ID@ ' \
+    'leading-space: @ID@' \
+    'extra-line:@ID@\n\n' \
+    'carriage-return:@ID@\r\n' \
+    'tab-padded:\t@ID@\n' \
+    'internal-space:abcdefg hijklm'; do
+    nsl_loose_name="${nsl_loose_case%%:*}"
+    nsl_loose_value="${nsl_loose_case#*:}"
+    nsl_run "mutation-loose-bytes-${nsl_loose_name}" fail \
+      "NSC_SHIM_HOSTNAME_BYTES=${nsl_loose_value}" NSC_SHIM_SSH_HANG_CALLS=9
+    jq -e '.sessionHang.entered == true' \
+      "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+      fail "mutation-loose-bytes-${nsl_loose_name}: the loose predicate did not admit these bytes, so this fixture cannot prove byte-exactness is load-bearing"
+  done
+  nsl_restore_list_proof
+  echo '    mutation-hostname-loose-bytes: all six discriminating fixtures enter the lane under the loose predicate, so byte-exactness is load-bearing ✓'
+
+  # ---- T4e: the tri-state is load-bearing ------------------------------
+  # Booleanize the liveness probe so a REFUSED list becomes "instance lost".
+  # That is the ruling-item-7 violation: uncertainty manufacturing an
+  # ordinal-consuming loss claim.
+  # shellcheck disable=SC2016
+  nsl_install_exact_line_mutant \
+    liveness-booleanized \
+    '  nsc_list_json "${listing}" || return 2' \
+    '  nsc_list_json "${listing}" || return 1'
+  nsl_run mutation-liveness-boolean fail \
+    NSC_SHIM_SSH_HANG_CALLS=9 \
+    NSC_SHIM_LIVENESS_FORM_AFTER=1 \
+    NSC_SHIM_LIVENESS_FORM=array \
+    NSC_SHIM_LIVENESS_STATUS=29
+  # The same fixture that produced 77 above must now produce 76.
+  [ "${nsl_status}" -eq 76 ] ||
+    fail "mutation-liveness-boolean: booleanizing the probe did not promote a nonzero list into a proven loss, got ${nsl_status}"
+  jq -e '.sessionHang.outcome == "instance-lost" and .sessionHang.instanceLossProven == true' \
+    "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+    fail 'mutation-liveness-boolean: the booleanized probe did not report instance loss'
+  nsl_restore_list_proof
+  echo '    mutation-liveness-boolean: without the tri-state, a merely nonzero list is promoted into an ordinal-consuming loss ✓'
+
+  # ---- T5c: the post-liveness deadline re-read is load-bearing ---------
+  # shellcheck disable=SC2016
+  nsl_install_exact_proof_block_mutant \
+    post-liveness-deadline \
+    '    if [ "${remaining}" -lt "${call_allowance}" ]; then' \
+    '    fi' \
+    5
+  nsl_run mutation-single-budget-check fail \
+    NSC_SHIM_SSH_HANG_CALLS=9 \
+    NSL_DATE_OFFSETS=l3:260
+  # With the re-check gone, the ssh call the budget could not afford STARTS
+  # anyway. Under the same l3 offset that made T5b close after one funded
+  # re-invocation, the mutant instead runs a second one and only then closes on
+  # budget at the top of iteration 3. That is a deterministic tuple, asserted
+  # exactly so an unrelated mutant failure cannot be mistaken for this one:
+  # terminal 75 / exhausted-budget, two liveness proofs, two re-invocations, and
+  # exactly three ssh rows (readiness plus two retries).
+  nsl_assert_terminal_signature \
+    mutation-single-budget-check 75 session-hang-exhausted exhausted-budget
+  jq -e '
+    .sessionHang.outcome == "exhausted-budget" and
+    .sessionHang.livenessProofs == 2 and
+    .sessionHang.reinvocations == 2
+  ' "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+    fail "mutation-single-budget-check: expected the unguarded tuple of 2 liveness proofs and 2 re-invocations, got $(jq -c '.sessionHang|{outcome,livenessProofs,reinvocations}' "${nsl_report}/lifecycle/lifecycle.json")"
+  nsl_unguarded_ssh="$(nsl_count_ssh_calls)"
+  [ "${nsl_unguarded_ssh}" -eq 3 ] ||
+    fail "mutation-single-budget-check: expected 3 ssh rows once the unaffordable call is allowed to start, found ${nsl_unguarded_ssh}"
+  # ...and the shipped wrapper, on the identical fixture, must refuse that second
+  # re-invocation. Without this contrast the tuple above proves nothing.
+  jq -e '
+    .sessionHang.reinvocations == 1 and
+    .sessionHang.livenessProofs == 2
+  ' "${nsl_root}/cases/budget-refuses-after-liveness/report/lifecycle/lifecycle.json" >/dev/null ||
+    fail 'mutation-single-budget-check: the shipped wrapper did not refuse the call the mutant allowed'
+  nsl_restore_list_proof
+  echo '    mutation-single-budget-check: deleting the post-liveness deadline re-read lets a call start with insufficient budget ✓'
+
+  # ---- Structural-gate self-tests: the source law is non-vacuous -------
+  # These prove the pins added at the top of this mode actually refuse a
+  # reversion, by running each predicate against a deliberately broken COPY of
+  # the wrapper. A structural pin that cannot fail is a comment.
+  nsl_gate_copy="${tmp}/gate-mutant.sh"
+  nsl_assert_gate_refuses() {
+    local label="$1" predicate="$2"
+    if eval "${predicate}"; then
+      fail "structural gate ${label}: the mutated wrapper was accepted, so that pin is vacuous"
+    fi
+    echo "      gate refuses ${label} ✓"
+  }
+  # Unbounded hostname preflight — the exact generation-13 defect. The three
+  # timeout lines are stripped from run_hostname_attempt ONLY, leaving a bare
+  # `nsc ssh ... hostname` exactly as the pre-repair wrapper had it.
+  # `s == 1` and not merely `s`, so only the FIRST timeout site after the
+  # function header is stripped; leaving it armed would strip all five.
+  # skip=2 drops the --kill-after and duration lines only: the `nsc ssh` line
+  # itself must SURVIVE, unbounded, or the fixture would not model the defect.
+  awk 'BEGIN{s=0}
+    /^run_hostname_attempt\(\) \{$/{s=1}
+    s == 1 && /^[[:space:]]+timeout --verbose --signal=TERM \\$/{s=2; skip=2; next}
+    skip>0 {skip--; next}
+    {print}' "${proof_source}" >"${nsl_gate_copy}"
+  # Prove the mutation actually landed and hit the HOSTNAME site specifically,
+  # so a self-test cannot pass against an unmutated or wrongly-mutated copy.
+  [ "$(rg -c -- '^[[:space:]]+timeout --verbose --signal=TERM \\$' "${nsl_gate_copy}" || true)" -eq 4 ] ||
+    fail 'structural gate fixture: the unbounded-preflight mutation did not remove exactly one timeout site'
+  # shellcheck disable=SC1003
+  rg -qF -- '    nsc ssh --disable-pty "${instance_id}" -- hostname \' "${nsl_gate_copy}" ||
+    fail 'structural gate fixture: the mutated copy lost the hostname call site itself'
+  # The scanner must now name the hostname site as unbounded.
+  nsl_gate_unbounded="$(printf '%s' "$(nsl_ssh_bound_scan "${nsl_gate_copy}")" | cut -d'|' -f2)"
+  [ -n "${nsl_gate_unbounded}" ] ||
+    fail 'structural gate an unbounded hostname preflight: the scanner named no unbounded site, so that pin is vacuous'
+  nsl_assert_gate_refuses 'an unbounded hostname preflight' \
+    "nsl_ssh_bounds_ok '${nsl_gate_copy}'"
+  # ...and the unmutated wrapper must still be accepted by the same scanner, or
+  # the refusal above would be meaningless.
+  nsl_ssh_bounds_ok "${proof_source}" ||
+    fail 'structural gate: the shipped wrapper is rejected by its own ssh-bounds scanner'
+  # Reverted loose byte predicate.
+  sed "s|. == \$id or . == (\$id + \"\\\\n\")|tr -d '[:space:]'|" \
+    "${proof_source}" >"${nsl_gate_copy}"
+  nsl_assert_gate_refuses 'a whitespace-stripping hostname predicate' \
+    "rg -qF -- '. == \$id or . == (\$id + \"\\n\")' '${nsl_gate_copy}'"
+  # A receipt written inside the terminal close, which would freeze the
+  # pre-cleanup snapshot into the only receipt.
+  awk '{print} /^close_lane_terminally\(\) \{$/{print "  write_lifecycle_report fail"}' \
+    "${proof_source}" >"${nsl_gate_copy}"
+  sed -n '/^close_lane_terminally() {$/,/^}$/p' "${nsl_gate_copy}" >"${tmp}/gate-close-body.sh"
+  nsl_assert_gate_refuses 'a receipt written inside the terminal close' \
+    "! rg -qF 'write_lifecycle_report' '${tmp}/gate-close-body.sh'"
+  # A lane that mints or destroys a second instance.
+  awk '{print} /^enter_session_hang_lane\(\) \{$/{print "  nsc destroy \"${instance_id}\" --force"}' \
+    "${proof_source}" >"${nsl_gate_copy}"
+  sed -n '/^enter_session_hang_lane() {$/,/^}$/p' "${nsl_gate_copy}" >"${tmp}/gate-lane-body.sh"
+  nsl_assert_gate_refuses 'an instance mutation inside the lane' \
+    "! rg -q 'nsc create|nsc destroy' '${tmp}/gate-lane-body.sh'"
+  # Pins whose true worst case cannot fit the ratified lane budget. Asserted
+  # against the EXTRACTED production bounds validator, not a transcription, so
+  # the gate cannot drift away from the arithmetic the wrapper really runs.
+  sed 's/^NSC_LIST_TIMEOUT_SECONDS=.*/NSC_LIST_TIMEOUT_SECONDS=40/' \
+    "${pins_source}" >"${tmp}/gate-pins.env"
+  nsl_assert_gate_refuses 'a pin set whose worst case exceeds the lane budget' \
+    "( . '${tmp}/gate-pins.env'; w=\$(( NSC_SESSION_HANG_MAX_REINVOCATIONS * ( (NSC_LIST_TIMEOUT_SECONDS + NSC_LIST_KILL_AFTER_SECONDS) + (NSC_SESSION_HANG_PER_CALL_TIMEOUT_SECONDS + NSC_SESSION_HANG_KILL_AFTER_SECONDS) ) )); [ \"\${w}\" -le \"\${NSC_SESSION_HANG_LANE_BUDGET_SECONDS}\" ] )"
+  # A bounds validator rewritten to charge the SSH calls alone. This is the real
+  # production line, mutated in place and re-extracted, so the scoped gate is
+  # proven to reject the actual defect rather than a synthetic stand-in.
+  # shellcheck disable=SC1003
+  sed 's|^    NSC_LIST_TIMEOUT_SECONDS + NSC_LIST_KILL_AFTER_SECONDS) + (\\$|    0 + 0) + (\\|' \
+    "${proof_source}" >"${nsl_gate_copy}"
+  cmp -s "${nsl_gate_copy}" "${proof_source}" &&
+    fail 'structural gate fixture: the ssh-only bounds mutation changed no production bytes'
+  sed -n '/^validate_session_hang_bounds() {$/,/^}$/p' "${nsl_gate_copy}" \
+    >"${tmp}/gate-bounds-body.sh"
+  nsl_assert_gate_refuses 'an ssh-only worst-case formula that hides the liveness cost' \
+    "rg -qF 'NSC_LIST_TIMEOUT_SECONDS + NSC_LIST_KILL_AFTER_SECONDS' '${tmp}/gate-bounds-body.sh'"
+  echo '    session-hang-gate-self-tests: every structural pin refuses its own reversion, so none of them is vacuous ✓'
+
+  # ---- T5d: the ssh-only formula is load-bearing in PRODUCTION ---------
+  # The strongest available pairing: mutate the real production arithmetic, run
+  # the whole wrapper on the untouched ratified pins, and read the wrapper's own
+  # recomputed worst case out of its receipt. Charging the ssh calls alone gives
+  # 3 * (60 + 10) = 210 instead of the true 3 * ((20+5) + (60+10)) = 285, so the
+  # wrapper would accept a pin set whose real worst case overruns the lane.
+  # shellcheck disable=SC1003
+  nsl_install_exact_line_mutant \
+    bounds-ssh-only \
+    '    NSC_LIST_TIMEOUT_SECONDS + NSC_LIST_KILL_AFTER_SECONDS) + (\' \
+    '    0 + 0) + (\'
+  nsl_run mutation-budget-arithmetic fail NSC_SHIM_SSH_HANG_CALLS=9
+  nsl_mutant_worst="$(jq -r '.sessionHang.worstCaseLaneSeconds' \
+    "${nsl_report}/lifecycle/lifecycle.json")"
+  [ "${nsl_mutant_worst}" -eq 210 ] ||
+    fail "mutation-budget-arithmetic: the ssh-only formula produced ${nsl_mutant_worst}s, not the 210s that proves the liveness proofs went uncharged"
+  nsl_restore_list_proof
+  # ...and the unmutated wrapper must report the true 285, or the contrast above
+  # would prove nothing about the shipped bytes.
+  jq -e '.sessionHang.worstCaseLaneSeconds == 285' \
+    "${nsl_root}/cases/session-hang-exhausted/report/lifecycle/lifecycle.json" >/dev/null ||
+    fail 'mutation-budget-arithmetic: the shipped wrapper does not report the true 285s worst case'
+  echo '    mutation-budget-arithmetic: charging only the ssh calls drops the wrapper worst case from 285s to 210s, so the liveness proofs are really charged ✓'
+
+  # ---- T11 / clean-path regression -------------------------------------
+  # The clean, non-lane path must be completely unchanged: exactly four ssh
+  # calls and a lane that was never entered.
+  nsl_run session-hang-clean-path pass
+  nsl_clean_ssh="$(nsl_count_ssh_calls)"
+  [ "${nsl_clean_ssh}" -eq 4 ] ||
+    fail "session-hang-clean-path: a clean lifecycle made ${nsl_clean_ssh} ssh calls, not the required four"
+  nsl_assert_single_instance_lifecycle session-hang-clean-path
+  jq -e '
+    .status == "pass" and
+    .sessionHang.entered == false and
+    .sessionHang.outcome == "not-entered-clean" and
+    .sessionHang.reinvocations == 0 and
+    .sessionHang.classification == null
+  ' "${nsl_report}/lifecycle/lifecycle.json" >/dev/null ||
+    fail 'session-hang-clean-path: the clean non-lane path was disturbed by the lane'
+  echo '    session-hang-clean-path: a clean run still makes exactly four ssh calls and never enters the lane ✓'
 
   echo '  Namespace outer lifecycle, pre-created handoff, exact pins, failure collection, exact-id cleanup, and pass ordering are refusal-tested ✓'
   ;;
