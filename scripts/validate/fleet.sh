@@ -1245,6 +1245,24 @@ kargo-row-update-contract | kargo-row-update | kargo-yaml-update-contract)
   if bun ./scripts/validate/fleet-yaml-update.ts "${tmp}/bad.yaml" missing.path value >/dev/null 2>&1; then
     fail "fast yaml-update contract model accepted a missing update path"
   fi
+
+  # Refusal must be non-destructive for a block header, an empty leaf, and a
+  # whitespace-only leaf. Copy before EVERY call so a future partial write
+  # cannot hide behind a preceding refusal.
+  refusal_fixture="${tmp}/refusal.yaml"
+  printf '%s\n' \
+    'pin:' \
+    '  tag: stable' \
+    '  empty:' \
+    '  spaced:    ' >"${refusal_fixture}"
+  for refusal_target in pin pin.empty pin.spaced; do
+    cp "${refusal_fixture}" "${tmp}/refusal.before.yaml"
+    if bun ./scripts/validate/fleet-yaml-update.ts "${refusal_fixture}" "${refusal_target}" refused >/dev/null 2>&1; then
+      fail "fast yaml-update contract model accepted an unwriteable ${refusal_target} target"
+    fi
+    cmp -s "${tmp}/refusal.before.yaml" "${refusal_fixture}" ||
+      fail "fast yaml-update contract model changed bytes while refusing ${refusal_target}"
+  done
   echo "  fast yaml-update contract model: exact Raichu pin.tag target, raw values bytes, and negatives ✓"
   ;;
 sit-namespace-lifecycle | sit-proof-lifecycle)
@@ -3285,7 +3303,7 @@ active_instance_json() {
     --argjson memory "${memory}" \
     --arg kubernetes "${kubernetes}" \
     --arg labelForm "${label_form}" '
-      [{cluster_id:$id,labels:{"ratchet-node":"fleet","ratchet-generation":"15"},
+      [{cluster_id:$id,labels:{"ratchet-node":"fleet","ratchet-generation":"17"},
         shape:{virtual_cpu:$cpu,memory_megabytes:$memory,machine_arch:"amd64",os:"linux"},
         kubernetes:$kubernetes}]
       | if $labelForm == "wrong-generation" then
@@ -3340,7 +3358,7 @@ emit_list_form() {
     printf '\033[0K'
     ;;
   invalid-utf8)
-    printf '[{"cluster_id":"%s","labels":{"ratchet-node":"fleet","ratchet-generation":"15"},"shape":{"virtual_cpu":16,"memory_megabytes":32768,"machine_arch":"amd64","os":"linux"},"kubernetes":"1.33","ignored":"audited-' "${id}"
+    printf '[{"cluster_id":"%s","labels":{"ratchet-node":"fleet","ratchet-generation":"17"},"shape":{"virtual_cpu":16,"memory_megabytes":32768,"machine_arch":"amd64","os":"linux"},"kubernetes":"1.33","ignored":"audited-' "${id}"
     printf '\xff'
     printf -- '-byte"}]\n'
     ;;
@@ -3516,7 +3534,7 @@ create)
   done
   expected=(
     --ephemeral --duration 2h --machine_type 16x32 --enable=kubernetes:1.33
-    --wait_kube_system --label ratchet-node=fleet --label ratchet-generation=15
+    --wait_kube_system --label ratchet-node=fleet --label ratchet-generation=17
     --purpose 'fleet full L0-L9 Namespace built-in-k3s proof'
     --cidfile "${cid}" --output json --output_json_to "${metadata}"
   )
@@ -3991,7 +4009,7 @@ NSL_NSC_SHIM
     .argv == [
       "--ephemeral","--duration","2h","--machine_type","16x32",
       "--enable=kubernetes:1.33","--wait_kube_system",
-      "--label","ratchet-node=fleet","--label","ratchet-generation=15",
+      "--label","ratchet-node=fleet","--label","ratchet-generation=17",
       "--purpose","fleet full L0-L9 Namespace built-in-k3s proof",
       "--cidfile",$cid,"--output","json","--output_json_to",$metadata
     ]
@@ -4357,7 +4375,7 @@ NSL_SCHEMA_CASES
   # validate_live_instance diagnostic and closed exact-id cleanup.
   nsl_run wrong-live-generation fail NSC_SHIM_LIST_LABELS=wrong-generation
   nsl_assert_live_label_refusal \
-    wrong-live-generation ratchet-generation 7 15
+    wrong-live-generation ratchet-generation 7 17
   nsl_run wrong-live-node fail NSC_SHIM_LIST_LABELS=wrong-node
   nsl_assert_live_label_refusal \
     wrong-live-node ratchet-node not-fleet fleet
@@ -4946,7 +4964,7 @@ NSL_ROW_SCHEMA_MUTANTS
   nsl_run mutation-live-generation-guard pass NSC_SHIM_LIST_LABELS=wrong-generation
   nsl_assert_exact_destroy mutation-live-generation-guard
   nsl_assert_single_live_label_delta \
-    mutation-live-generation-guard ratchet-generation 7 15
+    mutation-live-generation-guard ratchet-generation 7 17
   nsl_restore_list_proof
 
   # The jq variable names are literal production bytes, not shell expansions.
@@ -8419,6 +8437,30 @@ presence)
   test -s "${chart}/values.schema.json" || fail "compiler chart values.schema.json missing"
   test -s "${chart}/values.schema.source.json" || fail "deliberate compiler schema source missing"
   test -s "${golden_dir}/canary.prod.yaml" || fail "prod golden render missing"
+
+  # The action-pin scanner must distinguish its valid no-match result from a
+  # scan error, while refusing a root that has no workflows directory at all.
+  # Run against an isolated root so the checked-in workflow set is never used.
+  action_pin_validator="${PWD}/scripts/validate/action-pins.sh"
+  action_pin_root="${tmp}/action-pin-refusal"
+  mkdir -p "${action_pin_root}/config"
+  cp config/action-trust.json "${action_pin_root}/config/action-trust.json"
+  if (cd "${action_pin_root}" && bash "${action_pin_validator}" trusted) >/dev/null 2>"${tmp}/action-pin-missing.stderr"; then
+    fail "action-pin validator accepted a missing workflows directory"
+  fi
+  mkdir -p "${action_pin_root}/.github/workflows"
+  (cd "${action_pin_root}" && bash "${action_pin_validator}" trusted) >/dev/null 2>"${tmp}/action-pin-empty.stderr" ||
+    fail "action-pin validator rejected an empty workflows directory"
+  action_pin_fake_bin="${tmp}/action-pin-fake-bin"
+  mkdir -p "${action_pin_fake_bin}"
+  printf '%s\n' '#!/usr/bin/env bash' 'exit 2' >"${action_pin_fake_bin}/rg"
+  chmod +x "${action_pin_fake_bin}/rg"
+  if (cd "${action_pin_root}" && PATH="${action_pin_fake_bin}:${PATH}" bash "${action_pin_validator}" trusted) >/dev/null 2>"${tmp}/action-pin-rg.stderr"; then
+    fail "action-pin validator accepted an rg scan error"
+  fi
+  rg -qF 'rg exited 2' "${tmp}/action-pin-rg.stderr" ||
+    fail "action-pin validator did not name the rg exit status"
+
   # pin-management + webhook-wiring docs are published in the domain doc.
   rg -q '^## The `machinery-stable` tag' docs/domain/fleet-repo.md || fail "machinery-stable pin doc missing"
   rg -q '^## The `mercury-stable` pin' docs/domain/fleet-repo.md || fail "mercury-stable pin doc missing"
