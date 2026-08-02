@@ -16,6 +16,7 @@ set -euo pipefail
 #   scripts/local/materialize-fleet.sh --check <target>        # dry-run report
 #   scripts/local/materialize-fleet.sh --allow-dirty <target>  # skip clean gate
 #   scripts/local/materialize-fleet.sh --self-test             # temp-target proof
+#   scripts/local/materialize-fleet.sh --help                  # print this block
 #
 # Safety posture:
 #   * writes are confined to <target>; nothing outside it is ever deleted
@@ -31,12 +32,23 @@ allow_dirty=0
 self_test=0
 target=""
 
+# The `Usage:` block in the header above is the single source of truth; --help
+# prints it verbatim so the advertised flag can never drift from the parser.
+usage() {
+  sed -n '/^# Usage:/,/^#$/p' "${BASH_SOURCE[0]}" |
+    sed -e 's/^#[[:space:]]\{0,1\}//' -e '/^$/d'
+}
+
 # --- parse arguments (linear, substitution-friendly) ---
 while [ "$#" -gt 0 ]; do
   case "$1" in
   --check | -n) mode="check" ;;
   --allow-dirty) allow_dirty=1 ;;
   --self-test) self_test=1 ;;
+  --help | -h)
+    usage
+    exit 0
+    ;;
   -*) echo "❌ unknown flag '$1'" >&2 && exit 1 ;;
   *)
     [ -n "${target}" ] && echo "❌ only one target may be given" >&2 && exit 1
@@ -374,6 +386,25 @@ if [ "${self_test}" -eq 1 ]; then
   git -C "${contaminated}" commit -qm seed
   if "${BASH_SOURCE[0]}" --check "${contaminated}" >/dev/null 2>&1; then
     echo "❌ pre-existing probes tree was accepted in the target" >&2
+    fail=1
+  fi
+
+  # the advertised --help must exist and print the header usage block, while an
+  # unknown flag must still refuse — the refusal text points at --help, so a
+  # missing help path would make that guidance a dead end.
+  help_text="$("${BASH_SOURCE[0]}" --help)"
+  for advertised in 'Usage:' '--check' '--allow-dirty' '--self-test' '--help'; do
+    case "${help_text}" in
+    *"${advertised}"*) ;;
+    *) echo "❌ --help output omits ${advertised}" >&2 && fail=1 ;;
+    esac
+  done
+  if "${BASH_SOURCE[0]}" --check --not-a-real-flag "${scratch}" >/dev/null 2>&1; then
+    echo "❌ unknown flag was accepted" >&2
+    fail=1
+  fi
+  if "${BASH_SOURCE[0]}" >/dev/null 2>&1; then
+    echo "❌ a missing target was accepted" >&2
     fail=1
   fi
 

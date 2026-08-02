@@ -1,6 +1,6 @@
 # NEGATIVE FIXTURE — the ENTEI `traffic: false` invariant.
 #
-# Identical to fixtures/clusters/entei-<mark>.yaml except `traffic: true`.
+# Identical to fixtures/clusters/entei-mark.yaml except `traffic: true`.
 # The registry-manifest gate MUST reject it: an infrastructure-only host
 # landscape never joins the registered-fleet gray-zone A-set nor its S8 R53
 # backup mirror, so a traffic-carrying ENTEI cluster is a contradiction in the

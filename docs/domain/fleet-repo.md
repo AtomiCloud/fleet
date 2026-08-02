@@ -356,15 +356,15 @@ the `values:` >7d guardrail; registry/rendered CR validation (including
 CloudflareDeploy rollout and Warehouse); rollout and WebhookEngine negatives;
 AppSet scope; platforms AppSet; registry guard policy; and presence.
 
-`scripts/ci/fleet-sit-proof.sh` is the one required serialized full-proof entry
-point. It verifies a clean exact HEAD, builds a detached pristine snapshot, and
-keeps `--prepare-only` local, cheap, snapshot-bound, and entirely free of
-Namespace instance operations. Public `--full` is an outer lifecycle: it cold
-creates one anonymous ephemeral Namespace instance, transfers the self-contained
-snapshot, runs an explicit inner mode on the VM over `nsc ssh`, downloads the
-report, validates its report and direct-input inventory independently, and then
-destroys the exact instance id and proves it absent. Run it from the repository
-root:
+`scripts/ci/fleet-sit-proof.sh` is the one required entry point for the
+serialized full-proof lifecycle. It verifies a clean exact HEAD, builds a
+detached pristine snapshot, and keeps `--prepare-only` local, cheap,
+snapshot-bound, and entirely free of Namespace instance operations. Public
+`--full` is an outer lifecycle: it cold creates one anonymous ephemeral
+Namespace instance, transfers the self-contained snapshot, runs an explicit
+inner mode on the VM over `nsc ssh`, downloads the report, validates its report
+and direct-input inventory independently, and then destroys the exact instance
+id and proves it absent. Run it from the repository root:
 
 ```sh
 nix develop .#ci -c ./scripts/ci/fleet-sit-proof.sh --full

@@ -16,7 +16,7 @@ on:
           - create-denied
           - update-delete-denied
       run_key:
-        description: Numeric production-run identity used to bind evidence
+        description: Production-run identity binding the evidence, as <run-id>-<attempt> (digits-digits)
         required: true
         type: string
       backtrack_sha:
@@ -62,7 +62,8 @@ jobs:
 
           [ "${SANDBOX_REPOSITORY}" = "${expected_repository}" ] ||
             fail "unexpected sandbox repository ${SANDBOX_REPOSITORY}"
-          [[ "${RUN_KEY}" =~ ^[0-9]+-[0-9]+$ ]] || fail 'run identity must be numeric'
+          [[ "${RUN_KEY}" =~ ^[0-9]+-[0-9]+$ ]] ||
+            fail 'run identity must be <run-id>-<attempt> (digits-digits)'
           [[ "${BACKTRACK_SHA}" =~ ^[0-9a-f]{40}$ ]] || fail 'BACKTRACK_SHA must be a full SHA'
           [[ "${FORWARD_SHA}" =~ ^[0-9a-f]{40}$ ]] || fail 'FORWARD_SHA must be a full SHA'
           : "${GITHUB_TOKEN:?the sandbox workflow GITHUB_TOKEN is required}"
@@ -109,6 +110,13 @@ jobs:
               fail "${method} ${endpoint} returned an invalid HTTP status ${response_status:-empty}"
           }
 
+          # A ruleset-blocked `POST /git/refs` answers 422 with the envelope
+          # message "Validation Failed" and the ruleset wording in
+          # `.errors[].message`, so "validation failed" must NOT be excluded —
+          # excluding it would reject the exact denial this probe exists to
+          # prove. Genuine schema-validation 422s are still refused, because the
+          # required ruleset/protected/bypass wording below never appears in
+          # them.
           classify_policy_denial() {
             local status="$1"
             local body_file="$2"
@@ -132,7 +140,7 @@ jobs:
                     end)
                 ] | join("\n");
               denial_text as $text
-              | (($text | test("(?i)(not[[:space:]-]*found|resource[[:space:]-]*not[[:space:]-]*accessible|reference[[:space:]-]*already[[:space:]-]*exists|validation[[:space:]-]*failed)")) | not)
+              | (($text | test("(?i)(not[[:space:]-]*found|resource[[:space:]-]*not[[:space:]-]*accessible|reference[[:space:]-]*already[[:space:]-]*exists)")) | not)
               and ($text | test("(?i)(repository[[:space:]-]*(rule|ruleset)|ruleset|protected[[:space:]-]*(branch|ref|tag)|bypass)"))
             ' "${body_file}" >/dev/null
           }

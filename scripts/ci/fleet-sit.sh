@@ -4929,7 +4929,7 @@ kargo_runtime_finalize_git_oracle() {
     LC_ALL=C sort >"${KARGO_RUNTIME_DIR}/kargo-runtime-expected-paths.txt"
   cmp -s "${KARGO_RUNTIME_DIR}/kargo-runtime-expected-paths.txt" \
     "${KARGO_RUNTIME_DIR}/kargo-runtime-changed-paths.txt" ||
-    sit_fail 'Kargo runtime did not change exactly the eight expected row files'
+    sit_fail 'Kargo runtime did not change exactly the seven expected row files'
   git -C "${FLEET_BARE}" show \
     "${final_sha}:platforms/canary/landscapes/raichu/dummy.yaml" |
     sed -n '/^values:/,$p' >"${report}/kargo-runtime-raichu-values-after.yaml"

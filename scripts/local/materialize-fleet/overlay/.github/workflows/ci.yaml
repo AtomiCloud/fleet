@@ -13,11 +13,9 @@ jobs:
     permissions:
       contents: read
     uses: ./.github/workflows/⚡reusable-precommit.yaml
-    secrets: inherit
 
   fleet:
     name: Fleet
     permissions:
       contents: read
     uses: ./.github/workflows/⚡reusable-fleet.yaml
-    secrets: inherit
