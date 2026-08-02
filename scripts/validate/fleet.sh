@@ -7905,8 +7905,8 @@ PPVTUPLES
   fi
   ppv_shared_edges="$(rg -c '^  kargo_auto_promote_and_verify ' "${ppv_source}")"
   ppv_direct_edges=$(($(wc -l <"${tmp}/ppv-actual-tuples.tsv") - 1))
-  [ "$((ppv_shared_edges + ppv_direct_edges))" -eq 15 ] ||
-    fail 'the exact post-Promotion tuple guard no longer covers all fifteen runtime edges'
+  [ "$((ppv_shared_edges + ppv_direct_edges))" -eq 14 ] ||
+    fail 'the exact post-Promotion tuple guard no longer covers all fourteen runtime edges'
   sed -n '/^kargo_runtime_trace_wall_clock_soak() {$/,/^}$/p' "${ppv_source}" \
     >"${tmp}/ppv-soak-function.sh"
   [ "$(tail -n 1 "${tmp}/ppv-soak-function.sh")" = '}' ] ||
@@ -8290,7 +8290,7 @@ PPVTUPLES
     ! rg -q 'error_lines=.*BASH_LINENO' "${ppv_source}"; then
     fail 'last-error diagnostics do not retain the Bash call stack'
   fi
-  echo '  all 15 runtime edges, distinct reverify, causal soak ordering, outcome captures, and both project fallbacks are source-guarded ✓'
+  echo '  all 14 runtime edges, distinct reverify, causal soak ordering, outcome captures, and both project fallbacks are source-guarded ✓'
   ;;
 guard)
   bash ./scripts/validate/registry-guard.sh

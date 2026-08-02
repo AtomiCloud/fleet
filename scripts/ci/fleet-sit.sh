@@ -4749,7 +4749,6 @@ kargo_runtime_install_soak_project() {
     ([.[] | select(.kind == "ProjectConfig")][0].spec.promotionPolicies |
       map(select(.autoPromotionEnabled == true).stageSelector.name) | sort) == [
         "canary-sitsoak-dummy-ampharos",
-        "canary-sitsoak-dummy-pichu",
         "canary-sitsoak-dummy-raichu"
       ]
   ' "${KARGO_RUNTIME_DIR}/kargo-runtime-soak-rendered.json" >/dev/null
@@ -4778,7 +4777,6 @@ kargo_runtime_trace_wall_clock_soak() {
   kargo_seed_freight "${project}" fleet-sit-f4 "${tag}" \
     "${report}/kargo-runtime-soak-freight-created.json"
   freight="$(jq -r '.metadata.name' "${report}/kargo-runtime-soak-freight-created.json")"
-  kargo_auto_promote_and_verify "${project}" pichu "${freight}" "${tag}" kargo-runtime-soak-pichu
   kargo_auto_promote_and_verify "${project}" raichu "${freight}" "${tag}" kargo-runtime-soak-raichu
   kargo_refresh_stage "${project}" "${pikachu}"
   sit_wait_for 60 '90s fixture pikachu Stage to remain manual' \

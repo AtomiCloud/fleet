@@ -1,6 +1,8 @@
 # SIT-only strengthener for the released controller's real wall clock. This is
-# the production canary DAG with only the literal soak shortened from 15m to
-# 90s; it is rendered into the throwaway project canary-sitsoak.
+# the production canary DAG with the literal soak shortened from 15m to 90s.
+# Pichu is manual only in this throwaway project so an unrelated third verified
+# Stage cannot trigger Kargo v1.9.10's exact-set bug while this fixture isolates
+# the requested pikachu+raichu All/soak contract.
 platform: canary-sitsoak
 services:
   - name: dummy
@@ -11,7 +13,8 @@ infisical:
 sos:
   register: false
 landscapes:
-  - pichu
+  - landscape: pichu
+    gate: manual
   - pikachu
   - raichu
   - ampharos

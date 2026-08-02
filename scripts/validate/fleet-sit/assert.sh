@@ -110,7 +110,7 @@ sit_report_init() {
         "the pinned Argo install uses server-side apply because its ApplicationSet CRD is larger than Kubernetes permits in a client-side last-applied annotation",
         "the planned static dumb-HTTP fixture transport was replaced after source and runtime verification: Argo CD v3.4.5 go-git remote.List rejects its static info/refs response, so the Bun wrapper invokes git http-backend for smart HTTP",
         "L9 changes only the two ordinary consumer coordinates fleet.repoURL and oci.registry, disables the optional Kargo API/external-webhook/garbage-collector components, and supplies an operator-generated one-run TLS CA/certificate to the real kubernetes-webhooks-server",
-        "the literal 15m clock is strengthened with a separate SIT-only canary-sitsoak project whose otherwise-identical DAG uses 90s; this fixture is never a product render"
+        "the literal 15m clock is strengthened with a separate SIT-only canary-sitsoak project whose soak is 90s and whose unrelated pichu gate is manual; isolating the requested pikachu+raichu set avoids the Kargo v1.9.10 exact-set bug when extra verified Stages exist, and this fixture is never a product render"
       ],
       feasibility: {
         applicationSetWebhookPort: 7000,
