@@ -1771,7 +1771,7 @@ fetch_kargo_crds() {
       "${KARGO_CRD_BASE_URL}/${file}" --output "${KARGO_CRD_DIR}/${file}"
     printf '%s  %s\n' "${digest}" "${KARGO_CRD_DIR}/${file}" >>"${work}/kargo-crds.sha256"
   done
-  sha256sum --check "${work}/kargo-crds.sha256" | tee "${report}/kargo-crds-verified.txt"
+  sha256sum -c "${work}/kargo-crds.sha256" | tee "${report}/kargo-crds-verified.txt"
 }
 
 kargo_negative_rejected() {
@@ -2318,7 +2318,7 @@ kargo_runtime_prepare_artifacts() {
   [ -s "${chart_archive}" ] || sit_fail 'the pinned Kargo chart archive was not downloaded'
   printf '%s  %s\n' "${KARGO_CHART_ARCHIVE_SHA256}" "${chart_archive}" \
     >"${KARGO_RUNTIME_DIR}/kargo-chart.sha256"
-  sha256sum --check "${KARGO_RUNTIME_DIR}/kargo-chart.sha256" \
+  sha256sum -c "${KARGO_RUNTIME_DIR}/kargo-chart.sha256" \
     >"${report}/kargo-runtime-chart-sha256.txt"
   tar -xzf "${chart_archive}" -C "${KARGO_RUNTIME_DIR}/chart"
   helm show chart "${chart_archive}" >"${report}/kargo-runtime-chart-metadata.yaml"
@@ -2331,7 +2331,7 @@ kargo_runtime_prepare_artifacts() {
   printf '%s  %s\n' "${ROLLOUTS_MANIFEST_SHA256}" \
     "${KARGO_RUNTIME_DIR}/argo-rollouts-install.source.yaml" \
     >"${KARGO_RUNTIME_DIR}/argo-rollouts.sha256"
-  sha256sum --check "${KARGO_RUNTIME_DIR}/argo-rollouts.sha256" \
+  sha256sum -c "${KARGO_RUNTIME_DIR}/argo-rollouts.sha256" \
     >"${report}/kargo-runtime-rollouts-sha256.txt"
 
   local kargo_digest_ref="${KARGO_IMAGE_REPOSITORY}@${KARGO_IMAGE_DIGEST}"
@@ -5540,7 +5540,7 @@ run_full() {
   curl --fail --location --retry 3 --connect-timeout 15 --max-time 180 \
     "${ARGOCD_MANIFEST_URL}" --output "${work}/argocd-install.yaml"
   printf '%s  %s\n' "${ARGOCD_MANIFEST_SHA256}" "${work}/argocd-install.yaml" |
-    sha256sum --check | tee "${report}/pins-verified.txt"
+    sha256sum -c | tee "${report}/pins-verified.txt"
   yq eval-all -o=json 'select(.kind == "Service" and .metadata.name == "argocd-applicationset-controller")' \
     "${work}/argocd-install.yaml" |
     jq -e '{applicationSetWebhookPort:.spec.ports[] | select(.name == "webhook") | .port}' \

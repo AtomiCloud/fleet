@@ -1198,6 +1198,42 @@ sit-namespace-lifecycle | sit-proof-lifecycle)
     [ "${nsl_git_backend_install_line}" -lt "${nsl_git_backend_apk_line}" ] ||
     fail 'the Git smart-HTTP backend probe/install sequence no longer precedes APK installation'
   echo '    Wolfi Git smart-HTTP backend: executable probe installs pinned git-daemon and records exact APK ownership ✓'
+  # Attempt 3 passed the Git backend split and then reached an inner checksum
+  # verification still written for GNU coreutils. The whole fleet-sit worker
+  # executes on Wolfi's BusyBox userland, so every verification call must use
+  # its supported short `-c` spelling. Count the full reviewed set, reproduce
+  # the option asymmetry, and ensure a one-site reversion mutant is refused.
+  nsl_inner_checksums_are_busybox_portable() {
+    local source="$1"
+    [ "$(rg -c '^[[:space:]]+sha256sum -c([[:space:]]|$)' "${source}")" -eq 4 ] &&
+      ! rg -q '^[[:space:]]+sha256sum --check([[:space:]]|$)' "${source}"
+  }
+  nsl_inner_checksums_are_busybox_portable "${sit_source}" ||
+    fail 'the four on-instance checksum verification sites are not BusyBox-portable'
+  nsl_checksum_fixture="${tmp}/inner-checksum-fixture"
+  printf 'fleet-g15-inner-checksum\n' >"${nsl_checksum_fixture}"
+  nsl_checksum_digest="$(busybox sha256sum "${nsl_checksum_fixture}" | awk '{print $1}')"
+  printf '%s  %s\n' "${nsl_checksum_digest}" "${nsl_checksum_fixture}" |
+    busybox sha256sum -c >/dev/null ||
+    fail 'the BusyBox inner-checksum success fixture rejected the reviewed -c spelling'
+  if printf '%s  %s\n' "${nsl_checksum_digest}" "${nsl_checksum_fixture}" |
+    busybox sha256sum --check >/dev/null 2>&1; then
+    fail 'the BusyBox inner-checksum regression fixture unexpectedly accepted --check'
+  fi
+  nsl_inner_checksum_mutant="${tmp}/fleet-sit-inner-checksum-mutant.sh"
+  awk '
+    !mutated && /^[[:space:]]+sha256sum -c([[:space:]]|$)/ {
+      sub(/sha256sum -c/, "sha256sum --check")
+      mutated = 1
+    }
+    { print }
+    END { if (!mutated) exit 1 }
+  ' "${sit_source}" >"${nsl_inner_checksum_mutant}" ||
+    fail 'the inner-checksum reversion mutant changed no production site'
+  if nsl_inner_checksums_are_busybox_portable "${nsl_inner_checksum_mutant}"; then
+    fail 'the inner-checksum portability gate accepted a GNU-only one-site mutant'
+  fi
+  echo '    inner checksum verification: all four sites use BusyBox -c; live --check failure reproduced; one-site mutant refused ✓'
   # The first live g15 run reached L0 and exposed a Wolfi/BusyBox portability
   # defect: GNU sed's `0,/pattern/` address is not accepted by the substrate's
   # sed applet. Exercise the exact shipped helper, then prove the structural
