@@ -81,7 +81,7 @@
           pre-commit-check = pre-commit;
           format = formatter;
           fleet-ci-runtime = pkgs.runCommand "fleet-ci-runtime" { nativeBuildInputs = ciInputs; } ''
-            for cmd in bun envsubst go helm helm-schema jq kubeconform rg yq; do
+            for cmd in bun busybox envsubst go helm helm-schema jq kubeconform rg yq; do
               command -v "$cmd" >/dev/null 2>&1 || {
                 echo "missing runtime command: $cmd" >&2
                 exit 1

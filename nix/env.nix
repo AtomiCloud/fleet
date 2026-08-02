@@ -35,6 +35,7 @@ with packages;
   # ### workspace-main
   # #### source: workspace
   main = [
+    busybox
     cyanprint
     docker-client
     git
