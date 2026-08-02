@@ -129,6 +129,7 @@
       "items": { "$ref": "#/definitions/registeredLandscape" }
     },
     "stages": {
+      "$comment": "Cross-step landscape uniqueness is NOT expressed here, deliberately. A Kargo Stage name is <platform>-<service>-<landscape> (diene-platform.stageName), so a landscape repeated in two steps renders two Stages with the SAME name in one namespace. JSON Schema cannot state that: the uniqueItems on a parallel stageStep compares whole member VALUES inside a SINGLE step, so \"pichu\" and {landscape: pichu} are distinct items to it, and it cannot see across steps at all. Writing a schema keyword that appears to cover this would be a vacuous guard. The invariant is enforced fail-closed at render by diene-platform.assertPipeline (templates/_helpers.tpl), which also refuses a soak on the first step, and is proven non-vacuous by scripts/validate/fleet.sh dag / dag-negative.",
       "type": "array",
       "minItems": 1,
       "items": { "$ref": "#/definitions/stageStep" }
@@ -165,8 +166,9 @@
       "pattern": "^[1-9][0-9]*(?:s|m|h|d)$"
     },
     "semver": {
+      "$comment": "SemVer 2.0.0 shape: major.minor.patch, then an OPTIONAL prerelease and an OPTIONAL build metadata, INDEPENDENTLY. The two are separate optional groups precisely so a version carrying BOTH (1.2.3-rc.1+build.5) is accepted; a single [-+] class would have made the two mutually exclusive, because the trailing character class does not include '+'. Still rejected: a missing component (1.2), a 'v' prefix, a fourth component, an empty prerelease or build (1.2.3-, 1.2.3+), and more than one build marker.",
       "type": "string",
-      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[-+][0-9A-Za-z.-]+)?$"
+      "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:-[0-9A-Za-z.-]+)?(?:\\+[0-9A-Za-z.-]+)?$"
     },
     "serviceRosterEntry": {
       "type": "object",

@@ -93,6 +93,41 @@ input-schema)
   helm lint "${chart}" --namespace "${namespace}" --values "${services}" --values "${tmp}/bad-platform.yaml" >/dev/null 2>&1 &&
     fail "combined input schema accepted an invalid Problem fragment"
   echo "  closed source-B/source-C schema accepts canary and rejects targeted malformed shapes ✓"
+
+  # ---------------------------------------------------------------------------
+  # SemVer 2.0.0 acceptance for every `semver` consumer. A prerelease and build
+  # metadata are INDEPENDENT optional suffixes, so a version carrying BOTH is
+  # valid and must pass; the accept list below is what proves the two suffixes
+  # are not mutually exclusive. The reject list keeps the pattern strict, so
+  # widening it did not turn `semver` into "any string with dots".
+  # ---------------------------------------------------------------------------
+  semver_case() {
+    local field="$1" want="$2" version="$3"
+    cp "${fixture}" "${tmp}/semver.yaml"
+    # style="double" keeps yq from re-typing e.g. 1.2 as a YAML float, so the
+    # pattern — not the JSON type — is what decides the outcome.
+    yq -i "${field} = \"${version}\" | ${field} style=\"double\"" "${tmp}/semver.yaml"
+    if helm lint "${chart}" --namespace "${namespace}" \
+      --values "${services}" --values "${tmp}/semver.yaml" >/dev/null 2>&1; then
+      [ "${want}" = "accept" ] ||
+        fail "semver accepted the INVALID version '${version}' at ${field}"
+    else
+      [ "${want}" = "reject" ] ||
+        fail "semver rejected the VALID version '${version}' at ${field}"
+    fi
+  }
+  for v in "1.2.3" "1.2.3-rc.1" "1.2.3+build.5" "1.2.3-rc.1+build.5" \
+    "0.0.0-alpha+001" "10.20.30-a-b.c+x-y.z"; do
+    semver_case '.cloudflareDeploy[0].tag' accept "${v}"
+    semver_case '.problems[0].version' accept "${v}"
+  done
+  # Empty suffixes, a missing/extra component, a 'v' prefix, a second build
+  # marker, and out-of-class characters all stay rejected.
+  for v in "1.2" "v1.2.3" "1.2.3.4" "1.2.3-" "1.2.3+" "1.2.3-rc.1+" "1.2.3+b+c" "1.2.3_rc"; do
+    semver_case '.cloudflareDeploy[0].tag' reject "${v}"
+    semver_case '.problems[0].version' reject "${v}"
+  done
+  echo "  semver accepts prerelease+build metadata together and still rejects malformed versions ✓"
   ;;
 schema-drift)
   bash ./scripts/local/generate-platform-schema.sh "${tmp}/values.schema.json" >/dev/null
@@ -226,7 +261,15 @@ dag)
     and all($s[]; [.spec.promotionTemplate.spec.steps[] | select(.uses=="yaml-update") | .config.updates[].value] == ["${{ imageFrom(\"registry.atomi.cloud/canary/dummy\").Tag }}"])
   ' >/dev/null || fail "every Stage must retain the fixed pin-only git-update promotion template with the exact native Kargo imageFrom(...).Tag value"
 
-  echo "  stages: → Kargo v1 mapping (ProjectConfig policies / direct / preceding / rendezvous All+soak / verification / fixed pin-only template) ✓"
+  # Stage IDENTITY. A Kargo Stage name is <platform>-<service>-<landscape>, so
+  # two Stages may never share a name inside the platform namespace — a
+  # collision is two objects fighting over one identity, not a cosmetic dupe.
+  yq eval-all -o=json '.' "${tmp}/r.yaml" | jq -s -e '
+    [.[] | select(.kind=="Stage") | .metadata.name] as $n
+    | ($n | length) == ($n | unique | length)
+  ' >/dev/null || fail "rendered Kargo Stage names collide — one landscape is compiled into two Stages with the same name"
+
+  echo "  stages: → Kargo v1 mapping (ProjectConfig policies / direct / preceding / rendezvous All+soak / verification / fixed pin-only template) + unique Stage identities ✓"
   ;;
 dag-negative)
   # Controlled negatives over the EXACT rendered fields. Each mutates one field
@@ -298,6 +341,53 @@ dag-negative)
   tamper "yaml-update value uses the invalid Go-template pipe" \
     'map(if .kind=="Stage" then (.spec.promotionTemplate.spec.steps[] | select(.uses=="yaml-update") | .config.updates[].value) = $bad_pipe_value else . end)' \
     'all(.[]; (.kind != "Stage") or ([.spec.promotionTemplate.spec.steps[] | select(.uses=="yaml-update") | .config.updates[].value] == [$exact_yaml_update_value]))'
+
+  # $n below is a jq binding, not a shell variable.
+  # shellcheck disable=SC2016
+  tamper "a duplicate Stage identity injected into the render" \
+    '. + [.[] | select(.kind=="Stage" and .metadata.name=="canary-dummy-pichu")]' \
+    '[.[] | select(.kind=="Stage") | .metadata.name] as $n | ($n|length) == ($n|unique|length)'
+
+  # ---------------------------------------------------------------------------
+  # PIPELINE-CONTRACT negatives (diene-platform.assertPipeline). Both shapes
+  # below are ACCEPTED by values.schema.json and were previously compiled into
+  # silently wrong output: a repeated landscape rendered two Stages with one
+  # name, and a soak on step 1 was dropped while still stamping a soak
+  # annotation. JSON Schema cannot state either rule — `uniqueItems` compares
+  # whole member VALUES within a SINGLE step, and the schema cannot see step
+  # ORDER — so the guard is a template assertion.
+  #
+  # Each case requires the GUARD'S OWN message. That is what makes these
+  # non-vacuous: if the schema (or anything else) rejected the input first, the
+  # message would differ and the check would go red, so a green here proves the
+  # template guard is the thing doing the refusing.
+  # ---------------------------------------------------------------------------
+  guard_reject() {
+    local desc="$1" expr="$2" expect="$3"
+    cp "${fixture}" "${tmp}/guard.yaml"
+    yq -i "${expr}" "${tmp}/guard.yaml"
+    helm template "${release}" "${chart}" --namespace "${namespace}" \
+      --values "${services}" --values "${tmp}/guard.yaml" >/dev/null 2>"${tmp}/guard.err" &&
+      fail "negative '${desc}' rendered successfully — the pipeline guard is missing"
+    grep -qF "${expect}" "${tmp}/guard.err" ||
+      fail "negative '${desc}' was rejected, but NOT by the intended guard (wanted '${expect}') — got: $(tr '\n' ' ' <"${tmp}/guard.err")"
+    echo "    ${desc} → refused by the pipeline guard ✓"
+  }
+  # A landscape repeated in a LATER step (schema-invisible: cross-step).
+  guard_reject "landscape repeated across two steps" \
+    '.stages += ["pichu"]' \
+    'pipeline landscape "pichu" is declared more than once (step 1 and step 4)'
+  # A landscape repeated INSIDE one parallel set under two different member
+  # shapes — {landscape: pikachu, ...} and "pikachu" are distinct JSON values,
+  # so uniqueItems passes and only the flattening guard can see the collision.
+  guard_reject "landscape repeated inside one parallel set under two member shapes" \
+    '.stages[1] += ["pikachu"]' \
+    'pipeline landscape "pikachu" is declared more than once (step 2 and step 2)'
+  # A soak on the FIRST step, which subscribes direct to the Warehouse and so
+  # has no upstream Stage for requiredSoakTime to measure.
+  guard_reject "soak declared on the first pipeline step" \
+    '.stages[0] = {"landscape":"pichu","soak":"30m"}' \
+    'pipeline step 1 declares soak "30m" on landscape "pichu"'
 
   echo "  controlled DAG negatives visible in the render, and the dag assertions proven non-vacuous ✓"
   ;;
@@ -789,20 +879,39 @@ registry-exclusion)
     registry/fixtures/negative/entei-traffic-true.yaml >/dev/null ||
     fail "the traffic-true negative no longer expresses the violation it exists to encode"
 
-  # a platform.yaml declaring an infrastructure-only landscape must be REJECTED
+  # A platform.yaml declaring an infrastructure-only landscape must be REJECTED
   # by the closed registeredLandscape enum, before any object is rendered.
-  if helm template "${release}" "${chart}" --namespace "${namespace}" \
-    --values "${services}" --values registry/fixtures/negative/platform-declares-entei.yaml >/dev/null 2>&1; then
-    fail "a platform.yaml declaring 'entei' in landscapes:/stages: was RENDERED — the exclusion law is not enforced"
-  fi
+  #
+  # Asserting only a non-zero exit would be VACUOUS: a renamed fixture, a wrong
+  # chart path, an unrelated schema error or a helm crash would all "pass" it.
+  # So the combined stream is captured and required to carry the closed-enum
+  # rejection at BOTH fields the exclusion law is declared in — `landscapes:`
+  # and `stages:`. Anchoring on "value must be one of" rather than on the
+  # literal member list keeps this robust if enum MEMBERSHIP ever changes while
+  # still proving the refusal came from registeredLandscape.
+  reject_infra_platform() {
+    local desc="$1" values="$2" log="${tmp}/${3}.log"
+    helm template "${release}" "${chart}" --namespace "${namespace}" \
+      --values "${services}" --values "${values}" >"${log}" 2>&1 &&
+      fail "${desc}"
+    local field
+    for field in landscapes stages; do
+      grep -Fq "at '/${field}/1': value must be one of" "${log}" ||
+        fail "the ${3} platform negative failed for a reason other than the closed registeredLandscape enum at /${field}/1 — got: $(tr '\n' ' ' <"${log}")"
+    done
+  }
+  reject_infra_platform \
+    "a platform.yaml declaring 'entei' in landscapes:/stages: was RENDERED — the exclusion law is not enforced" \
+    registry/fixtures/negative/platform-declares-entei.yaml \
+    platform-declares-entei
   # ...and so must one naming the SECOND infrastructure-only landscape, proving
   # the rejection is structural rather than a special case for `entei`.
   cp registry/fixtures/negative/platform-declares-entei.yaml "${tmp}/second-infra-platform.yaml"
   yq -i '(.landscapes[] | select(. == "entei")) = "suicune" | (.stages[] | select(. == "entei")) = "suicune"' "${tmp}/second-infra-platform.yaml"
-  if helm template "${release}" "${chart}" --namespace "${namespace}" \
-    --values "${services}" --values "${tmp}/second-infra-platform.yaml" >/dev/null 2>&1; then
-    fail "a platform.yaml declaring the SECOND infrastructure-only landscape rendered — the exclusion is name-keyed, not purpose-keyed"
-  fi
+  reject_infra_platform \
+    "a platform.yaml declaring the SECOND infrastructure-only landscape rendered — the exclusion is name-keyed, not purpose-keyed" \
+    "${tmp}/second-infra-platform.yaml" \
+    second-infra-platform
 
   # canary declares exactly the four workload landscapes, and never entei
   yq -o=json '.landscapes' "${fixture}" | jq -e '. == ["pichu","pikachu","raichu","ampharos"]' >/dev/null ||
