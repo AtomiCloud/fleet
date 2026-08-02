@@ -1182,8 +1182,8 @@ sit-namespace-lifecycle | sit-proof-lifecycle)
     fail 'Namespace preparation no longer installs the pinned Git smart-HTTP backend package'
   rg -qF 'namespace_git_http_backend_record' "${sit_source}" ||
     fail 'Namespace platform evidence no longer records the Git smart-HTTP backend owner'
-  rg -qF 'expected_prefix="${path} is owned by ${NSC_GIT_HTTP_BACKEND_PACKAGE}-"' "${sit_source}" ||
-    fail 'Git smart-HTTP backend evidence no longer binds exact APK ownership'
+  rg -qF 'expected_prefix="${canonical} is owned by ${package}-"' "${sit_source}" ||
+    fail 'APK-owned tool evidence no longer binds canonical path to exact package family'
   nsl_git_backend_prepare="${tmp}/namespace-git-backend-prepare.sh"
   sed -n '/^namespace_prepare_tools() {$/,/^}$/p' "${sit_source}" >"${nsl_git_backend_prepare}"
   [ "$(tail -n 1 "${nsl_git_backend_prepare}")" = '}' ] ||
@@ -1198,42 +1198,6 @@ sit-namespace-lifecycle | sit-proof-lifecycle)
     [ "${nsl_git_backend_install_line}" -lt "${nsl_git_backend_apk_line}" ] ||
     fail 'the Git smart-HTTP backend probe/install sequence no longer precedes APK installation'
   echo '    Wolfi Git smart-HTTP backend: executable probe installs pinned git-daemon and records exact APK ownership ✓'
-  # Attempt 3 passed the Git backend split and then reached an inner checksum
-  # verification still written for GNU coreutils. The whole fleet-sit worker
-  # executes on Wolfi's BusyBox userland, so every verification call must use
-  # its supported short `-c` spelling. Count the full reviewed set, reproduce
-  # the option asymmetry, and ensure a one-site reversion mutant is refused.
-  nsl_inner_checksums_are_busybox_portable() {
-    local source="$1"
-    [ "$(rg -c '^[[:space:]]+sha256sum -c([[:space:]]|$)' "${source}")" -eq 4 ] &&
-      ! rg -q '^[[:space:]]+sha256sum --check([[:space:]]|$)' "${source}"
-  }
-  nsl_inner_checksums_are_busybox_portable "${sit_source}" ||
-    fail 'the four on-instance checksum verification sites are not BusyBox-portable'
-  nsl_checksum_fixture="${tmp}/inner-checksum-fixture"
-  printf 'fleet-g15-inner-checksum\n' >"${nsl_checksum_fixture}"
-  nsl_checksum_digest="$(busybox sha256sum "${nsl_checksum_fixture}" | awk '{print $1}')"
-  printf '%s  %s\n' "${nsl_checksum_digest}" "${nsl_checksum_fixture}" |
-    busybox sha256sum -c >/dev/null ||
-    fail 'the BusyBox inner-checksum success fixture rejected the reviewed -c spelling'
-  if printf '%s  %s\n' "${nsl_checksum_digest}" "${nsl_checksum_fixture}" |
-    busybox sha256sum --check >/dev/null 2>&1; then
-    fail 'the BusyBox inner-checksum regression fixture unexpectedly accepted --check'
-  fi
-  nsl_inner_checksum_mutant="${tmp}/fleet-sit-inner-checksum-mutant.sh"
-  awk '
-    !mutated && /^[[:space:]]+sha256sum -c([[:space:]]|$)/ {
-      sub(/sha256sum -c/, "sha256sum --check")
-      mutated = 1
-    }
-    { print }
-    END { if (!mutated) exit 1 }
-  ' "${sit_source}" >"${nsl_inner_checksum_mutant}" ||
-    fail 'the inner-checksum reversion mutant changed no production site'
-  if nsl_inner_checksums_are_busybox_portable "${nsl_inner_checksum_mutant}"; then
-    fail 'the inner-checksum portability gate accepted a GNU-only one-site mutant'
-  fi
-  echo '    inner checksum verification: all four sites use BusyBox -c; live --check failure reproduced; one-site mutant refused ✓'
   # The first live g15 run reached L0 and exposed a Wolfi/BusyBox portability
   # defect: GNU sed's `0,/pattern/` address is not accepted by the substrate's
   # sed applet. Exercise the exact shipped helper, then prove the structural
@@ -1544,29 +1508,42 @@ sit-namespace-lifecycle | sit-proof-lifecycle)
   rg -qF 'NSC_LIST_TIMEOUT_SECONDS + NSC_LIST_KILL_AFTER_SECONDS' "${nsl_bounds_body}" ||
     fail 'the wrapper worst case no longer charges the bounded liveness proofs'
   echo '    SESSION-HANG lane source law: four bounded stdin-closed ssh sites, tri-state liveness, three distinct reserved terminals, deferred receipt, 3 x 95 = 285 <= 300 ✓'
-  # The remote programs execute against BusyBox v1.37.0 on the instance, whose
-  # sha256sum applet accepts only `-c`. The generation-11 live run
-  # fleet-g11-live-6ae04f0-20260801T082535Z reached the final checksum with
-  # correct command packing and then died at snapshot-setup on
-  # `sha256sum: unrecognized option '--check'`. That run retains the BusyBox
-  # version and its `-c`-only usage banner; it never reached inner platform
-  # evidence, so the distribution behind that userland is design intent here,
-  # not an independently proven fact. Pin the portable spelling on the remote
-  # setup program and refuse the GNU-only one there. Scoped to that one
-  # production line on purpose: this validator's own checksum calls run on the
-  # CI host's GNU coreutils and are deliberately left alone.
+  # Stock Wolfi exposes every core utility through BusyBox. The ratified guest
+  # bootstrap installs the measured GNU package set as the FIRST setup action,
+  # before extracting or running any climb script. Tar is the explicit
+  # exception: Wolfi has no GNU tar package, so its BusyBox-compatible short
+  # options remain mandatory.
+  rg -qF "NSC_GNU_BOOTSTRAP_PACKAGES='coreutils findutils sed grep gawk'" "${pins_source}" ||
+    fail 'the exact measured GNU guest-bootstrap package set is not pinned'
+  rg -qF '[ "${NSC_GNU_BOOTSTRAP_PACKAGES}" = '\''coreutils findutils sed grep gawk'\'' ] ||' \
+    "${proof_source}" ||
+    fail 'the outer wrapper does not fail closed on a drifted GNU bootstrap pin'
+  rg -qF 'namespace_apk_owned_tool_receipt "${gnu_path}" "${gnu_package}"' "${sit_source}" ||
+    fail 'the inner preflight no longer proves GNU command ownership before the climb'
+  # shellcheck disable=SC2016 # source-code literals intentionally retain $().
+  for nsl_gnu_owner in \
+    'awk "$(command -v awk)" gawk' \
+    'find "$(command -v find)" findutils' \
+    'grep "$(command -v grep)" grep' \
+    'sed "$(command -v sed)" sed' \
+    'sha256sum "$(command -v sha256sum)" coreutils' \
+    'timeout "$(command -v timeout)" coreutils'; do
+    rg -qF "namespace_apk_owned_tool_record ${nsl_gnu_owner}" "${sit_source}" ||
+      fail "Namespace platform evidence no longer records GNU ownership: ${nsl_gnu_owner}"
+  done
   mapfile -t nsl_setup_program_lines < <(rg -N '^  setup_command=' "${proof_source}")
   [ "${#nsl_setup_program_lines[@]}" -eq 1 ] ||
     fail 'the production wrapper must define exactly one remote setup program'
   nsl_setup_program_line="${nsl_setup_program_lines[0]}"
+  # shellcheck disable=SC2016 # match the literal guest-side variable reference.
   case "${nsl_setup_program_line}" in
-  *'sha256sum --check'*)
-    fail 'the remote setup program reintroduced the GNU-only sha256sum --check that remote BusyBox v1.37.0 rejects'
+  '  setup_command="apk add --no-cache ${NSC_GNU_BOOTSTRAP_PACKAGES} && '*)
     ;;
+  *) fail 'the GNU toolchain install is not the first remote setup action' ;;
   esac
   case "${nsl_setup_program_line}" in
-  *'| sha256sum -c"') ;;
-  *) fail 'the remote setup program does not end in the portable BusyBox sha256sum -c form' ;;
+  *'| sha256sum --check"') ;;
+  *) fail 'the remote setup checksum does not prove GNU coreutils was installed first' ;;
   esac
   # The remote extraction must decline restored ownership, using BusyBox's
   # documented short flag. `tar -o -xzf` does not contain the substring
@@ -1596,7 +1573,7 @@ sit-namespace-lifecycle | sit-proof-lifecycle)
   # The predicate must precede the checksum, or the packed program stops ending
   # in the trailing token every other pin and the fake client rely on.
   case "${nsl_setup_program_line}" in
-  *'rev-parse --git-dir'*'| sha256sum -c"') ;;
+  *'rev-parse --git-dir'*'| sha256sum --check"') ;;
   *) fail 'the remote git predicate must run before the trailing checksum' ;;
   esac
   # R1: the wrapper must keep git's own diagnosis rather than discard it.
@@ -2640,6 +2617,7 @@ find) stub find "${FLEET_SOURCE}/platforms/canary/landscapes" quiet ;;
 jq) stub jq '.[] | select(.landscape == $landscape) | .name' quiet ;;
 sed-inventory | sed-inventory-match) stub sed '1d' "$([ "${category}" = 'sed-inventory-match' ] && echo real || echo quiet)" ;;
 sed-transcript) stub sed -n quiet ;;
+awk-transcript) stub awk -v quiet ;;
 git-ls-tree) stub git ls-tree real ;;
 esac
 PATH="${work}/stub:${PATH}"
@@ -2665,6 +2643,11 @@ sed-inventory-match)
   ;;
 sed-transcript)
   printf 'unpacking img:tag (sha256:%064d)...done\n' 1 >"${work}/transcript.txt"
+  kargo_runtime_assert_import_transcript "${work}/transcript.txt" 'img:tag' "sha256:$(printf '%064d' 1)"
+  ;;
+awk-transcript)
+  printf 'img:tag\t\tsaved\napplication/vnd.oci.image.index.v1+json sha256:%064d\n' \
+    1 >"${work}/transcript.txt"
   kargo_runtime_assert_import_transcript "${work}/transcript.txt" 'img:tag' "sha256:$(printf '%064d' 1)"
   ;;
 git-ls-tree)
@@ -2721,6 +2704,8 @@ NSL_CAT_DRIVER
   nsl_cat_check sed-inventory 'could not read the platform containerd image inventory' \
     'platform containerd does not bind'
   nsl_cat_check sed-transcript 'could not extract unpack markers from the import transcript' \
+    'does not bind'
+  nsl_cat_check awk-transcript 'could not extract saved markers from the import transcript' \
     'does not bind'
   nsl_cat_check git-ls-tree 'could not enumerate the direct-input roots'
 
@@ -3582,17 +3567,20 @@ ssh)
     # the retained live failure instead of inventing a shim-only refusal. The
     # only lossy shape the wrapper has ever produced is `sh <flags> -c <program>`:
     # after the join the remote shell hands `sh` just the first word of the
-    # program as its -c operand. Both wrapper programs begin with `test`, which
-    # exits 1 with no operands and short-circuits the rest of the && chain, and
-    # nsc renders that as its generic remote status report.
+    # program as its -c operand. The setup program now begins with `apk` and the
+    # archive program with `test`; both exit 1 with no operands, and nsc renders
+    # that as its generic remote status report.
     case "${remote_command}" in
     'sh '*' -c '*)
       remote_operand="${remote_command#*' -c '}"
       remote_operand="${remote_operand%%' '*}"
-      [ "${remote_operand}" = 'test' ] || {
+      case "${remote_operand}" in
+      test | apk) ;;
+      *)
         echo "shim: unmodeled joined sh -c operand: ${remote_operand}" >&2
         exit 75
-      }
+        ;;
+      esac
       printf '\n========================================\n' >&2
       printf 'Failed: Process exited with status 1\n' >&2
       printf '========================================\n\n' >&2
@@ -3604,16 +3592,17 @@ ssh)
       ;;
     esac
   fi
-  # The instance answers as BusyBox v1.37.0, whose sha256sum applet takes
-  # only `-c`. Model that refusal on the joined command string, before any
-  # dispatch, so no remote program can be blessed here with a GNU-only spelling
-  # the real instance rejects. The decisive lines reproduce the retained stderr
+  # The stock instance answers as BusyBox v1.37.0 until the setup command's
+  # leading package install replaces sha256sum with GNU coreutils. Model the
+  # retained refusal only when that bootstrap is absent. The decisive lines
+  # reproduce the retained stderr
   # of fleet-g11-live-6ae04f0-20260801T082535Z: the applet refusal, the version
   # and usage banner, and nsc's generic remote status block. nsc's trailing
   # docs footer is deliberately not reproduced — it is client boilerplate, not
   # part of the failure signature — so this is not full-byte equality, and the
   # command-packing model above omits it for the same reason.
   case "${remote_command}" in
+  *'apk add --no-cache coreutils findutils sed grep gawk'*'sha256sum --check'*) ;;
   *'sha256sum --check'*)
     printf "sha256sum: unrecognized option '--check'\n" >&2
     printf 'BusyBox v1.37.0 (2026-05-22 13:39:12 UTC) multi-call binary.\n\n' >&2
@@ -3666,11 +3655,10 @@ ssh)
     fi
     printf '%s\n' "${id}"
     ;;
-  *source.tgz*'| sha256sum -c')
-    # Only the modeled portable spelling reaches the happy path. The GNU
-    # `--check` form is intercepted above with the exact live BusyBox stderr,
-    # and every other checksum spelling falls through to the unmodeled branch
-    # and fails closed rather than being blessed by a broad match.
+  *'apk add --no-cache coreutils findutils sed grep gawk'*source.tgz*'| sha256sum --check')
+    # Only the exact GNU-first bootstrap reaches the happy path. A missing
+    # bootstrap falls into the BusyBox refusal above, and every other checksum
+    # spelling falls through to the unmodeled branch and fails closed.
     #
     # The setup program holds spaces and quotes, so the wrapper must pack it as
     # exactly one remote argument for the join to preserve its bytes.
@@ -4668,25 +4656,21 @@ NSL_SCHEMA_CASES
     mutation-ssh-packing-archive remote-report-collection remote-report-archive.stderr
   nsl_restore_list_proof
 
-  # Regression for the generation-11 BusyBox failure. With command packing
-  # already correct, the remote setup program reached its final checksum and
-  # remote BusyBox v1.37.0 refused the GNU long option. Restore exactly that
-  # spelling and require the same stage, the same refusal signature, and a
-  # completed exact-id destroy and strict absence proof.
-  #
-  # Both spellings are derived from the reviewed production line captured by the
-  # structural pin above rather than transcribed here, so the mutation cannot
-  # silently stop matching if unrelated bytes of that line ever change, and the
-  # `exact_call` is by construction the line the wrapper really ships. On the
-  # live-broken baseline that exact line does not exist, so the installer finds
-  # nothing to replace and this case cannot pass there.
-  nsl_setup_program_prefix="${nsl_setup_program_line%'| sha256sum -c"'}"
+  # The GNU bootstrap is load-bearing. Remove only its leading install from the
+  # reviewed setup line: the unchanged --check then reaches stock BusyBox and
+  # reproduces the generation-11 refusal at snapshot-setup, with cleanup and
+  # exact absence still complete.
+  # shellcheck disable=SC2016 # remove the literal guest-side variable reference.
+  nsl_gnu_setup_prefix='apk add --no-cache ${NSC_GNU_BOOTSTRAP_PACKAGES} && '
+  nsl_setup_without_gnu="${nsl_setup_program_line/"${nsl_gnu_setup_prefix}"/}"
+  [ "${nsl_setup_without_gnu}" != "${nsl_setup_program_line}" ] ||
+    fail 'could not derive the missing-GNU-bootstrap mutant from the setup program'
   nsl_install_exact_line_mutant \
-    checksum-setup \
-    "${nsl_setup_program_prefix}"'| sha256sum -c"' \
-    "${nsl_setup_program_prefix}"'| sha256sum --check"'
-  nsl_run mutation-setup-gnu-checksum fail
-  nsl_assert_busybox_checksum_refusal mutation-setup-gnu-checksum
+    gnu-bootstrap-setup \
+    "${nsl_setup_program_line}" \
+    "${nsl_setup_without_gnu}"
+  nsl_run mutation-setup-missing-gnu-bootstrap fail
+  nsl_assert_busybox_checksum_refusal mutation-setup-missing-gnu-bootstrap
   nsl_restore_list_proof
 
   # Regression for the generation-11 inner failure at product 1ce87ae. Restoring
@@ -6537,9 +6521,9 @@ shim_ctr() {
     printf 'ctr: content digest %s: not found\n' "${missing}" >&2
     return 1
   fi
-  # containerd 1.7 ctr prints one line per image binding the stored name to the
-  # archive root descriptor — here the pinned index digest.
-  printf 'unpacking %s (%s)...done\n' "${ref}" "${digest}"
+  # Current Wolfi ctr prints an adjacent saved-name / root-descriptor pair.
+  printf '%s\t\tsaved\n' "${ref}"
+  printf 'application/vnd.docker.distribution.manifest.list.v2+json %s\n' "${digest}"
   printf '%s\t%s\n' "${ref}" "${digest}" >>"${node_state}"
 }
 
@@ -6874,8 +6858,8 @@ NIIBASE
     fail "R1 the fixed node-image path: ${nii_kargo_tag} is not bound to the pinned digest in the node model"
   grep -qxF "${nii_kargo_alias}"$'\t'"${KARGO_IMAGE_DIGEST}" "${tmp}/r1/node-images.tsv" ||
     fail "R1 the fixed node-image path: ${nii_kargo_alias} is not bound to the pinned digest in the node model"
-  grep -q '^unpacking ' "${tmp}/r1/report/kargo-runtime-image-imports.txt" ||
-    fail 'R1 the fixed node-image path: the retained transcript carries no ctr unpack marker'
+  grep -q '[[:space:]]saved$' "${tmp}/r1/report/kargo-runtime-image-imports.txt" ||
+    fail 'R1 the fixed node-image path: the retained transcript carries no ctr saved marker'
   grep -qF "== alias ${nii_kargo_tag} -> ${nii_kargo_alias}" \
     "${tmp}/r1/report/kargo-runtime-image-aliases.txt" ||
     fail 'R1 the fixed node-image path: the retained alias transcript does not record the alias it created'
@@ -6929,8 +6913,9 @@ NIIBASE
   nii_expect 'R4d tag bound to other content' 1 'does not bind' r4d
   echo "  R4 the node verifier rejects absence and a tag carrying other content, and accepts only tag+pin ✓"
 
-  # R5 — the positive marker must bind the PIN, not merely say 'done'. A
-  # success-shaped transcript whose unpack digest is other content is red.
+  # R5 — either positive marker must bind the PIN, not merely say `done` or
+  # `saved`. Success-shaped legacy and current-Wolfi transcripts whose root
+  # digest is other content are both red.
   {
     printf '== import %s (%s)\n' "${nii_kargo_tag}" "${KARGO_IMAGE_DIGEST}"
     printf 'unpacking %s (%s)...done\n' "${nii_kargo_tag}" "${nii_other}"
@@ -6939,9 +6924,19 @@ NIIBASE
     printf '== import %s (%s)\n' "${nii_analysis_tag}" "${ANALYSIS_IMAGE_DIGEST}"
     printf 'unpacking %s (%s)...done\n' "${nii_analysis_tag}" "${ANALYSIS_IMAGE_DIGEST}"
   } >"${tmp}/transcript-wrong-pin.txt"
-  nii_case r5 transcript "${nii_fns}" "${tmp}/transcript-wrong-pin.txt"
-  nii_expect 'R5 unpack marker with the wrong digest' 1 'does not bind' r5
-  echo "  R5 an unpack marker that completes on other content is rejected, so acceptance is not 'contains done' ✓"
+  nii_case r5a transcript "${nii_fns}" "${tmp}/transcript-wrong-pin.txt"
+  nii_expect 'R5a unpack marker with the wrong digest' 1 'does not bind' r5a
+  {
+    printf '%s\t\tsaved\napplication/vnd.oci.image.index.v1+json %s\n' \
+      "${nii_kargo_tag}" "${nii_other}"
+    printf '%s\t\tsaved\napplication/vnd.oci.image.index.v1+json %s\n' \
+      "${nii_rollouts_tag}" "${ROLLOUTS_IMAGE_DIGEST}"
+    printf '%s\t\tsaved\napplication/vnd.oci.image.index.v1+json %s\n' \
+      "${nii_analysis_tag}" "${ANALYSIS_IMAGE_DIGEST}"
+  } >"${tmp}/transcript-saved-wrong-pin.txt"
+  nii_case r5b transcript "${nii_fns}" "${tmp}/transcript-saved-wrong-pin.txt"
+  nii_expect 'R5b saved marker with the wrong digest' 1 'does not bind' r5b
+  echo "  R5 legacy unpack and current Wolfi saved markers carrying other content are both rejected ✓"
 
   # P1 — the positive control for the repair itself: unmutated production bytes
   # end with the tag and the pinned digest name on ONE CRI entry per image, and

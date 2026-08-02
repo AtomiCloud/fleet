@@ -165,6 +165,8 @@ validate_inputs() {
   [ "${NSC_BUSYBOX_PACKAGE}" = 'busybox' ] &&
     [ "${NSC_BUSYBOX_CANONICAL}" = '/usr/bin/busybox' ] ||
     sit_fail 'Namespace BusyBox package and canonical-path pins changed'
+  [ "${NSC_GNU_BOOTSTRAP_PACKAGES}" = 'coreutils findutils sed grep gawk' ] ||
+    sit_fail 'Namespace GNU bootstrap package pin changed'
   [ "${NSC_GIT_HTTP_BACKEND_PACKAGE}" = 'git-daemon' ] &&
     [ "${NSC_GIT_HTTP_BACKEND_CANONICAL}" = '/usr/libexec/git-core/git-http-backend' ] ||
     sit_fail 'Namespace Git smart-HTTP backend package and canonical-path pins changed'
@@ -212,12 +214,43 @@ namespace_prepare_tools() {
     sit_fail "Namespace instance OS must be ${NSC_INSTANCE_OS_ID}, found ${os_id:-unknown}"
 
   local bootstrap
-  for bootstrap in apk awk bash busybox curl docker git gzip head jq kubectl mkfifo nproc sed sha256sum tar tee timeout tr; do
+  for bootstrap in apk awk bash busybox curl docker git gzip head jq kubectl mkfifo nproc sed sha256sum tar tee timeout tr grep readlink; do
     sit_require_command "${bootstrap}"
   done
   [ -x "${NSC_CONTAINERD_CTR}" ] ||
     sit_fail "platform containerd client is missing: ${NSC_CONTAINERD_CTR}"
   sit_require_command k3s
+
+  # The outer snapshot-setup command must install this exact GNU toolchain
+  # before the climb worker starts. Prove every reviewed command is already
+  # owned by its expected package family; never repair a missing bootstrap
+  # here, where a partial climb would already be running.
+  local -a gnu_packages=()
+  read -r -a gnu_packages <<<"${NSC_GNU_BOOTSTRAP_PACKAGES}"
+  [ "${#gnu_packages[@]}" -eq 5 ] ||
+    sit_fail 'Namespace GNU bootstrap package list has unexpected cardinality'
+  local gnu_entry gnu_command gnu_package gnu_path
+  for gnu_entry in \
+    'sed sed' \
+    'grep grep' \
+    'awk gawk' \
+    'sha256sum coreutils' \
+    'find findutils' \
+    'date coreutils' \
+    'stat coreutils' \
+    'xargs findutils' \
+    'cut coreutils' \
+    'sort coreutils' \
+    'head coreutils' \
+    'timeout coreutils'; do
+    gnu_command="${gnu_entry%% *}"
+    gnu_package="${gnu_entry##* }"
+    gnu_path="$(command -v "${gnu_command}" 2>/dev/null || true)"
+    namespace_apk_owned_tool_receipt "${gnu_path}" "${gnu_package}" >/dev/null ||
+      sit_fail "Namespace GNU bootstrap ownership failed: ${gnu_command} -> ${gnu_package}"
+  done
+  namespace_installed_packages="$(printf '%s\n' "${gnu_packages[@]}" |
+    jq -Rsc 'split("\n")[:-1]')"
 
   local -a packages=()
   local entry command package
@@ -236,9 +269,11 @@ namespace_prepare_tools() {
     packages+=("${NSC_GIT_HTTP_BACKEND_PACKAGE}")
   if [ "${#packages[@]}" -gt 0 ]; then
     apk add --no-cache "${packages[@]}"
-    namespace_installed_packages="$(printf '%s\n' "${packages[@]}" | jq -Rsc 'split("\n")[:-1]')"
-  else
-    namespace_installed_packages='[]'
+    local prepared_packages
+    prepared_packages="$(printf '%s\n' "${packages[@]}" | jq -Rsc 'split("\n")[:-1]')"
+    namespace_installed_packages="$(jq -cn \
+      --argjson bootstrap "${namespace_installed_packages}" \
+      --argjson prepared "${prepared_packages}" '$bootstrap + $prepared')"
   fi
   [ -x "${NSC_GIT_HTTP_BACKEND_CANONICAL}" ] ||
     sit_fail "Git smart-HTTP backend is missing after tool preparation: ${NSC_GIT_HTTP_BACKEND_CANONICAL}"
@@ -283,23 +318,38 @@ namespace_tool_command_record() {
   namespace_tool_record "${name}" "${path}" "${version}"
 }
 
-namespace_git_http_backend_record() {
-  local path="${NSC_GIT_HTTP_BACKEND_CANONICAL}" owner expected_prefix
+namespace_apk_owned_tool_receipt() {
+  local path="$1" package="$2" canonical owner expected_prefix
   [ -x "${path}" ] || {
-    sit_fail "Git smart-HTTP backend pin is not an executable: ${path}"
+    sit_fail "APK-owned tool path is not executable: ${path:-<missing>}"
     return 1
   }
-  owner="$(namespace_first_line_receipt apk info --who-owns "${path}")" || return 1
-  expected_prefix="${path} is owned by ${NSC_GIT_HTTP_BACKEND_PACKAGE}-"
+  canonical="$(readlink -f -- "${path}")" || {
+    sit_fail "APK-owned tool path cannot be canonicalized: ${path}"
+    return 1
+  }
+  owner="$(namespace_first_line_receipt apk info --who-owns "${canonical}")" || return 1
+  expected_prefix="${canonical} is owned by ${package}-"
   [[ ${owner} == "${expected_prefix}"* ]] || {
-    sit_fail "Git smart-HTTP backend has unexpected package ownership: ${owner}"
+    sit_fail "tool has unexpected APK ownership (${path} -> ${package}): ${owner}"
     return 1
   }
-  namespace_tool_record git-http-backend "${path}" "${owner}"
+  printf '%s\n' "${owner}"
 }
 
-# BusyBox applets such as gzip, sha256sum, tar and timeout are materialised by
-# the busybox package trigger rather than listed in its file manifest. Bind the
+namespace_apk_owned_tool_record() {
+  local name="$1" path="$2" package="$3" owner
+  owner="$(namespace_apk_owned_tool_receipt "${path}" "${package}")" || return 1
+  namespace_tool_record "${name}" "${path}" "${owner}"
+}
+
+namespace_git_http_backend_record() {
+  namespace_apk_owned_tool_record git-http-backend \
+    "${NSC_GIT_HTTP_BACKEND_CANONICAL}" "${NSC_GIT_HTTP_BACKEND_PACKAGE}"
+}
+
+# BusyBox applets such as gzip and tar are materialised by the busybox package
+# trigger rather than listed in its file manifest. Bind the
 # PATH BusyBox and each applet to the reviewed canonical binary by device and
 # inode, then ask apk for that canonical path's exact package attribution.
 # Symlinked and hardlinked applets pass; unrelated files, byte-identical copies,
@@ -425,14 +475,20 @@ namespace_capture_platform() {
   apk_version="$(namespace_first_line_receipt apk --version)" || return 1
   printf 'Namespace apk version: %s\n' "${apk_version}"
   namespace_tool_record apk "${apk_path}" "${apk_version}"
+  namespace_apk_owned_tool_record awk "$(command -v awk)" gawk
   namespace_tool_command_record bash "$(command -v bash)" bash --version
   namespace_tool_command_record bun "$(command -v bun)" bun --version
+  namespace_apk_owned_tool_record cut "$(command -v cut)" coreutils
   namespace_tool_command_record curl "$(command -v curl)" curl --version
+  namespace_apk_owned_tool_record date "$(command -v date)" coreutils
   namespace_tool_command_record docker "$(command -v docker)" docker --version
+  namespace_apk_owned_tool_record find "$(command -v find)" findutils
   namespace_tool_command_record git "$(command -v git)" git --version
   namespace_git_http_backend_record
+  namespace_apk_owned_tool_record grep "$(command -v grep)" grep
   namespace_tool_command_record go "$(command -v go)" go version
   namespace_tool_command_record helm "$(command -v helm)" helm version --short
+  namespace_apk_owned_tool_record head "$(command -v head)" coreutils
   namespace_tool_command_record jq "$(command -v jq)" jq --version
   namespace_tool_command_record k3s "$(command -v k3s)" k3s --version
   namespace_tool_command_record crictl "$(command -v k3s) crictl" k3s crictl --version
@@ -444,10 +500,14 @@ namespace_capture_platform() {
   namespace_tool_record kubectl "$(command -v kubectl)" "${kubectl_version}"
   namespace_tool_command_record openssl "$(command -v openssl)" openssl version
   namespace_tool_command_record rg "$(command -v rg)" rg --version
+  namespace_apk_owned_tool_record sed "$(command -v sed)" sed
+  namespace_apk_owned_tool_record sort "$(command -v sort)" coreutils
+  namespace_apk_owned_tool_record stat "$(command -v stat)" coreutils
   namespace_wolfi_tool_record gzip "$(command -v gzip)"
-  namespace_wolfi_tool_record sha256sum "$(command -v sha256sum)"
+  namespace_apk_owned_tool_record sha256sum "$(command -v sha256sum)" coreutils
   namespace_wolfi_tool_record tar "$(command -v tar)"
-  namespace_wolfi_tool_record timeout "$(command -v timeout)"
+  namespace_apk_owned_tool_record timeout "$(command -v timeout)" coreutils
+  namespace_apk_owned_tool_record xargs "$(command -v xargs)" findutils
   namespace_tool_command_record yq "$(command -v yq)" yq --version
   ctr_version="$("${NSC_CONTAINERD_CTR}" --address "${NSC_CONTAINERD_ADDRESS}" version 2>&1)" || {
     sit_fail 'platform containerd version receipt failed'
@@ -1771,7 +1831,7 @@ fetch_kargo_crds() {
       "${KARGO_CRD_BASE_URL}/${file}" --output "${KARGO_CRD_DIR}/${file}"
     printf '%s  %s\n' "${digest}" "${KARGO_CRD_DIR}/${file}" >>"${work}/kargo-crds.sha256"
   done
-  sha256sum -c "${work}/kargo-crds.sha256" | tee "${report}/kargo-crds-verified.txt"
+  sha256sum --check "${work}/kargo-crds.sha256" | tee "${report}/kargo-crds-verified.txt"
 }
 
 kargo_negative_rejected() {
@@ -2034,16 +2094,31 @@ kargo_runtime_assert_import_transcript() {
     sit_fail "the node image import transcript carries an error marker: ${transcript}"
   fi
   # Second: absence of errors is not presence of imports. Each image must carry
-  # ctr's positive unpack marker binding its canonical tag to the PINNED
-  # digest, so an empty, truncated, or silently short transcript is red too.
+  # a positive ctr marker binding its canonical tag to the PINNED digest, so an
+  # empty, truncated, or silently short transcript is red too. Containerd 1.7
+  # prints a one-line `unpacking TAG (DIGEST)...done` marker. The current Wolfi
+  # ctr prints an adjacent `TAG saved` line followed by `MEDIA-TYPE DIGEST`.
+  # Accept both exact shapes, but never infer a binding across intervening
+  # output or from the harness's own `== import` marker.
   local expected_tag digest ref actual_digest bound
   # No process substitution on an instance-executed path. Extract once, with the
   # producer status-checked, so a failed sed cannot read as "no unpack markers"
   # and be blamed on the transcript.
-  local unpack_pairs="${transcript}.unpack-pairs.$$"
+  local import_pairs="${transcript}.import-pairs.$$"
   sed -n 's/^unpacking \(.*\) (\(sha256:[0-9a-f]\{64\}\))\.*done.*$/\1 \2/p' \
-    "${transcript}" >"${unpack_pairs}" ||
+    "${transcript}" >"${import_pairs}" ||
     sit_fail "could not extract unpack markers from the import transcript: ${transcript}"
+  awk -v fleet_import_pairs=1 '
+    BEGIN { if (fleet_import_pairs != 1) exit 2 }
+    NF == 2 && $2 == "saved" { saved = $1; next }
+    saved != "" {
+      if (NF == 2 && $1 ~ /^application\// && $2 ~ /^sha256:[0-9a-f]+$/) {
+        print saved, $2
+      }
+      saved = ""
+    }
+  ' "${transcript}" >>"${import_pairs}" ||
+    sit_fail "could not extract saved markers from the import transcript: ${transcript}"
   while [ "$#" -ge 2 ]; do
     expected_tag="$(kargo_runtime_canonical_image_tag "$1")"
     digest="$2"
@@ -2056,11 +2131,11 @@ kargo_runtime_assert_import_transcript() {
         bound=1
         break
       fi
-    done <"${unpack_pairs}"
+    done <"${import_pairs}"
     [ "${bound}" -eq 1 ] ||
       sit_fail "the node import transcript does not bind ${expected_tag} to pinned digest ${digest}"
   done
-  rm -f "${unpack_pairs}"
+  rm -f "${import_pairs}"
   [ "$#" -eq 0 ] ||
     sit_fail 'kargo_runtime_assert_import_transcript takes <tag> <digest> pairs'
 }
@@ -2318,7 +2393,7 @@ kargo_runtime_prepare_artifacts() {
   [ -s "${chart_archive}" ] || sit_fail 'the pinned Kargo chart archive was not downloaded'
   printf '%s  %s\n' "${KARGO_CHART_ARCHIVE_SHA256}" "${chart_archive}" \
     >"${KARGO_RUNTIME_DIR}/kargo-chart.sha256"
-  sha256sum -c "${KARGO_RUNTIME_DIR}/kargo-chart.sha256" \
+  sha256sum --check "${KARGO_RUNTIME_DIR}/kargo-chart.sha256" \
     >"${report}/kargo-runtime-chart-sha256.txt"
   tar -xzf "${chart_archive}" -C "${KARGO_RUNTIME_DIR}/chart"
   helm show chart "${chart_archive}" >"${report}/kargo-runtime-chart-metadata.yaml"
@@ -2331,7 +2406,7 @@ kargo_runtime_prepare_artifacts() {
   printf '%s  %s\n' "${ROLLOUTS_MANIFEST_SHA256}" \
     "${KARGO_RUNTIME_DIR}/argo-rollouts-install.source.yaml" \
     >"${KARGO_RUNTIME_DIR}/argo-rollouts.sha256"
-  sha256sum -c "${KARGO_RUNTIME_DIR}/argo-rollouts.sha256" \
+  sha256sum --check "${KARGO_RUNTIME_DIR}/argo-rollouts.sha256" \
     >"${report}/kargo-runtime-rollouts-sha256.txt"
 
   local kargo_digest_ref="${KARGO_IMAGE_REPOSITORY}@${KARGO_IMAGE_DIGEST}"
@@ -5540,7 +5615,7 @@ run_full() {
   curl --fail --location --retry 3 --connect-timeout 15 --max-time 180 \
     "${ARGOCD_MANIFEST_URL}" --output "${work}/argocd-install.yaml"
   printf '%s  %s\n' "${ARGOCD_MANIFEST_SHA256}" "${work}/argocd-install.yaml" |
-    sha256sum -c | tee "${report}/pins-verified.txt"
+    sha256sum --check | tee "${report}/pins-verified.txt"
   yq eval-all -o=json 'select(.kind == "Service" and .metadata.name == "argocd-applicationset-controller")' \
     "${work}/argocd-install.yaml" |
     jq -e '{applicationSetWebhookPort:.spec.ports[] | select(.name == "webhook") | .port}' \

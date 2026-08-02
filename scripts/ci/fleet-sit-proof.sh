@@ -1240,12 +1240,10 @@ run_outer() {
   # is three arguments; the join leaves the program unquoted and `sh -c` then
   # executes only its first word. Both remote programs below are complete `&&`
   # chains that already fail closed, so pass the command string directly.
-  # The remote program runs against BusyBox v1.37.0 on the instance, whose
-  # sha256sum applet implements only `-c`; the GNU long option `--check` is
-  # rejected outright. Keep the short flag here. Host-side checksum calls in
-  # this wrapper run on GNU coreutils and are unaffected. (The intended image
-  # is the Wolfi userland, but the observed fact is the BusyBox version and its
-  # `-c`-only usage banner.)
+  # Stock Wolfi exposes its core utilities through BusyBox. Install the pinned
+  # GNU toolchain as the FIRST remote setup action, before extracting or
+  # invoking any climb script. `tar` deliberately remains BusyBox: Wolfi has no
+  # GNU tar package, so its short ownership-neutral extraction form stays.
   #
   # `tar -o` is BusyBox's documented "don't restore user:group" and GNU tar's
   # extract-mode --no-same-owner; the GNU long spellings are absent from
@@ -1259,10 +1257,10 @@ run_outer() {
   # with no diagnosis. Prove the tree is a usable checkout here, at the stage
   # that owns the transfer, where the refusal lands in retained setup stderr.
   # The predicate sits before the checksum so the program still ends in
-  # `| sha256sum -c`, and the whole program is still one argument after `--`.
+  # `| sha256sum --check`, and the whole program is still one argument after `--`.
   failure_stage='snapshot-setup'
   local setup_command
-  setup_command="test ! -e '${remote_root}/source' && mkdir -p '${remote_root}/result' && tar -o -xzf '${remote_archive}' -C '${remote_root}' && git -C '${remote_root}/source' rev-parse --git-dir >/dev/null && printf '%s  %s\\n' '${transfer_sha}' '${remote_archive}' | sha256sum -c"
+  setup_command="apk add --no-cache ${NSC_GNU_BOOTSTRAP_PACKAGES} && test ! -e '${remote_root}/source' && mkdir -p '${remote_root}/result' && tar -o -xzf '${remote_archive}' -C '${remote_root}' && git -C '${remote_root}/source' rev-parse --git-dir >/dev/null && printf '%s  %s\\n' '${transfer_sha}' '${remote_archive}' | sha256sum --check"
   setup_started_epoch="$(date +%s)"
   local setup_status=0
   timeout --verbose --signal=TERM \
@@ -1344,6 +1342,8 @@ run_outer() {
 for command in bash git jq sha256sum; do
   require_command "${command}"
 done
+[ "${NSC_GNU_BOOTSTRAP_PACKAGES}" = 'coreutils findutils sed grep gawk' ] ||
+  fail 'Namespace GNU bootstrap package pin changed'
 
 # Reserve the evidence directory and accept a syntactically exact pre-created
 # id before source or nsc-version preflight. From this point the wrapper owns
