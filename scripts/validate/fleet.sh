@@ -2401,12 +2401,17 @@ NSL_PROBE_DRIVER
   # rather than skip.
   git -C "${nsl_probe_repo}" rev-parse --git-dir >/dev/null 2>&1 ||
     fail 'the checkout probe fixture is not a usable repository'
-  if env GIT_TEST_ASSUME_DIFFERENT_OWNER=1 \
+  nsl_probe_foreign_owner_env=(
+    GIT_CONFIG_GLOBAL=/dev/null
+    GIT_CONFIG_NOSYSTEM=1
+    GIT_TEST_ASSUME_DIFFERENT_OWNER=1
+  )
+  if env "${nsl_probe_foreign_owner_env[@]}" \
     git -C "${nsl_probe_repo}" rev-parse --git-dir >/dev/null 2>&1; then
     fail 'GIT_TEST_ASSUME_DIFFERENT_OWNER no longer forces the ownership refusal, so the diagnostic regression would be vacuous'
   fi
 
-  nsl_probe_run foreign-owner "${nsl_probe_repo}" GIT_TEST_ASSUME_DIFFERENT_OWNER=1
+  nsl_probe_run foreign-owner "${nsl_probe_repo}" "${nsl_probe_foreign_owner_env[@]}"
   [ "${nsl_probe_status}" -ne 0 ] ||
     fail 'the production checkout preflight accepted a checkout git refuses to own'
   grep -qF 'not a git checkout' "${tmp}/checkout-probe-foreign-owner.err" ||
