@@ -118,6 +118,20 @@ recovered_id_surface=''
 destroy_attempts=0
 destroy_succeeded=0
 absence_proven=0
+session_hang_entered=0
+session_hang_reinvocations=0
+session_hang_liveness_proofs=0
+session_hang_lane_started_epoch=0
+session_hang_lane_finished_epoch=0
+session_hang_deadline_epoch=0
+session_hang_worst_case_seconds=$((NSC_SESSION_HANG_MAX_REINVOCATIONS * ((\
+  NSC_LIST_TIMEOUT_SECONDS + NSC_LIST_KILL_AFTER_SECONDS) + (\
+  NSC_SESSION_HANG_PER_CALL_TIMEOUT_SECONDS + NSC_SESSION_HANG_KILL_AFTER_SECONDS))))
+session_hang_outcome='not-entered'
+session_hang_exhausted=0
+reserved_terminal_status=0
+hostname_readiness_attempted=0
+hostname_readiness_status=0
 report_collected=0
 report_validated=0
 lifecycle_written=0
@@ -133,6 +147,8 @@ setup_started_epoch=0
 setup_finished_epoch=0
 inner_started_epoch=0
 inner_finished_epoch=0
+archive_started_epoch=0
+archive_finished_epoch=0
 download_started_epoch=0
 download_finished_epoch=0
 destroy_started_epoch=0
@@ -310,7 +326,11 @@ nsc_list_json() {
   local output="$1"
   local raw="${output}.raw"
   local list_status=0
-  nsc list --output json </dev/null >"${raw}" 2>"${output}.stderr" || list_status=$?
+  timeout --verbose --signal=TERM \
+    --kill-after="${NSC_LIST_KILL_AFTER_SECONDS}s" \
+    "${NSC_LIST_TIMEOUT_SECONDS}s" \
+    nsc list --output json </dev/null >"${raw}" 2>"${output}.stderr" || list_status=$?
+  printf '%s\n' "${list_status}" >"${output}.exit-status"
   # The command status remains authoritative even when stdout looks complete.
   if [ "${list_status}" -ne 0 ]; then
     echo "nsc list exited ${list_status}; refusing its retained stdout" >&2
@@ -381,6 +401,63 @@ instance_absent_from() {
   jq -e --arg id "${instance_id}" '
     . == null or ([.[] | select(.cluster_id == $id)] | length) == 0
   ' "${listing}" >/dev/null
+}
+
+instance_present_in() {
+  local listing="$1"
+  jq -e --arg id "${instance_id}" \
+    '(. // []) | [.[] | select(.cluster_id == $id)] | length >= 1' \
+    "${listing}" >/dev/null
+}
+
+instance_present_and_reviewed_in() {
+  local listing="$1"
+  jq -e \
+    --arg id "${instance_id}" \
+    --arg nodeKey "${NSC_LABEL_NODE_KEY}" \
+    --arg nodeValue "${NSC_LABEL_NODE_VALUE}" \
+    --arg generationKey "${NSC_LABEL_GENERATION_KEY}" \
+    --arg generationValue "${NSC_LABEL_GENERATION_VALUE}" \
+    --argjson cpu "${NSC_VCPU}" \
+    --argjson memory "${NSC_MEMORY_MEGABYTES}" \
+    --arg arch "${NSC_MACHINE_ARCH}" \
+    --arg os "${NSC_MACHINE_OS}" '
+      [.[] | select(.cluster_id == $id)] as $matches |
+      ($matches | length) == 1 and
+      $matches[0].labels[$nodeKey] == $nodeValue and
+      $matches[0].labels[$generationKey] == $generationValue and
+      $matches[0].shape.virtual_cpu == $cpu and
+      $matches[0].shape.memory_megabytes == $memory and
+      $matches[0].shape.machine_arch == $arch and
+      $matches[0].shape.os == $os
+    ' "${listing}" >/dev/null
+}
+
+# Tri-state liveness proof. Only a schema-valid exact-id absence is instance
+# loss; every command, encoding, schema, or reviewed-row disagreement is
+# uncertainty and can never authorize an ordinal-consuming loss signal.
+#
+#   0 = exact reviewed row present
+#   1 = schema-valid exact id absence
+#   2 = liveness unproven
+probe_instance_liveness() {
+  local listing="$1"
+  nsc_list_json "${listing}" || return 2
+  if instance_present_and_reviewed_in "${listing}"; then
+    return 0
+  fi
+  if instance_present_in "${listing}"; then
+    return 2
+  fi
+  instance_absent_from "${listing}" || return 2
+  return 1
+}
+
+prove_instance_still_live() {
+  local attempt="$1"
+  session_hang_liveness_proofs=$((session_hang_liveness_proofs + 1))
+  local listing="${lifecycle_dir}/session-hang-liveness-${attempt}.json"
+  probe_instance_liveness "${listing}"
 }
 
 destroy_instance_and_prove_absent() {
@@ -546,12 +623,38 @@ write_lifecycle_report() {
     --argjson setupFinished "${setup_finished_epoch}" \
     --argjson innerStarted "${inner_started_epoch}" \
     --argjson innerFinished "${inner_finished_epoch}" \
+    --argjson archiveStarted "${archive_started_epoch}" \
+    --argjson archiveFinished "${archive_finished_epoch}" \
     --argjson downloadStarted "${download_started_epoch}" \
     --argjson downloadFinished "${download_finished_epoch}" \
     --argjson destroyStarted "${destroy_started_epoch}" \
-    --argjson destroyFinished "${destroy_finished_epoch}" '
+    --argjson destroyFinished "${destroy_finished_epoch}" \
+    --arg sessionHangOutcome "${session_hang_outcome}" \
+    --argjson sessionHangEntered "${session_hang_entered}" \
+    --argjson sessionHangReinvocations "${session_hang_reinvocations}" \
+    --argjson sessionHangMaxReinvocations "${NSC_SESSION_HANG_MAX_REINVOCATIONS}" \
+    --argjson sessionHangPerCallTimeout "${NSC_SESSION_HANG_PER_CALL_TIMEOUT_SECONDS}" \
+    --argjson sessionHangKillAfter "${NSC_SESSION_HANG_KILL_AFTER_SECONDS}" \
+    --argjson sessionHangLaneBudget "${NSC_SESSION_HANG_LANE_BUDGET_SECONDS}" \
+    --argjson sessionHangWorstCase "${session_hang_worst_case_seconds}" \
+    --argjson sessionHangLivenessProofs "${session_hang_liveness_proofs}" \
+    --argjson sessionHangLivenessTimeout "${NSC_LIST_TIMEOUT_SECONDS}" \
+    --argjson sessionHangLivenessKillAfter "${NSC_LIST_KILL_AFTER_SECONDS}" \
+    --argjson sessionHangExhausted "${session_hang_exhausted}" \
+    --argjson sessionHangStarted "${session_hang_lane_started_epoch}" \
+    --argjson sessionHangFinished "${session_hang_lane_finished_epoch}" \
+    --argjson sessionHangDeadline "${session_hang_deadline_epoch}" \
+    --argjson reservedTerminalStatus "${reserved_terminal_status}" \
+    --argjson readinessAttempted "${hostname_readiness_attempted}" \
+    --argjson readinessStatus "${hostname_readiness_status}" \
+    --argjson setupTimeout "${NSC_SSH_SETUP_TIMEOUT_SECONDS}" \
+    --argjson setupKillAfter "${NSC_SSH_SETUP_KILL_AFTER_SECONDS}" \
+    --argjson innerTimeout "${NSC_SSH_INNER_TIMEOUT_SECONDS}" \
+    --argjson innerKillAfter "${NSC_SSH_INNER_KILL_AFTER_SECONDS}" \
+    --argjson archiveTimeout "${NSC_SSH_REPORT_ARCHIVE_TIMEOUT_SECONDS}" \
+    --argjson archiveKillAfter "${NSC_SSH_REPORT_ARCHIVE_KILL_AFTER_SECONDS}" '
       {
-        schemaVersion:1,status:$status,failureStage:$failureStage,
+        schemaVersion:2,status:$status,failureStage:$failureStage,
         source:{commit:$commit,tree:$tree,directInputSha256:$directInputSha256,directInputFileCount:$directInputFileCount},
         namespace:{
           instanceId:$instanceId,createdByHarness:($createdByHarness == 1),
@@ -567,16 +670,96 @@ write_lifecycle_report() {
         transfer:{snapshotArchiveSha256:$transferSha256,remoteReportArchiveSha256:$remoteReportArchiveSha256},
         innerReport:{path:$innerReport,sha256:$innerReportSha256,collected:($reportCollected == 1),validated:($reportValidated == 1)},
         cleanup:{destroyAttempts:$destroyAttempts,destroySucceeded:($destroySucceeded == 1),exactIdAbsenceProven:($absenceProven == 1)},
+        sshBounds:{
+          allInvocationsDisablePty:true,
+          allInvocationsCloseStdin:true,
+          hostname:{timeoutSeconds:$sessionHangPerCallTimeout,killAfterSeconds:$sessionHangKillAfter},
+          snapshotSetup:{
+            timeoutSeconds:$setupTimeout,killAfterSeconds:$setupKillAfter,
+            stdout:"lifecycle/setup.txt",stderr:"lifecycle/setup.stderr",
+            exitStatus:"lifecycle/setup.exit-status"
+          },
+          innerProof:{
+            timeoutSeconds:$innerTimeout,killAfterSeconds:$innerKillAfter,
+            combinedOutput:"lifecycle/inner-run.log",
+            exitStatus:"lifecycle/inner-run.exit-status"
+          },
+          reportArchive:{
+            timeoutSeconds:$archiveTimeout,killAfterSeconds:$archiveKillAfter,
+            stdout:"lifecycle/remote-report-sha256.txt",
+            stderr:"lifecycle/remote-report-archive.stderr",
+            exitStatus:"lifecycle/remote-report-archive.exit-status"
+          }
+        },
+        sessionHang:{
+          entered:($sessionHangEntered == 1),
+          outcome:$sessionHangOutcome,
+          reinvocations:$sessionHangReinvocations,
+          maxReinvocations:$sessionHangMaxReinvocations,
+          perCallTimeoutSeconds:$sessionHangPerCallTimeout,
+          killAfterSeconds:$sessionHangKillAfter,
+          laneBudgetSeconds:$sessionHangLaneBudget,
+          worstCaseLaneSeconds:$sessionHangWorstCase,
+          initialReadinessCallExcludedFromLaneBudget:true,
+          livenessProofs:$sessionHangLivenessProofs,
+          livenessTimeoutSeconds:$sessionHangLivenessTimeout,
+          livenessKillAfterSeconds:$sessionHangLivenessKillAfter,
+          instanceLossProven:($sessionHangOutcome == "instance-lost"),
+          livenessUnproven:($sessionHangOutcome == "liveness-unproven"),
+          exhausted:($sessionHangExhausted == 1),
+          startedEpoch:$sessionHangStarted,
+          finishedEpoch:$sessionHangFinished,
+          deadlineEpoch:$sessionHangDeadline,
+          terminalStatus:(if $reservedTerminalStatus == 0 then null else $reservedTerminalStatus end),
+          readinessAttempt:(if $readinessAttempted == 1 then {
+            stdout:"lifecycle/hostname-attempt-readiness-1.txt",
+            stderr:"lifecycle/hostname-attempt-readiness-1.stderr",
+            exitStatus:"lifecycle/hostname-attempt-readiness-1.exit-status",
+            observedStatus:$readinessStatus
+          } else null end),
+          attemptArtifacts:([
+            range(1; $sessionHangReinvocations + 1) | {
+              attempt:.,
+              stdout:("lifecycle/hostname-attempt-session-hang-\(.).txt"),
+              stderr:("lifecycle/hostname-attempt-session-hang-\(.).stderr"),
+              exitStatus:("lifecycle/hostname-attempt-session-hang-\(.).exit-status")
+            }
+          ]),
+          livenessProofArtifacts:([
+            range(1; $sessionHangLivenessProofs + 1) | {
+              attempt:.,
+              validatedJsonWhenSchemaValid:("lifecycle/session-hang-liveness-\(.).json"),
+              rawStdout:("lifecycle/session-hang-liveness-\(.).json.raw"),
+              stderr:("lifecycle/session-hang-liveness-\(.).json.stderr"),
+              exitStatus:("lifecycle/session-hang-liveness-\(.).json.exit-status")
+            }
+          ]),
+          consumesInstanceOrdinal:false,
+          ordinalSemantics:{
+            wrapperOwnsGenerationCounter:false,
+            wrapperCreatesReplacementInstance:false,
+            externalDriverMayConsumeOnlyForProvenInstanceLoss:true
+          },
+          classification:(
+            if $sessionHangExhausted == 1 then
+              {verdict:"SESSION-HANG-EXHAUSTED",instanceReadinessResult:false,
+               fleetDefect:false,proofFailure:false,subjectResult:false,
+               consumesInstanceOrdinal:false}
+            else null end
+          )
+        },
         timings:{
           outerStartedEpoch:$outerStarted,
           create:{startedEpoch:$createStarted,finishedEpoch:$createFinished},
           upload:{startedEpoch:$uploadStarted,finishedEpoch:$uploadFinished},
           setup:{startedEpoch:$setupStarted,finishedEpoch:$setupFinished},
           inner:{startedEpoch:$innerStarted,finishedEpoch:$innerFinished},
+          reportArchive:{startedEpoch:$archiveStarted,finishedEpoch:$archiveFinished},
           download:{startedEpoch:$downloadStarted,finishedEpoch:$downloadFinished},
           destroy:{startedEpoch:$destroyStarted,finishedEpoch:$destroyFinished}
         },
-        passLaw:"pass is impossible until report collection, independent report validation, exact-id destroy, and exact-id absence all succeed"
+        passLaw:"pass is impossible until report collection, independent report validation, exact-id destroy, and exact-id absence all succeed",
+        sessionHangLaw:"exact hostname stdout proves instance reachability; a bounded same-instance session lane is not an instance-readiness result, not a Fleet defect, not a subject result, and never consumes an instance ordinal"
       }
     ' >"${lifecycle_dir}/lifecycle.json"
   [ "${requested_status}" != 'pass' ] || [ "${actual_status}" = 'pass' ] ||
@@ -585,6 +768,13 @@ write_lifecycle_report() {
 
 cleanup() {
   local rc=$?
+  local preserve_reserved_terminal=0
+  case "${reserved_terminal_status}" in
+  "${NSC_SESSION_HANG_EXHAUSTED_STATUS}" | "${NSC_INSTANCE_LOST_STATUS}" | "${NSC_LIVENESS_UNPROVEN_STATUS}")
+    preserve_reserved_terminal=1
+    rc="${reserved_terminal_status}"
+    ;;
+  esac
   trap - EXIT HUP INT TERM
   set +e
   # A signal may arrive after nsc has written its output but before the
@@ -597,13 +787,30 @@ cleanup() {
   fi
   if [ "${mode}" = 'full' ] && [ "${instance_registered}" -eq 1 ] &&
     { [ "${destroy_succeeded}" -ne 1 ] || [ "${absence_proven}" -ne 1 ]; }; then
-    destroy_instance_and_prove_absent || rc=1
+    if ! destroy_instance_and_prove_absent; then
+      echo 'fleet SIT proof: final exact-id cleanup did not prove both destroy and absence' >&2
+      [ "${preserve_reserved_terminal}" -eq 1 ] || rc=1
+    fi
   fi
-  if [ "${mode}" = 'full' ] && [ "${lifecycle_written}" -ne 1 ] && [ -n "${lifecycle_dir}" ]; then
-    mkdir -p "${lifecycle_dir}" || rc=1
-    write_lifecycle_report fail || rc=1
+  if [ "${mode}" = 'full' ] && [ -n "${lifecycle_dir}" ]; then
+    if [ "${preserve_reserved_terminal}" -eq 1 ]; then
+      # Reserved lane terminals deliberately defer their only receipt until the
+      # final cleanup attempt above. This keeps cleanup booleans factual even
+      # when the first attempt in close_lane_terminally needed a retry.
+      if mkdir -p "${lifecycle_dir}" && write_lifecycle_report fail; then
+        lifecycle_written=1
+      else
+        echo 'fleet SIT proof: could not write the final reserved-terminal lifecycle receipt' >&2
+      fi
+    elif [ "${lifecycle_written}" -ne 1 ]; then
+      mkdir -p "${lifecycle_dir}" || rc=1
+      write_lifecycle_report fail || rc=1
+    fi
   fi
-  remove_snapshot || rc=1
+  if ! remove_snapshot; then
+    echo 'fleet SIT proof: snapshot cleanup failed' >&2
+    [ "${preserve_reserved_terminal}" -eq 1 ] || rc=1
+  fi
   exit "${rc}"
 }
 trap cleanup EXIT
@@ -616,6 +823,62 @@ validate_nsc_version() {
   grep -Fx "version ${NSC_CLI_VERSION} (commit ${NSC_CLI_COMMIT})" \
     "${lifecycle_dir}/nsc-version.txt" >/dev/null ||
     fail "nsc client is not pinned ${NSC_CLI_VERSION} at ${NSC_CLI_COMMIT}"
+}
+
+validate_session_hang_bounds() {
+  local pin_name value
+  for pin_name in \
+    NSC_SESSION_HANG_MAX_REINVOCATIONS \
+    NSC_SESSION_HANG_PER_CALL_TIMEOUT_SECONDS \
+    NSC_SESSION_HANG_KILL_AFTER_SECONDS \
+    NSC_SESSION_HANG_LANE_BUDGET_SECONDS \
+    NSC_LIST_TIMEOUT_SECONDS \
+    NSC_LIST_KILL_AFTER_SECONDS \
+    NSC_SESSION_HANG_EXHAUSTED_STATUS \
+    NSC_INSTANCE_LOST_STATUS \
+    NSC_LIVENESS_UNPROVEN_STATUS \
+    NSC_SSH_SETUP_TIMEOUT_SECONDS \
+    NSC_SSH_SETUP_KILL_AFTER_SECONDS \
+    NSC_SSH_INNER_TIMEOUT_SECONDS \
+    NSC_SSH_INNER_KILL_AFTER_SECONDS \
+    NSC_SSH_REPORT_ARCHIVE_TIMEOUT_SECONDS \
+    NSC_SSH_REPORT_ARCHIVE_KILL_AFTER_SECONDS; do
+    value="${!pin_name:-}"
+    [[ ${value} =~ ^[1-9][0-9]*$ ]] ||
+      fail "SSH bound is not a positive integer: ${pin_name}=${value:-<missing>}"
+  done
+
+  [ "${NSC_SESSION_HANG_MAX_REINVOCATIONS}" -eq 3 ] ||
+    fail 'the ratified SESSION-HANG lane permits exactly three re-invocations'
+  [ "${NSC_SESSION_HANG_PER_CALL_TIMEOUT_SECONDS}" -eq 60 ] ||
+    fail 'the ratified SESSION-HANG per-call hard timeout is exactly 60 seconds'
+  [ "${NSC_SESSION_HANG_KILL_AFTER_SECONDS}" -eq 10 ] ||
+    fail 'the ratified SESSION-HANG TERM grace is exactly 10 seconds'
+  [ "${NSC_SESSION_HANG_LANE_BUDGET_SECONDS}" -eq 300 ] ||
+    fail 'the ratified SESSION-HANG lane budget is exactly five minutes'
+  [ "${NSC_LIST_TIMEOUT_SECONDS}" -eq 20 ] &&
+    [ "${NSC_LIST_KILL_AFTER_SECONDS}" -eq 5 ] ||
+    fail 'the reviewed liveness proof allowance is not exactly 20s plus 5s'
+  [ "${NSC_SESSION_HANG_EXHAUSTED_STATUS}" -eq 75 ] &&
+    [ "${NSC_INSTANCE_LOST_STATUS}" -eq 76 ] &&
+    [ "${NSC_LIVENESS_UNPROVEN_STATUS}" -eq 77 ] ||
+    fail 'the reserved terminal statuses must remain SESSION-HANG=75, instance-loss=76, and liveness-unproven=77'
+  [ "${NSC_SSH_SETUP_TIMEOUT_SECONDS}" -eq 300 ] &&
+    [ "${NSC_SSH_SETUP_KILL_AFTER_SECONDS}" -eq 30 ] &&
+    [ "${NSC_SSH_INNER_TIMEOUT_SECONDS}" -eq 5400 ] &&
+    [ "${NSC_SSH_INNER_KILL_AFTER_SECONDS}" -eq 30 ] &&
+    [ "${NSC_SSH_REPORT_ARCHIVE_TIMEOUT_SECONDS}" -eq 300 ] &&
+    [ "${NSC_SSH_REPORT_ARCHIVE_KILL_AFTER_SECONDS}" -eq 30 ] ||
+    fail 'the reviewed setup, inner-proof, or report-archive SSH bound drifted'
+
+  # The initial readiness call is outside the lane. Every admitted lane
+  # iteration must be able to pay for one bounded list proof and one bounded SSH
+  # call, including both TERM-to-KILL allowances.
+  session_hang_worst_case_seconds=$((NSC_SESSION_HANG_MAX_REINVOCATIONS * ((\
+    NSC_LIST_TIMEOUT_SECONDS + NSC_LIST_KILL_AFTER_SECONDS) + (\
+    NSC_SESSION_HANG_PER_CALL_TIMEOUT_SECONDS + NSC_SESSION_HANG_KILL_AFTER_SECONDS))))
+  [ "${session_hang_worst_case_seconds}" -le "${NSC_SESSION_HANG_LANE_BUDGET_SECONDS}" ] ||
+    fail "SESSION-HANG worst case ${session_hang_worst_case_seconds}s exceeds its ${NSC_SESSION_HANG_LANE_BUDGET_SECONDS}s lane budget"
 }
 
 stage_precreated_instance_for_cleanup() {
@@ -691,25 +954,7 @@ validate_create_receipt() {
 validate_live_instance() {
   local listing="${lifecycle_dir}/list-before-use.json"
   nsc_list_json "${listing}" || fail 'could not list Namespace instances before first use'
-  jq -e \
-    --arg id "${instance_id}" \
-    --arg nodeKey "${NSC_LABEL_NODE_KEY}" \
-    --arg nodeValue "${NSC_LABEL_NODE_VALUE}" \
-    --arg generationKey "${NSC_LABEL_GENERATION_KEY}" \
-    --arg generationValue "${NSC_LABEL_GENERATION_VALUE}" \
-    --argjson cpu "${NSC_VCPU}" \
-    --argjson memory "${NSC_MEMORY_MEGABYTES}" \
-    --arg arch "${NSC_MACHINE_ARCH}" \
-    --arg os "${NSC_MACHINE_OS}" '
-      [.[] | select(.cluster_id == $id)] as $matches |
-      ($matches | length) == 1 and
-      $matches[0].labels[$nodeKey] == $nodeValue and
-      $matches[0].labels[$generationKey] == $generationValue and
-      $matches[0].shape.virtual_cpu == $cpu and
-      $matches[0].shape.memory_megabytes == $memory and
-      $matches[0].shape.machine_arch == $arch and
-      $matches[0].shape.os == $os
-    ' "${listing}" >/dev/null ||
+  instance_present_and_reviewed_in "${listing}" ||
     fail 'live Namespace instance disagrees with exact id, labels, or reviewed shape'
 }
 
@@ -817,10 +1062,137 @@ validate_download_archive() {
   done <"${listing}"
 }
 
+# One source-level call site serves readiness and every same-instance retry.
+# stdin is closed, no PTY is allocated, and stdout, stderr, and status remain
+# separate artifacts. A timeout status does not erase exact hostname bytes.
+run_hostname_attempt() {
+  local attempt="$1"
+  local out="${lifecycle_dir}/hostname-attempt-${attempt}.txt"
+  local err="${lifecycle_dir}/hostname-attempt-${attempt}.stderr"
+  local status_file="${lifecycle_dir}/hostname-attempt-${attempt}.exit-status"
+  local status=0
+  timeout --verbose --signal=TERM \
+    --kill-after="${NSC_SESSION_HANG_KILL_AFTER_SECONDS}s" \
+    "${NSC_SESSION_HANG_PER_CALL_TIMEOUT_SECONDS}s" \
+    nsc ssh --disable-pty "${instance_id}" -- hostname \
+    </dev/null >"${out}" 2>"${err}" || status=$?
+  printf '%s\n' "${status}" >"${status_file}"
+  return "${status}"
+}
+
+# Accept only the two ratified exact byte sequences: the id alone or the id
+# followed by one newline. Padded, embedded-whitespace, multi-line, wrong, and
+# empty stdout are all ordinary readiness refusals and never enter the lane.
+hostname_bytes_are_exact() {
+  jq -eRs --arg id "${instance_id}" '. == $id or . == ($id + "\n")' \
+    "$1" >/dev/null 2>&1
+}
+
+close_session_hang_lane() {
+  session_hang_lane_finished_epoch="$(date +%s)"
+  case "${session_hang_outcome}" in
+  resolved) ;;
+  exhausted-calls | exhausted-budget) session_hang_exhausted=1 ;;
+  instance-lost | liveness-unproven) ;;
+  *) fail "session-hang lane closed with an unmodeled outcome: ${session_hang_outcome}" ;;
+  esac
+}
+
+enter_session_hang_lane() {
+  session_hang_entered=1
+  failure_stage='session-hang'
+  session_hang_lane_started_epoch="$(date +%s)"
+  session_hang_deadline_epoch=$((session_hang_lane_started_epoch + NSC_SESSION_HANG_LANE_BUDGET_SECONDS))
+  local call_allowance=$((NSC_SESSION_HANG_PER_CALL_TIMEOUT_SECONDS + \
+    NSC_SESSION_HANG_KILL_AFTER_SECONDS))
+  local liveness_allowance=$((NSC_LIST_TIMEOUT_SECONDS + NSC_LIST_KILL_AFTER_SECONDS))
+  local attempt status now out remaining liveness
+
+  for ((attempt = 1; attempt <= NSC_SESSION_HANG_MAX_REINVOCATIONS; attempt += 1)); do
+    # Enforce the total deadline before liveness. Starting an iteration requires
+    # enough remaining time for both bounded calls, not merely a future deadline.
+    now="$(date +%s)"
+    remaining=$((session_hang_deadline_epoch - now))
+    if [ "${remaining}" -lt "$((liveness_allowance + call_allowance))" ]; then
+      session_hang_outcome='exhausted-budget'
+      close_session_hang_lane
+      return 1
+    fi
+
+    liveness=0
+    prove_instance_still_live "${attempt}" || liveness=$?
+    case "${liveness}" in
+    0) ;;
+    1)
+      session_hang_outcome='instance-lost'
+      close_session_hang_lane
+      return 1
+      ;;
+    2)
+      session_hang_outcome='liveness-unproven'
+      close_session_hang_lane
+      return 1
+      ;;
+    *) fail "liveness probe returned an unmodeled state: ${liveness}" ;;
+    esac
+
+    # Liveness can consume its entire allowance. Re-read the clock and refuse
+    # to start SSH unless the full SSH timeout plus kill grace still fits.
+    now="$(date +%s)"
+    remaining=$((session_hang_deadline_epoch - now))
+    if [ "${remaining}" -lt "${call_allowance}" ]; then
+      session_hang_outcome='exhausted-budget'
+      close_session_hang_lane
+      return 1
+    fi
+
+    status=0
+    run_hostname_attempt "session-hang-${attempt}" || status=$?
+    session_hang_reinvocations=$((session_hang_reinvocations + 1))
+    out="${lifecycle_dir}/hostname-attempt-session-hang-${attempt}.txt"
+    if [ "${status}" -eq 0 ] && hostname_bytes_are_exact "${out}"; then
+      session_hang_outcome='resolved'
+      close_session_hang_lane
+      return 0
+    fi
+  done
+
+  session_hang_outcome='exhausted-calls'
+  close_session_hang_lane
+  return 1
+}
+
+close_lane_terminally() {
+  case "${session_hang_outcome}" in
+  exhausted-calls | exhausted-budget)
+    failure_stage='session-hang-exhausted'
+    reserved_terminal_status="${NSC_SESSION_HANG_EXHAUSTED_STATUS}"
+    ;;
+  instance-lost)
+    failure_stage='session-hang-instance-lost'
+    reserved_terminal_status="${NSC_INSTANCE_LOST_STATUS}"
+    ;;
+  liveness-unproven)
+    failure_stage='session-hang-liveness-unproven'
+    reserved_terminal_status="${NSC_LIVENESS_UNPROVEN_STATUS}"
+    ;;
+  *) fail "terminal close reached an unmodeled session-hang outcome: ${session_hang_outcome}" ;;
+  esac
+
+  # First cleanup attempt precedes the receipt. The EXIT trap retries if either
+  # exact-id predicate remains false, then writes the sole terminal receipt from
+  # those final facts. Cleanup failure never rewrites the reserved class/status.
+  if ! destroy_instance_and_prove_absent; then
+    echo 'fleet SIT proof: session-lane cleanup could not prove exact-id absence; EXIT cleanup will retry' >&2
+  fi
+  exit "${reserved_terminal_status}"
+}
+
 run_outer() {
   for command in bash date git iconv jq nsc sha256sum tar timeout; do
     require_command "${command}"
   done
+  validate_session_hang_bounds
   validate_nsc_version
 
   failure_stage='instance-acquisition'
@@ -830,10 +1202,22 @@ run_outer() {
   # explicit remote-command separator ends option parsing. Keep it on every
   # ssh call, including commands whose first token does not begin with `-`.
   failure_stage='hostname-preflight'
-  nsc ssh --disable-pty "${instance_id}" -- hostname \
-    >"${lifecycle_dir}/hostname.txt" 2>"${lifecycle_dir}/hostname.stderr"
-  [ "$(tr -d '[:space:]' <"${lifecycle_dir}/hostname.txt")" = "${instance_id}" ] ||
+  hostname_readiness_attempted=1
+  hostname_readiness_status=0
+  run_hostname_attempt readiness-1 || hostname_readiness_status=$?
+  local readiness_out="${lifecycle_dir}/hostname-attempt-readiness-1.txt"
+  cp -- "${readiness_out}" "${lifecycle_dir}/hostname.txt"
+  cp -- "${lifecycle_dir}/hostname-attempt-readiness-1.stderr" \
+    "${lifecycle_dir}/hostname.stderr"
+  if [ "${hostname_readiness_status}" -eq 0 ] && hostname_bytes_are_exact "${readiness_out}"; then
+    session_hang_outcome='not-entered-clean'
+  elif hostname_bytes_are_exact "${readiness_out}"; then
+    # Exact stdout proves that readiness and reachability already succeeded.
+    # A nonzero client status enters the separately bounded same-instance lane.
+    enter_session_hang_lane || close_lane_terminally
+  else
     fail 'Namespace hostname does not equal the exact instance id'
+  fi
 
   local transfer_archive="${snapshot}/fleet-sit-source.tgz"
   tar -czf "${transfer_archive}" -C "${snapshot}" source
@@ -880,21 +1264,30 @@ run_outer() {
   local setup_command
   setup_command="test ! -e '${remote_root}/source' && mkdir -p '${remote_root}/result' && tar -o -xzf '${remote_archive}' -C '${remote_root}' && git -C '${remote_root}/source' rev-parse --git-dir >/dev/null && printf '%s  %s\\n' '${transfer_sha}' '${remote_archive}' | sha256sum -c"
   setup_started_epoch="$(date +%s)"
-  nsc ssh --disable-pty "${instance_id}" -- "${setup_command}" \
-    >"${lifecycle_dir}/setup.txt" 2>"${lifecycle_dir}/setup.stderr"
+  local setup_status=0
+  timeout --verbose --signal=TERM \
+    --kill-after="${NSC_SSH_SETUP_KILL_AFTER_SECONDS}s" \
+    "${NSC_SSH_SETUP_TIMEOUT_SECONDS}s" \
+    nsc ssh --disable-pty "${instance_id}" -- "${setup_command}" \
+    </dev/null >"${lifecycle_dir}/setup.txt" 2>"${lifecycle_dir}/setup.stderr" || setup_status=$?
+  printf '%s\n' "${setup_status}" >"${lifecycle_dir}/setup.exit-status"
   setup_finished_epoch="$(date +%s)"
+  [ "${setup_status}" -eq 0 ] || fail "on-instance snapshot setup exited ${setup_status}"
 
   failure_stage='inner-run'
   inner_started_epoch="$(date +%s)"
   local inner_status=0
-  timeout --signal=TERM --kill-after=30s 5400 \
+  timeout --verbose --signal=TERM \
+    --kill-after="${NSC_SSH_INNER_KILL_AFTER_SECONDS}s" \
+    "${NSC_SSH_INNER_TIMEOUT_SECONDS}s" \
     nsc ssh --disable-pty "${instance_id}" -- env \
     FLEET_SIT_NAMESPACE_INNER=namespace-k3s-v1 \
     FLEET_SIT_INSTANCE_ID="${instance_id}" \
     FLEET_SIT_EXPECTED_HEAD="${commit}" \
     FLEET_SIT_REPORT="${remote_report}" \
     bash "${remote_root}/source/scripts/ci/fleet-sit-proof.sh" --inner \
-    >"${lifecycle_dir}/inner-run.log" 2>&1 || inner_status=$?
+    </dev/null >"${lifecycle_dir}/inner-run.log" 2>&1 || inner_status=$?
+  printf '%s\n' "${inner_status}" >"${lifecycle_dir}/inner-run.exit-status"
   inner_finished_epoch="$(date +%s)"
   [ "${inner_status}" -eq 0 ] || fail "on-instance inner proof exited ${inner_status}"
 
@@ -902,9 +1295,17 @@ run_outer() {
   local archive_command
   archive_command="test -s '${remote_report}/sit-report.json' && tar -czf '${remote_report_archive}' -C '${remote_root}/result' sit-report && sha256sum '${remote_report_archive}'"
   # Packed as one remote argument for the same InlineSsh join reason as setup.
-  nsc ssh --disable-pty "${instance_id}" -- "${archive_command}" \
-    >"${lifecycle_dir}/remote-report-sha256.txt" \
-    2>"${lifecycle_dir}/remote-report-archive.stderr"
+  archive_started_epoch="$(date +%s)"
+  local archive_status=0
+  timeout --verbose --signal=TERM \
+    --kill-after="${NSC_SSH_REPORT_ARCHIVE_KILL_AFTER_SECONDS}s" \
+    "${NSC_SSH_REPORT_ARCHIVE_TIMEOUT_SECONDS}s" \
+    nsc ssh --disable-pty "${instance_id}" -- "${archive_command}" \
+    </dev/null >"${lifecycle_dir}/remote-report-sha256.txt" \
+    2>"${lifecycle_dir}/remote-report-archive.stderr" || archive_status=$?
+  printf '%s\n' "${archive_status}" >"${lifecycle_dir}/remote-report-archive.exit-status"
+  archive_finished_epoch="$(date +%s)"
+  [ "${archive_status}" -eq 0 ] || fail "on-instance report archive exited ${archive_status}"
   remote_report_sha="$(awk 'NR == 1 {print $1}' "${lifecycle_dir}/remote-report-sha256.txt")"
   [[ ${remote_report_sha} =~ ^[0-9a-f]{64}$ ]] || fail 'remote report archive digest is invalid'
 
