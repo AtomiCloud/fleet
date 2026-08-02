@@ -1,0 +1,20 @@
+{{- $platform := include "diene-platform.platform" . -}}
+{{- range $vls := .Values.virtualLandscapeServices }}
+apiVersion: {{ $.Values.apiVersions.fleet }}
+kind: VirtualLandscapeService
+metadata:
+  name: {{ printf "%s-%s-%s" $vls.service $vls.vlandscape $vls.landscape }}
+  namespace: {{ $platform }}
+  labels:
+    {{- include "diene-platform.labels" $ | nindent 4 }}
+spec:
+  # platform is the explicit S16 source of truth (never inferred): the P slot
+  # is stamped here so a fragment cannot serve under another platform.
+  platform: {{ $platform }}
+  vlandscape: {{ required "virtualLandscapeServices[].vlandscape is required" $vls.vlandscape }}
+  service: {{ required "virtualLandscapeServices[].service is required" $vls.service }}
+  module: {{ required "virtualLandscapeServices[].module is required" $vls.module }}
+  landscape: {{ required "virtualLandscapeServices[].landscape is required" $vls.landscape }}
+  serve: {{ $vls.serve }}
+---
+{{- end }}

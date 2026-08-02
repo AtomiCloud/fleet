@@ -1,0 +1,8 @@
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Promotion
+metadata:
+  name: <name>
+  namespace: <namespace>
+spec:
+  stage: <stage>
+  freight: <freight>

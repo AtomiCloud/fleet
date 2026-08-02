@@ -1,0 +1,10 @@
+# ### workspace-prettier
+# #### source: workspace
+arrowParens: avoid
+bracketSpacing: true
+printWidth: 120
+semi: true
+singleAttributePerLine: false
+singleQuote: true
+tabWidth: 2
+trailingComma: all

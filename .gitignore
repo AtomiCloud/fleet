@@ -1,0 +1,35 @@
+### nix-root
+#### source: main
+.direnv/
+.pre-commit-config.yaml
+/result
+/result-*
+
+### workspace
+#### source: workspace
+.env
+.env.*
+!.env.example
+.kagent/
+.kloop/
+*.log
+*.swo
+*.swp
+*~
+.DS_Store
+._*
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini
+infra/root_chart/uploads/
+
+### helm-wrapper
+#### source: helm-wrapper
+chart/files/config/
+dist/
+probe-report.json
+
+### fleet
+#### source: fleet
+sit-report/

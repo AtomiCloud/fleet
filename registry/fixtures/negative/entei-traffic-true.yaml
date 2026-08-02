@@ -1,0 +1,24 @@
+# NEGATIVE FIXTURE — the ENTEI `traffic: false` invariant.
+#
+# Identical to fixtures/clusters/entei-mark.yaml except `traffic: true`.
+# The registry-manifest gate MUST reject it: an infrastructure-only host
+# landscape never joins the registered-fleet gray-zone A-set nor its S8 R53
+# backup mirror, so a traffic-carrying ENTEI cluster is a contradiction in the
+# topology, not a configuration choice.
+#
+# This file is schema-VALID on purpose. If it were merely schema-invalid the
+# negative would prove kubeconform works, not that the invariant is enforced —
+# the rejection must come from the semantic gate.
+apiVersion: fleet.atomi.cloud/v1alpha1
+kind: ClusterRegistration
+metadata:
+  name: 'entei-<mark>'
+  labels:
+    atomi.cloud/landscape: entei
+spec:
+  landscape: entei
+  mark: '<mark>'
+  provider: '<provider>'
+  hostRole: anonymous-vcluster-host
+  originMode: loadbalancer
+  traffic: true

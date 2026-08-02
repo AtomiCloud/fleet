@@ -1,0 +1,18 @@
+{{- $platform := include "diene-platform.platform" . -}}
+{{- range $p := .Values.problems }}
+apiVersion: {{ $.Values.apiVersions.fleet }}
+kind: Problem
+metadata:
+  name: {{ printf "%s-%s" $p.service $p.landscape }}
+  namespace: {{ $platform }}
+  labels:
+    {{- include "diene-platform.labels" $ | nindent 4 }}
+spec:
+  platform: {{ $platform }}
+  service: {{ required "problems[].service is required" $p.service }}
+  landscape: {{ required "problems[].landscape is required" $p.landscape }}
+  version: {{ required "problems[].version is required" $p.version | quote }}
+  problems:
+    {{- toYaml $p.entries | nindent 4 }}
+---
+{{- end }}

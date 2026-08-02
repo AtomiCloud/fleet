@@ -1,0 +1,21 @@
+# ### workspace-ci
+# #### source: fleet
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  precommit:
+    name: Pre-Commit
+    permissions:
+      contents: read
+    uses: ./.github/workflows/⚡reusable-precommit.yaml
+
+  fleet:
+    name: Fleet
+    permissions:
+      contents: read
+    uses: ./.github/workflows/⚡reusable-fleet.yaml

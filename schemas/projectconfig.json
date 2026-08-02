@@ -1,0 +1,52 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Fleet-owned frozen validation slice of the Kargo v1.9.10 ProjectConfig CRD (charts/kargo/resources/crds/kargo.akuity.io_projectconfigs.yaml, module github.com/akuity/kargo v1.9.10). Like the Warehouse slice, this validates the shapes THIS chart renders, not every shape upstream accepts — hence the closed spec. ProjectConfig is the CR that actually gates promotion, so it is validated rather than skipped: `gate: manual` is realized as the ABSENCE of an enabling policy, and an unvalidated render could lose that distinction silently.",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "kargo.akuity.io/v1alpha1" },
+    "kind": { "const": "ProjectConfig" },
+    "metadata": {
+      "type": "object",
+      "required": ["name", "namespace"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "namespace": { "type": "string", "minLength": 1 },
+        "labels": { "type": "object" }
+      },
+      "additionalProperties": true
+    },
+    "spec": {
+      "type": "object",
+      "required": ["promotionPolicies"],
+      "properties": {
+        "promotionPolicies": {
+          "$comment": "May legitimately be EMPTY: a platform whose every stage is gate: manual enables nothing. An empty list is meaningfully different from a missing key, so the key is required while the array is not.",
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["stageSelector", "autoPromotionEnabled"],
+            "properties": {
+              "stageSelector": {
+                "$comment": "The chart selects by exact Stage name. Upstream also permits matchLabels/matchExpressions; those are deliberately excluded so a selector cannot silently widen to match Stages the pipeline never declared.",
+                "type": "object",
+                "required": ["name"],
+                "properties": {
+                  "name": { "type": "string", "minLength": 1 }
+                },
+                "additionalProperties": false
+              },
+              "autoPromotionEnabled": {
+                "$comment": "Only `true` is ever rendered. A policy entry exists to ENABLE auto-promotion; a `false` entry would be an inert row that reads like a deliberate opt-out and blurs the absence-means-manual rule.",
+                "const": true
+              }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

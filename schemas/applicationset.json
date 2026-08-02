@@ -1,0 +1,294 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$comment": "Fleet-owned frozen validation slice of the official Argo CD v3.4.5 ApplicationSet CRD (https://raw.githubusercontent.com/argoproj/argo-cd/v3.4.5/manifests/crds/applicationset-crd.yaml). It intentionally covers only the ApplicationSet fields used by this fleet.",
+  "description": "Pinned, hand-reduced fleet slice of the official Argo CD v3.4.5 ApplicationSet CRD: https://raw.githubusercontent.com/argoproj/argo-cd/v3.4.5/manifests/crds/applicationset-crd.yaml.",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "const": "argoproj.io/v1alpha1" },
+    "kind": { "const": "ApplicationSet" },
+    "metadata": { "$ref": "#/$defs/metadata" },
+    "spec": {
+      "type": "object",
+      "required": ["goTemplate", "goTemplateOptions", "generators", "template", "templatePatch"],
+      "properties": {
+        "goTemplate": { "const": true },
+        "goTemplateOptions": {
+          "type": "array",
+          "minItems": 1,
+          "contains": { "const": "missingkey=error" },
+          "items": { "type": "string", "minLength": 1 }
+        },
+        "generators": { "type": "array", "minItems": 1, "items": { "$ref": "#/$defs/generator" } },
+        "template": { "$ref": "#/$defs/applicationTemplate" },
+        "templatePatch": { "type": "string", "minLength": 1 }
+      },
+      "allOf": [
+        {
+          "if": {
+            "properties": {
+              "generators": { "contains": { "anyOf": [{ "required": ["git"] }, { "required": ["matrix"] }] } }
+            }
+          },
+          "then": {
+            "properties": {
+              "templatePatch": { "allOf": [{ "pattern": "path\\.segments" }, { "pattern": "path\\.filename" }] }
+            }
+          }
+        }
+      ],
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "metadata": {
+      "type": "object",
+      "required": ["name", "namespace"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "namespace": { "type": "string", "minLength": 1 },
+        "labels": { "type": "object" }
+      },
+      "additionalProperties": false
+    },
+    "generator": {
+      "oneOf": [
+        {
+          "type": "object",
+          "required": ["scmProvider"],
+          "properties": {
+            "scmProvider": { "$ref": "#/$defs/scmProvider" },
+            "template": { "$ref": "#/$defs/applicationTemplate" }
+          },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["git"],
+          "properties": { "git": { "$ref": "#/$defs/git" }, "template": { "$ref": "#/$defs/applicationTemplate" } },
+          "additionalProperties": false
+        },
+        {
+          "type": "object",
+          "required": ["matrix"],
+          "properties": {
+            "matrix": { "$ref": "#/$defs/matrix" },
+            "template": { "$ref": "#/$defs/applicationTemplate" }
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "scmProvider": {
+      "type": "object",
+      "required": ["github", "filters"],
+      "properties": {
+        "github": {
+          "type": "object",
+          "required": ["organization", "allBranches"],
+          "properties": { "organization": { "type": "string", "minLength": 1 }, "allBranches": { "type": "boolean" } },
+          "additionalProperties": false
+        },
+        "filters": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["repositoryMatch"],
+            "properties": { "repositoryMatch": { "type": "string", "minLength": 1 } },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    },
+    "git": {
+      "type": "object",
+      "required": ["repoURL", "revision", "files"],
+      "properties": {
+        "repoURL": { "type": "string", "minLength": 1 },
+        "revision": { "type": "string", "minLength": 1 },
+        "files": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "required": ["path"],
+            "properties": { "path": { "type": "string", "minLength": 1 } },
+            "additionalProperties": false
+          }
+        },
+        "template": { "$ref": "#/$defs/applicationTemplate" }
+      },
+      "additionalProperties": false
+    },
+    "clusters": {
+      "type": "object",
+      "required": ["selector"],
+      "properties": {
+        "selector": {
+          "type": "object",
+          "required": ["matchLabels"],
+          "properties": {
+            "matchLabels": {
+              "type": "object",
+              "minProperties": 1,
+              "additionalProperties": { "type": "string", "minLength": 1 }
+            },
+            "matchExpressions": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": ["key", "operator"],
+                "properties": {
+                  "key": { "type": "string", "minLength": 1 },
+                  "operator": { "type": "string", "minLength": 1 },
+                  "values": {
+                    "type": "array",
+                    "items": { "type": "string" }
+                  }
+                },
+                "additionalProperties": false
+              }
+            }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "matrix": {
+      "type": "object",
+      "required": ["generators"],
+      "properties": {
+        "generators": {
+          "type": "array",
+          "minItems": 2,
+          "items": {
+            "oneOf": [
+              {
+                "type": "object",
+                "required": ["git"],
+                "properties": { "git": { "$ref": "#/$defs/git" } },
+                "additionalProperties": false
+              },
+              {
+                "type": "object",
+                "required": ["clusters"],
+                "properties": { "clusters": { "$ref": "#/$defs/clusters" } },
+                "additionalProperties": false
+              }
+            ]
+          },
+          "allOf": [{ "contains": { "required": ["git"] } }, { "contains": { "required": ["clusters"] } }]
+        },
+        "template": { "$ref": "#/$defs/applicationTemplate" }
+      },
+      "additionalProperties": false
+    },
+    "applicationTemplate": {
+      "type": "object",
+      "required": ["metadata", "spec"],
+      "properties": {
+        "metadata": {
+          "type": "object",
+          "required": ["name"],
+          "properties": { "name": { "type": "string", "minLength": 1 }, "labels": { "type": "object" } },
+          "additionalProperties": false
+        },
+        "spec": {
+          "type": "object",
+          "required": ["project", "destination"],
+          "properties": {
+            "project": { "type": "string", "minLength": 1 },
+            "destination": { "$ref": "#/$defs/destination" },
+            "source": { "$ref": "#/$defs/templateSource" },
+            "sources": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "$ref": "#/$defs/templateSource" },
+              "allOf": [
+                {
+                  "if": {
+                    "contains": {
+                      "properties": {
+                        "helm": {
+                          "properties": { "valueFiles": { "contains": { "type": "string", "pattern": "^\\$" } } },
+                          "required": ["valueFiles"]
+                        }
+                      },
+                      "required": ["helm"]
+                    }
+                  },
+                  "then": {
+                    "contains": {
+                      "properties": { "ref": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" } },
+                      "required": ["ref"]
+                    }
+                  }
+                }
+              ]
+            },
+            "syncPolicy": { "$ref": "#/$defs/syncPolicy" }
+          },
+          "oneOf": [{ "required": ["source"] }, { "required": ["sources"] }],
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "templateSource": {
+      "type": "object",
+      "required": ["repoURL"],
+      "properties": {
+        "repoURL": { "type": "string", "minLength": 1 },
+        "targetRevision": { "type": "string", "minLength": 1 },
+        "path": { "type": "string", "minLength": 1 },
+        "ref": { "type": "string", "pattern": "^[a-z][a-z0-9-]*$" },
+        "helm": {
+          "type": "object",
+          "properties": {
+            "valueFiles": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "pattern": "^\\$[A-Za-z][A-Za-z0-9-]*(?:/.*)?$" }
+            },
+            "values": { "type": "string", "minLength": 1 }
+          },
+          "minProperties": 1,
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "destination": {
+      "type": "object",
+      "required": ["server", "namespace"],
+      "properties": {
+        "server": { "type": "string", "minLength": 1 },
+        "namespace": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": false
+    },
+    "syncPolicy": {
+      "type": "object",
+      "properties": {
+        "automated": {
+          "type": "object",
+          "required": ["prune", "selfHeal"],
+          "properties": { "prune": { "type": "boolean" }, "selfHeal": { "type": "boolean" } },
+          "additionalProperties": false
+        },
+        "syncOptions": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "type": "string", "pattern": "^[A-Za-z][A-Za-z0-9]*=.*$" }
+        }
+      },
+      "anyOf": [{ "required": ["automated"] }, { "required": ["syncOptions"] }],
+      "additionalProperties": false
+    }
+  }
+}

@@ -1,0 +1,609 @@
+---
+# Source: diene-platform/templates/appset.yaml
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: canary
+  namespace: argocd
+  labels:
+    helm.sh/chart: diene-platform-0.1.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: diene-fleet
+    atomi.cloud/platform: "canary"
+spec:
+  goTemplate: true
+  goTemplateOptions: ["missingkey=error"]
+  generators:
+    # g1 — git-files over landscapes/<l>/<svc>.yaml → one primordial Application
+    # per row, destined for the Primordial central cluster.
+    - git:
+        repoURL: https://github.com/AtomiCloud/fleet
+        revision: HEAD
+        files:
+          - path: platforms/canary/landscapes/*/*.yaml
+        template:
+          metadata:
+            name: '{{ .platform }}-{{ .landscape }}-{{ .service }}-primordial'
+          spec:
+            project: default
+            destination:
+              server: https://kubernetes.default.svc
+              namespace: '{{ .platform }}'
+            sources:
+              - repoURL: 'oci://registry.atomi.cloud/{{ .platform }}-{{ .service }}-primordial'
+                targetRevision: '{{ .pin.tag }}'
+                helm:
+                  values: '{{ get . "values" | default dict | toRawJson }}'
+    # g2 — g1 × cluster generator (label-selected by landscape) → one per-cluster
+    # Application per row per matching cluster. This is the SOLE membership
+    # mechanism, so delivery: replicated modules land on EVERY landscape cluster.
+    - matrix:
+        generators:
+          - git:
+              repoURL: https://github.com/AtomiCloud/fleet
+              revision: HEAD
+              files:
+                - path: platforms/canary/landscapes/*/*.yaml
+          - clusters:
+              selector:
+                matchLabels:
+                  atomi.cloud/landscape: '{{ .landscape }}'
+                matchExpressions:
+                  - key: atomi.cloud/cluster-role
+                    operator: NotIn
+                    values:
+                      - infrastructure-only
+        template:
+          metadata:
+            name: '{{ .platform }}-{{ .landscape }}-{{ .service }}-{{ .name }}'
+          spec:
+            project: default
+            destination:
+              server: '{{ .server }}'
+              namespace: '{{ .platform }}'
+            sources:
+              - repoURL: 'oci://registry.atomi.cloud/{{ .platform }}-{{ .service }}'
+                targetRevision: '{{ .pin.tag }}'
+                helm:
+                  values: '{{ get . "values" | default dict | toRawJson }}'
+  # Runtime guard for machine-written rows. A malformed row fails generation
+  # before either Application is rendered; explicit row fields remain the only
+  # identity values consumed downstream.
+  templatePatch: |
+    {{- $pathLandscape := index .path.segments 3 -}}
+    {{- $filenameService := trimSuffix ".yaml" .path.filename -}}
+    {{- if ne .platform "canary" -}}
+    {{- fail (printf "row platform %q must equal containing roster and release namespace canary" .platform) -}}
+    {{- end -}}
+    {{- if not (has .service (splitList "," "dummy")) -}}
+    {{- fail (printf "row service %q is absent from the containing services roster" .service) -}}
+    {{- end -}}
+    {{- if ne .service $filenameService -}}
+    {{- fail (printf "row service %q must equal filename service %q" .service $filenameService) -}}
+    {{- end -}}
+    {{- if ne .landscape $pathLandscape -}}
+    {{- fail (printf "row landscape %q must equal path landscape %q" .landscape $pathLandscape) -}}
+    {{- end -}}
+    {}
+  # Base template: the two generator-level templates above override per row.
+  template:
+    metadata:
+      name: '{{ .platform }}-row'
+      labels:
+        atomi.cloud/platform: '{{ .platform }}'
+    spec:
+      project: default
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: '{{ .platform }}'
+      source:
+        repoURL: https://github.com/AtomiCloud/fleet
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+---
+# Source: diene-platform/templates/cloudflare-deploy.yaml
+apiVersion: edge.atomi.cloud/v1alpha1
+kind: CloudflareDeploy
+metadata:
+  name: canary-web
+  namespace: canary
+  labels:
+    helm.sh/chart: diene-platform-0.1.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: diene-fleet
+    atomi.cloud/platform: "canary"
+spec:
+  scriptName: canary-web
+  # tag-addressed version (never a hand-pinned version id): CI uploads
+  # versions, Kargo freight pins the tag, cf-deploy resolves tag → version.
+  desiredVersionFrom:
+    tag: "0.1.0"
+  rollout:
+    steps:
+    - percent: 10
+      soak: 10m
+    - percent: 100
+    strategy: gradual
+  pin: true
+---
+# Source: diene-platform/templates/platform.yaml
+apiVersion: fleet.atomi.cloud/v1alpha1
+kind: Platform
+metadata:
+  name: canary
+  namespace: canary
+  labels:
+    helm.sh/chart: diene-platform-0.1.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: diene-fleet
+    atomi.cloud/platform: "canary"
+spec:
+  infisical:
+    projectSlug: canary
+    serviceFolders: true
+  sos:
+    register: true
+  pipeline:
+    # Rendered 1:1 from carbon's platform.yaml stages: — the derived Kargo
+    # Stages live in kargo.yaml; this is the DAG of record.
+    stages:
+      - pichu
+      - - gate: manual
+          landscape: pikachu
+          verification:
+            analysisTemplates:
+            - canary-smoke
+        - raichu
+      - gate: auto
+        landscape: ampharos
+        soak: 15m
+        verification:
+          analysisTemplates:
+          - canary-analysis
+---
+# Source: diene-platform/templates/platform-dependency.yaml
+apiVersion: fleet.atomi.cloud/v1alpha1
+kind: PlatformDependency
+metadata:
+  name: canary-raichu
+  namespace: canary
+  labels:
+    helm.sh/chart: diene-platform-0.1.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: diene-fleet
+    atomi.cloud/platform: "canary"
+  annotations:
+    atomi.cloud/profile: "registered-fleet"
+spec:
+  platform: canary
+  landscape: raichu
+  placement:
+    preferredHost: raichu
+  database:
+    maindb:
+      backup:
+        crossVendor: true
+      cpu: 1
+      credentialMode: standard
+      delivery: external
+      engine:
+        neon:
+          tier: free
+      providerAccountRef: canary-neon
+      ram: 1Gi
+      rotation: "on"
+      storage: 10Gi
+      type: neon
+      version: "16"
+  kv:
+    sessions:
+      credentialMode: standard
+      delivery: external
+      engine:
+        upstash: {}
+      providerAccountRef: canary-upstash
+      ram: 128Mi
+      rotation: "on"
+      type: upstash
+  cache:
+    hot:
+      credentialMode: standard
+      delivery: replicated
+      engine:
+        dragonfly: {}
+      ram: 128Mi
+      rotation: "on"
+      type: dragonfly
+  store:
+    assets:
+      credentialMode: standard
+      delivery: external
+      engine:
+        tigris: {}
+      providerAccountRef: canary-tigris
+      rotation: "on"
+      type: tigris
+  deletionPolicy:
+    retainSecret: 168h
+  # render-split summary (compiler assertion surface):
+  # externalOffRail: assets,maindb,sessions
+  # replicatedOnRail: hot
+---
+# Source: diene-platform/templates/problem.yaml
+apiVersion: fleet.atomi.cloud/v1alpha1
+kind: Problem
+metadata:
+  name: dummy-raichu
+  namespace: canary
+  labels:
+    helm.sh/chart: diene-platform-0.1.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: diene-fleet
+    atomi.cloud/platform: "canary"
+spec:
+  platform: canary
+  service: dummy
+  landscape: raichu
+  version: "0.1.0"
+  problems:
+    - endpoints:
+      - method: GET
+        path: /
+      id: CANARY_DUMMY
+      recoverable: false
+      schema: {}
+      status: 418
+      title: Canary dummy problem
+      type: https://errors.atomi.cloud/canary/dummy
+---
+# Source: diene-platform/templates/kargo.yaml
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Project
+metadata:
+  name: canary
+  labels:
+    helm.sh/chart: diene-platform-0.1.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: diene-fleet
+    atomi.cloud/platform: "canary"
+---
+# Source: diene-platform/templates/kargo.yaml
+apiVersion: kargo.akuity.io/v1alpha1
+kind: ProjectConfig
+metadata:
+  name: canary
+  namespace: canary
+  labels:
+    helm.sh/chart: diene-platform-0.1.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: diene-fleet
+    atomi.cloud/platform: "canary"
+spec:
+  promotionPolicies:
+    - autoPromotionEnabled: true
+      stageSelector:
+        name: canary-dummy-pichu
+    - autoPromotionEnabled: true
+      stageSelector:
+        name: canary-dummy-raichu
+    - autoPromotionEnabled: true
+      stageSelector:
+        name: canary-dummy-ampharos
+---
+# Source: diene-platform/templates/kargo.yaml
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Stage
+metadata:
+  name: canary-dummy-pichu
+  namespace: canary
+  labels:
+    helm.sh/chart: diene-platform-0.1.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: diene-fleet
+    atomi.cloud/platform: "canary"
+    atomi.cloud/landscape: "pichu"
+  annotations:
+    atomi.cloud/promotion-gate: "auto"
+spec:
+  requestedFreight:
+    - origin:
+        kind: Warehouse
+        name: dummy
+      sources:
+        # first step subscribes directly to the service's Warehouse
+        direct: true
+  promotionTemplate:
+    spec:
+      # Fixed git-update promotion template (identical for auto and manual
+      # gates). It bumps ONLY the pin in the row file and preserves any
+      # human `values:` override block byte-for-byte.
+      steps:
+        - uses: git-clone
+          config:
+            repoURL: https://github.com/AtomiCloud/fleet
+            checkout:
+              - branch: main
+                path: ./repo
+        - uses: yaml-update
+          config:
+            path: ./repo/platforms/canary/landscapes/pichu/dummy.yaml
+            updates:
+              - key: pin.tag
+                value: ${{ imageFrom("registry.atomi.cloud/canary/dummy").Tag }}
+        - uses: git-commit
+          config:
+            path: ./repo
+            author:
+              name: kargo-bot
+              email: kargo-bot@atomi.cloud
+            message: "chore(canary): promote dummy to pichu"
+        - uses: git-push
+          config:
+            path: ./repo
+---
+# Source: diene-platform/templates/kargo.yaml
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Stage
+metadata:
+  name: canary-dummy-pikachu
+  namespace: canary
+  labels:
+    helm.sh/chart: diene-platform-0.1.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: diene-fleet
+    atomi.cloud/platform: "canary"
+    atomi.cloud/landscape: "pikachu"
+  annotations:
+    atomi.cloud/promotion-gate: "manual"
+spec:
+  requestedFreight:
+    - origin:
+        kind: Warehouse
+        name: dummy
+      sources:
+        # every member takes the PRECEDING step as its upstream; the step after
+        # a parallel set therefore lists ALL of that set's members (rendezvous)
+        stages:
+          - canary-dummy-pichu
+  verification:
+    analysisTemplates:
+      - name: "canary-smoke"
+  promotionTemplate:
+    spec:
+      # Fixed git-update promotion template (identical for auto and manual
+      # gates). It bumps ONLY the pin in the row file and preserves any
+      # human `values:` override block byte-for-byte.
+      steps:
+        - uses: git-clone
+          config:
+            repoURL: https://github.com/AtomiCloud/fleet
+            checkout:
+              - branch: main
+                path: ./repo
+        - uses: yaml-update
+          config:
+            path: ./repo/platforms/canary/landscapes/pikachu/dummy.yaml
+            updates:
+              - key: pin.tag
+                value: ${{ imageFrom("registry.atomi.cloud/canary/dummy").Tag }}
+        - uses: git-commit
+          config:
+            path: ./repo
+            author:
+              name: kargo-bot
+              email: kargo-bot@atomi.cloud
+            message: "chore(canary): promote dummy to pikachu"
+        - uses: git-push
+          config:
+            path: ./repo
+---
+# Source: diene-platform/templates/kargo.yaml
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Stage
+metadata:
+  name: canary-dummy-raichu
+  namespace: canary
+  labels:
+    helm.sh/chart: diene-platform-0.1.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: diene-fleet
+    atomi.cloud/platform: "canary"
+    atomi.cloud/landscape: "raichu"
+  annotations:
+    atomi.cloud/promotion-gate: "auto"
+spec:
+  requestedFreight:
+    - origin:
+        kind: Warehouse
+        name: dummy
+      sources:
+        # every member takes the PRECEDING step as its upstream; the step after
+        # a parallel set therefore lists ALL of that set's members (rendezvous)
+        stages:
+          - canary-dummy-pichu
+  promotionTemplate:
+    spec:
+      # Fixed git-update promotion template (identical for auto and manual
+      # gates). It bumps ONLY the pin in the row file and preserves any
+      # human `values:` override block byte-for-byte.
+      steps:
+        - uses: git-clone
+          config:
+            repoURL: https://github.com/AtomiCloud/fleet
+            checkout:
+              - branch: main
+                path: ./repo
+        - uses: yaml-update
+          config:
+            path: ./repo/platforms/canary/landscapes/raichu/dummy.yaml
+            updates:
+              - key: pin.tag
+                value: ${{ imageFrom("registry.atomi.cloud/canary/dummy").Tag }}
+        - uses: git-commit
+          config:
+            path: ./repo
+            author:
+              name: kargo-bot
+              email: kargo-bot@atomi.cloud
+            message: "chore(canary): promote dummy to raichu"
+        - uses: git-push
+          config:
+            path: ./repo
+---
+# Source: diene-platform/templates/kargo.yaml
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Stage
+metadata:
+  name: canary-dummy-ampharos
+  namespace: canary
+  labels:
+    helm.sh/chart: diene-platform-0.1.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: diene-fleet
+    atomi.cloud/platform: "canary"
+    atomi.cloud/landscape: "ampharos"
+  annotations:
+    atomi.cloud/promotion-gate: "auto"
+    atomi.cloud/soak: "15m"
+spec:
+  requestedFreight:
+    - origin:
+        kind: Warehouse
+        name: dummy
+      sources:
+        # every member takes the PRECEDING step as its upstream; the step after
+        # a parallel set therefore lists ALL of that set's members (rendezvous)
+        stages:
+          - canary-dummy-pikachu
+          - canary-dummy-raichu
+        # RENDEZVOUS: freight must be available from EVERY member of the
+        # preceding parallel set, not just the first to arrive.
+        availabilityStrategy: All
+        # Residency clock (Kargo's documented soak contract): the interval starts
+        # at SUCCESSFUL PROMOTION of the freight into the upstream Stage and runs
+        # on occupancy alone. Upstream verification gates downstream availability
+        # as an INDEPENDENT condition but never starts, pauses, or resets this
+        # interval — freight that clears verification after already occupying the
+        # upstream for the required time is immediately soak-eligible.
+        requiredSoakTime: "15m"
+  verification:
+    analysisTemplates:
+      - name: "canary-analysis"
+  promotionTemplate:
+    spec:
+      # Fixed git-update promotion template (identical for auto and manual
+      # gates). It bumps ONLY the pin in the row file and preserves any
+      # human `values:` override block byte-for-byte.
+      steps:
+        - uses: git-clone
+          config:
+            repoURL: https://github.com/AtomiCloud/fleet
+            checkout:
+              - branch: main
+                path: ./repo
+        - uses: yaml-update
+          config:
+            path: ./repo/platforms/canary/landscapes/ampharos/dummy.yaml
+            updates:
+              - key: pin.tag
+                value: ${{ imageFrom("registry.atomi.cloud/canary/dummy").Tag }}
+        - uses: git-commit
+          config:
+            path: ./repo
+            author:
+              name: kargo-bot
+              email: kargo-bot@atomi.cloud
+            message: "chore(canary): promote dummy to ampharos"
+        - uses: git-push
+          config:
+            path: ./repo
+---
+# Source: diene-platform/templates/virtual-landscape-service.yaml
+apiVersion: fleet.atomi.cloud/v1alpha1
+kind: VirtualLandscapeService
+metadata:
+  name: dummy-mew-raichu
+  namespace: canary
+  labels:
+    helm.sh/chart: diene-platform-0.1.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: diene-fleet
+    atomi.cloud/platform: "canary"
+spec:
+  # platform is the explicit S16 source of truth (never inferred): the P slot
+  # is stamped here so a fragment cannot serve under another platform.
+  platform: canary
+  vlandscape: mew
+  service: dummy
+  module: api
+  landscape: raichu
+  serve: true
+---
+# Source: diene-platform/templates/kargo.yaml
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Warehouse
+metadata:
+  name: dummy
+  namespace: canary
+  labels:
+    helm.sh/chart: diene-platform-0.1.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: diene-fleet
+    atomi.cloud/platform: "canary"
+spec:
+  # Kargo >=1.8 evaluates this native criterion against discovered artifacts
+  # before creating Freight. Skewed image/chart revisions therefore never
+  # become promotable Freight; mercury uses this same ordinary service rail.
+  interval: 5m0s
+  freightCreationPolicy: Automatic
+  freightCreationCriteria:
+    expression: "imageFrom('registry.atomi.cloud/canary/dummy').Tag == chartFrom('oci://registry.atomi.cloud/canary-dummy').Version"
+  subscriptions:
+    - image:
+        repoURL: registry.atomi.cloud/canary/dummy
+        imageSelectionStrategy: SemVer
+        constraint: ">=0.0.0"
+        strictSemvers: true
+        discoveryLimit: 5
+    - chart:
+        repoURL: oci://registry.atomi.cloud/canary-dummy
+        semverConstraint: ">=0.0.0"
+        discoveryLimit: 5
+---
+# Source: diene-platform/templates/webhook-engine.yaml
+apiVersion: fleet.atomi.cloud/v1alpha1
+kind: WebhookEngine
+metadata:
+  # ONE fleet-wide mercury deployment (Q-MT1): the platform declares config
+  # only. There is NO engine-version field — the mercury-stable pin rides
+  # Kargo on mercury's own service rows, not here.
+  name: mercury
+  namespace: canary
+  labels:
+    helm.sh/chart: diene-platform-0.1.0
+    app.kubernetes.io/managed-by: Helm
+    app.kubernetes.io/part-of: diene-fleet
+    atomi.cloud/platform: "canary"
+spec:
+  home:
+    vlandscape: mew
+  retention:
+    archive:
+      bucket: canary-webhook-archive
+      store: tigris
+    cycle: monthly
+    keepMonths: 2
+  retryWindow: "72h"
+  backoff:
+    initial: 5s
+    shape: exponential
+  circuitBreaker:
+    failWindow: 24h
+  dedupWindow: "72h"
+  quotas:
+    burst: 200
+    intakeRps: 50
+  customDomains:
+    []

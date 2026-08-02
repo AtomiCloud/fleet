@@ -1,0 +1,6 @@
+# SIT-only machine-roster fixture. This is copied into a throwaway git repo;
+# it is not a platform or topology registry record.
+platform: sitother
+services:
+  - name: dummy
+    repo: AtomiCloud/sitother.dummy

@@ -1,0 +1,221 @@
+# Inert commissioning fixture. It is deliberately nested below registry/
+# rather than .github/workflows: an owner must review and install this exact
+# file on AtomiCloud/fleet-guard-sandbox before production dispatches it.
+name: Sandbox Ordinary Token Guard Probe
+
+run-name: ordinary-token-guard-${{ inputs.run_key }}-${{ inputs.mode }}
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Fixed policy-denial probe to run
+        required: true
+        type: choice
+        options:
+          - create-denied
+          - update-delete-denied
+      run_key:
+        description: Production-run identity binding the evidence, as <run-id>-<attempt> (digits-digits)
+        required: true
+        type: string
+      backtrack_sha:
+        description: Existing sandbox main commit used as the stable baseline
+        required: true
+        type: string
+      forward_sha:
+        description: Strict descendant sandbox main commit used for update probes
+        required: true
+        type: string
+
+# This is intentionally the sandbox workflow's own ordinary GITHUB_TOKEN. It
+# must have write scope so a denial cannot be mistaken for a missing-scope 403.
+permissions:
+  contents: write
+
+jobs:
+  ordinary-token-policy-denial:
+    if: github.repository == 'AtomiCloud/fleet-guard-sandbox'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Establish ref preconditions and prove the sandbox GITHUB_TOKEN policy denial
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          MODE: ${{ inputs.mode }}
+          RUN_KEY: ${{ inputs.run_key }}
+          BACKTRACK_SHA: ${{ inputs.backtrack_sha }}
+          FORWARD_SHA: ${{ inputs.forward_sha }}
+          SANDBOX_REPOSITORY: ${{ github.repository }}
+          GITHUB_API_URL: ${{ github.api_url }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          readonly expected_repository='AtomiCloud/fleet-guard-sandbox'
+          readonly stable_ref='refs/tags/machinery-stable'
+
+          fail() {
+            echo "❌ $1" >&2
+            exit 1
+          }
+
+          [ "${SANDBOX_REPOSITORY}" = "${expected_repository}" ] ||
+            fail "unexpected sandbox repository ${SANDBOX_REPOSITORY}"
+          [[ "${RUN_KEY}" =~ ^[0-9]+-[0-9]+$ ]] ||
+            fail 'run identity must be <run-id>-<attempt> (digits-digits)'
+          [[ "${BACKTRACK_SHA}" =~ ^[0-9a-f]{40}$ ]] || fail 'BACKTRACK_SHA must be a full SHA'
+          [[ "${FORWARD_SHA}" =~ ^[0-9a-f]{40}$ ]] || fail 'FORWARD_SHA must be a full SHA'
+          : "${GITHUB_TOKEN:?the sandbox workflow GITHUB_TOKEN is required}"
+
+          tmp_dir="$(mktemp -d)"
+          trap 'rm -rf -- "${tmp_dir}"' EXIT
+          request_count=0
+          response_status=''
+          response_body=''
+
+          capture_api_response() {
+            local method="$1"
+            local endpoint="$2"
+            local payload="${3:-}"
+
+            request_count=$((request_count + 1))
+            response_body="${tmp_dir}/response-${request_count}.json"
+            if [ -n "${payload}" ]; then
+              response_status="$(printf '%s' "${payload}" | curl \
+                --silent --show-error --connect-timeout 15 --max-time 60 \
+                --request "${method}" \
+                --header 'Accept: application/vnd.github+json' \
+                --header 'X-GitHub-Api-Version: 2022-11-28' \
+                --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+                --header 'Content-Type: application/json' \
+                --data-binary @- \
+                --output "${response_body}" \
+                --write-out '%{http_code}' \
+                "${GITHUB_API_URL}/${endpoint}")" ||
+                  fail "${method} ${endpoint} did not reach the GitHub API"
+            else
+              response_status="$(curl \
+                --silent --show-error --connect-timeout 15 --max-time 60 \
+                --request "${method}" \
+                --header 'Accept: application/vnd.github+json' \
+                --header 'X-GitHub-Api-Version: 2022-11-28' \
+                --header "Authorization: Bearer ${GITHUB_TOKEN}" \
+                --output "${response_body}" \
+                --write-out '%{http_code}' \
+                "${GITHUB_API_URL}/${endpoint}")" ||
+                  fail "${method} ${endpoint} did not reach the GitHub API"
+            fi
+            [[ "${response_status}" =~ ^[0-9]{3}$ ]] ||
+              fail "${method} ${endpoint} returned an invalid HTTP status ${response_status:-empty}"
+          }
+
+          # A ruleset-blocked `POST /git/refs` answers 422 with the envelope
+          # message "Validation Failed" and the ruleset wording in
+          # `.errors[].message`, so "validation failed" must NOT be excluded —
+          # excluding it would reject the exact denial this probe exists to
+          # prove. Genuine schema-validation 422s are still refused, because the
+          # required ruleset/protected/bypass wording below never appears in
+          # them.
+          classify_policy_denial() {
+            local status="$1"
+            local body_file="$2"
+
+            case "${status}" in
+              403 | 422) ;;
+              *) return 1 ;;
+            esac
+            jq -e '
+              def denial_text:
+                [
+                  .message? // empty,
+                  .documentation_url? // empty,
+                  (.errors[]? |
+                    if type == "object" then
+                      .message? // empty,
+                      .code? // empty,
+                      .field? // empty
+                    else
+                      tostring
+                    end)
+                ] | join("\n");
+              denial_text as $text
+              | (($text | test("(?i)(not[[:space:]-]*found|resource[[:space:]-]*not[[:space:]-]*accessible|reference[[:space:]-]*already[[:space:]-]*exists)")) | not)
+              and ($text | test("(?i)(repository[[:space:]-]*(rule|ruleset)|ruleset|protected[[:space:]-]*(branch|ref|tag)|bypass)"))
+            ' "${body_file}" >/dev/null
+          }
+
+          api_expect_policy_denied() {
+            local label="$1"
+            local method="$2"
+            local endpoint="$3"
+            local payload="${4:-}"
+
+            capture_api_response "${method}" "${endpoint}" "${payload}"
+            classify_policy_denial "${response_status}" "${response_body}" ||
+              fail "${label} was not an exact ruleset-policy denial (HTTP ${response_status})"
+            echo "✅ policy denial: ${label} (HTTP ${response_status})"
+          }
+
+          exact_ref_json() {
+            local ref="$1"
+            local suffix="${ref#refs/}"
+            local prefix="${suffix%/*}/${suffix##*/}"
+            capture_api_response GET "repos/${SANDBOX_REPOSITORY}/git/matching-refs/${prefix}"
+            [ "${response_status}" = '200' ] ||
+              fail "endpoint precondition lookup for ${ref} returned HTTP ${response_status}"
+            jq -c --arg ref "${ref}" '[.[] | select(.ref == $ref)]' "${response_body}"
+          }
+
+          assert_ref_absent() {
+            local ref="$1"
+            local exact
+            exact="$(exact_ref_json "${ref}")"
+            [ "$(jq 'length' <<<"${exact}")" -eq 0 ] ||
+              fail "endpoint precondition failed: ${ref} must be absent"
+          }
+
+          assert_ref_at_sha() {
+            local ref="$1"
+            local expected_sha="$2"
+            local exact
+            exact="$(exact_ref_json "${ref}")"
+            jq -e --arg ref "${ref}" --arg sha "${expected_sha}" '
+              length == 1
+              and .[0].ref == $ref
+              and .[0].object.type == "commit"
+              and .[0].object.sha == $sha
+            ' <<<"${exact}" >/dev/null ||
+              fail "endpoint precondition failed: ${ref} must be one lightweight commit ref at ${expected_sha}"
+          }
+
+          assert_commit_exists() {
+            local sha="$1"
+            capture_api_response GET "repos/${SANDBOX_REPOSITORY}/git/commits/${sha}"
+            [ "${response_status}" = '200' ] ||
+              fail "endpoint precondition failed: commit ${sha} lookup returned HTTP ${response_status}"
+            jq -e --arg sha "${sha}" '.sha == $sha' "${response_body}" >/dev/null ||
+              fail "endpoint precondition failed: commit lookup did not return ${sha}"
+          }
+
+          case "${MODE}" in
+            create-denied)
+              assert_commit_exists "${BACKTRACK_SHA}"
+              assert_ref_absent "${stable_ref}"
+              payload="$(jq -n --arg ref "${stable_ref}" --arg sha "${BACKTRACK_SHA}" '{ref: $ref, sha: $sha}')"
+              api_expect_policy_denied 'ordinary workflow token machinery-stable creation' POST "repos/${SANDBOX_REPOSITORY}/git/refs" "${payload}"
+              assert_ref_absent "${stable_ref}"
+              ;;
+            update-delete-denied)
+              assert_commit_exists "${FORWARD_SHA}"
+              assert_ref_at_sha "${stable_ref}" "${BACKTRACK_SHA}"
+              payload="$(jq -n --arg sha "${FORWARD_SHA}" '{sha: $sha, force: false}')"
+              api_expect_policy_denied 'ordinary workflow token machinery-stable update' PATCH "repos/${SANDBOX_REPOSITORY}/git/refs/tags/machinery-stable" "${payload}"
+              assert_ref_at_sha "${stable_ref}" "${BACKTRACK_SHA}"
+              api_expect_policy_denied 'ordinary workflow token machinery-stable deletion' DELETE "repos/${SANDBOX_REPOSITORY}/git/refs/tags/machinery-stable"
+              assert_ref_at_sha "${stable_ref}" "${BACKTRACK_SHA}"
+              ;;
+            *) fail "unsupported fixture mode ${MODE}" ;;
+          esac
+
+          echo "FLEET_GUARD_ORDINARY_TOKEN_EVIDENCE mode=${MODE} run_key=${RUN_KEY} result=policy-denied"

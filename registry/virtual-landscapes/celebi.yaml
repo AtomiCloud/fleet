@@ -1,0 +1,23 @@
+# VirtualLandscape CR — envelope/registrar entry (T3-DESIGN.md §2). No
+# reconciler. The staging counterpart of `mew`: purely a DNS/multi-tenant
+# envelope {name, hosts} with no clusters of its own.
+#
+# HOST SET IS AN INFERENCE, CONFIRMED HERE: goals/fleet.md derives
+# `{hosts: [pikachu]}` from "celebi = same pattern for staging rows"
+# (ARCHITECTURE.md §4) plus pikachu being the only staging host in the ratified
+# eight-landscape model. The goal names THIS committed manifest as the
+# confirming site, so this file is the confirmation — not a guess: the host set
+# is fully determined by the ratified serving set, unlike the cluster
+# marks/providers and ENTEI's region, which remain owner-unratified refusal
+# points and are therefore fixtures, not live rows.
+#
+# Host-set SHRINK is refused while any (host × envelope) still has a serving
+# VirtualLandscapeService fragment — fragment deletion, not serve:false, is the
+# release signal (Q-I34).
+apiVersion: fleet.atomi.cloud/v1alpha1
+kind: VirtualLandscape
+metadata:
+  name: celebi
+spec:
+  hosts:
+    - pikachu

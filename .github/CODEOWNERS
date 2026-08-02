@@ -13,5 +13,24 @@
 
 /registry/           @AtomiCloud/fleet-admin
 /registry/**         @AtomiCloud/fleet-admin
+/.github/            @AtomiCloud/fleet-admin
+/.github/**          @AtomiCloud/fleet-admin
 /.github/CODEOWNERS  @AtomiCloud/fleet-admin
 /.github/rulesets/   @AtomiCloud/fleet-admin
+/.github/rulesets/** @AtomiCloud/fleet-admin
+/.github/workflows/  @AtomiCloud/fleet-admin
+/.github/workflows/** @AtomiCloud/fleet-admin
+/scripts/ci/         @AtomiCloud/fleet-admin
+/scripts/ci/**       @AtomiCloud/fleet-admin
+/scripts/validate/   @AtomiCloud/fleet-admin
+/scripts/validate/** @AtomiCloud/fleet-admin
+/scripts/local/materialize-fleet.sh @AtomiCloud/fleet-admin
+/scripts/local/registry-guard-apply.sh @AtomiCloud/fleet-admin
+/scripts/local/registry-guard-e2e.sh @AtomiCloud/fleet-admin
+/scripts/local/machinery-stable-tag-move.sh @AtomiCloud/fleet-admin
+/scripts/validate/registry-guard.sh @AtomiCloud/fleet-admin
+/flake.nix           @AtomiCloud/fleet-admin
+/flake.lock          @AtomiCloud/fleet-admin
+/.envrc              @AtomiCloud/fleet-admin
+/nix/                @AtomiCloud/fleet-admin
+/nix/**              @AtomiCloud/fleet-admin

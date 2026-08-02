@@ -1,0 +1,20 @@
+apiVersion: v2
+name: diene-platform
+description: >-
+  The fleet compiler chart. Renders one platform's control plane — the Platform
+  CR, its Kargo Project/Warehouse/Stages, and its per-platform ApplicationSet
+  (g1 primordial + g2 per-cluster matrix) — from that platform's carbon
+  platform.yaml (source B) plus fleet's machine-written services.yaml (source
+  C). Git-sourced fleet-wide machinery (S32): the machinery-stable tag is the
+  moving version pointer; OCI digests cannot resolve a moving tag.
+type: application
+version: 0.1.0
+appVersion: 0.1.0
+keywords:
+  - fleet
+  - gitops
+  - argocd
+  - kargo
+  - compiler
+maintainers:
+  - name: AtomiCloud fleet-admin

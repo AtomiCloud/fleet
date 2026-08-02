@@ -1,0 +1,22 @@
+{{- $platform := include "diene-platform.platform" . -}}
+{{- range $cf := .Values.cloudflareDeploy }}
+apiVersion: {{ $.Values.apiVersions.edge }}
+kind: CloudflareDeploy
+metadata:
+  name: {{ required "cloudflareDeploy[].scriptName is required" $cf.scriptName }}
+  namespace: {{ $platform }}
+  labels:
+    {{- include "diene-platform.labels" $ | nindent 4 }}
+spec:
+  scriptName: {{ $cf.scriptName }}
+  # tag-addressed version (never a hand-pinned version id): CI uploads
+  # versions, Kargo freight pins the tag, cf-deploy resolves tag → version.
+  desiredVersionFrom:
+    tag: {{ required "cloudflareDeploy[].tag is required" $cf.tag | quote }}
+  {{- with $cf.rollout }}
+  rollout:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
+  pin: {{ $cf.pin | default false }}
+---
+{{- end }}

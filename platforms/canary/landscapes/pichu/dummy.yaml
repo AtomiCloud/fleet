@@ -1,0 +1,6 @@
+# MACHINE-WRITTEN row (stub: T3 materializer · pin: Kargo). platform: explicit (S16).
+platform: canary
+service: dummy
+landscape: pichu
+pin:
+  tag: 0.1.0

@@ -1,0 +1,17 @@
+# VirtualLandscape CR — envelope/registrar entry (T3-DESIGN.md §2). No
+# reconciler. MULTI-TENANT: many platforms serve into one envelope and
+# conflicts are impossible by construction because every hostname is DERIVED as
+# <module>.<service>.<PLATFORM>.<vlandscape>… — the P slot is the serving
+# VirtualLandscapeService fragment's required explicit `platform` field,
+# admission-checked against its owner, never inferred. Bare names (mew) are
+# fleet-PR name-governed; prefixed names are auto-granted. Host-set SHRINK is
+# refused while any (host × envelope) still has a serving fragment — fragment
+# deletion, not serve:false, is the release signal.
+apiVersion: fleet.atomi.cloud/v1alpha1
+kind: VirtualLandscape
+metadata:
+  name: mew
+spec:
+  hosts:
+    - raichu
+    - ampharos

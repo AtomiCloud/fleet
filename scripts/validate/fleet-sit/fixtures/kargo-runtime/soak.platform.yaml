@@ -1,0 +1,31 @@
+# SIT-only strengthener for the released controller's real wall clock. This is
+# the production canary DAG with the literal soak shortened from 15m to 90s.
+# Pichu is omitted from this throwaway project so an unrelated third verified
+# Stage cannot trigger Kargo v1.9.10's exact-set bug while this fixture isolates
+# the requested pikachu+raichu All/soak contract.
+platform: canary-sitsoak
+services:
+  - name: dummy
+    repo: AtomiCloud/canary-sitsoak.dummy
+infisical:
+  projectSlug: canary-sitsoak
+  serviceFolders: true
+sos:
+  register: false
+landscapes:
+  - pikachu
+  - raichu
+  - ampharos
+stages:
+  - - landscape: pikachu
+      gate: manual
+      verification:
+        analysisTemplates:
+          - canary-smoke
+    - raichu
+  - landscape: ampharos
+    gate: auto
+    soak: 90s
+    verification:
+      analysisTemplates:
+        - canary-analysis

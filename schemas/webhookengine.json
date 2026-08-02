@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "type": "object",
+  "required": ["apiVersion", "kind", "metadata", "spec"],
+  "properties": {
+    "apiVersion": { "type": "string" },
+    "kind": { "const": "WebhookEngine" },
+    "metadata": { "type": "object", "required": ["name"] },
+    "spec": {
+      "type": "object",
+      "required": ["home"],
+      "properties": {
+        "home": {
+          "type": "object",
+          "required": ["vlandscape"],
+          "properties": { "vlandscape": { "type": "string", "minLength": 1 } },
+          "additionalProperties": false
+        },
+        "retention": { "type": "object" },
+        "retryWindow": { "type": "string" },
+        "backoff": { "type": "object" },
+        "circuitBreaker": { "type": "object" },
+        "dedupWindow": { "type": "string" },
+        "quotas": { "type": "object" },
+        "customDomains": { "type": "array" }
+      },
+      "comment": "additionalProperties:false is load-bearing (Q-WH1/Q-MT1): there is exactly ONE fleet-wide mercury deployment and NO engine-version field. A fixture that declares any version/engineVersion field is schema-invalid.",
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

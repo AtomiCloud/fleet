@@ -1,0 +1,15 @@
+apiVersion: kargo.akuity.io/v1alpha1
+kind: Freight
+metadata:
+  name: seed
+  namespace: <namespace>
+alias: <alias>
+origin:
+  kind: Warehouse
+  name: dummy
+images:
+  - repoURL: <image-repo>
+    tag: <tag>
+charts:
+  - repoURL: <chart-repo>
+    version: <tag>

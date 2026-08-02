@@ -1,0 +1,26 @@
+# ClusterRegistration FIXTURE — serving-cluster shape for landscape `raichu`.
+#
+# NOT A LIVE ROW. The v1 serving-cluster roster is UNRATIFIED: no ratified
+# source enumerates how many clusters each serving landscape runs, nor each
+# cluster's mark, provider, or provider account/region. T3-DESIGN §3.1's
+# `raichu-opal` (provider `doks`) is a normative EXAMPLE, not a roster, and the
+# recorded topology ruling FORBIDS guessing provider coordinates.
+#
+# The fixture proves the shape — `<l>-<mark>` naming, the `spec.traffic` dial,
+# the provider field, and the landscape label mirroring `spec.landscape` — while
+# the `<mark>`/`<provider>` placeholders keep it unusable as a live row: the
+# placeholder-live-path guard refuses any `<...>` token under registry/clusters/.
+#
+# Live serving rows land only after the owner publishes the v1 cluster roster.
+apiVersion: fleet.atomi.cloud/v1alpha1
+kind: ClusterRegistration
+metadata:
+  name: 'raichu-<mark>'
+  labels:
+    atomi.cloud/landscape: raichu
+spec:
+  landscape: raichu
+  mark: '<mark>'
+  provider: '<provider>'
+  originMode: loadbalancer
+  traffic: true

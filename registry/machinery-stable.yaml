@@ -1,0 +1,3 @@
+# Reviewed pointer consumed only by the protected machinery-stable workflow.
+# Promotion and rollback both select a descendant commit on main.
+target: 752170d700411ae4393e5dd92e9871708561932b

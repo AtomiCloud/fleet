@@ -1,0 +1,90 @@
+# diene-platform compiler-chart defaults.
+#
+# The three-source ArgoCD Application layers values as:
+#   source A  this chart (these defaults)
+#   source B  <p>.carbon platform.yaml   — human intent (landscapes/stages/deps/...)
+#   source C  fleet platforms/<p>/services.yaml — machine roster (platform + services)
+# so the keys below are the machinery-stable defaults every platform inherits.
+
+# -- Frozen T3 / upstream API groups the compiler renders against.
+apiVersions:
+  fleet: fleet.atomi.cloud/v1alpha1
+  identity: identity.atomi.cloud/v1alpha1
+  edge: edge.atomi.cloud/v1alpha1
+  argoproj: argoproj.io/v1alpha1
+  applicationSet: argoproj.io/v1alpha1
+  kargo: kargo.akuity.io/v1alpha1
+
+# -- Single configurable service-tree label/annotation prefix.
+labelPrefix: atomi.cloud
+
+# -- The fleet git repository (sources A and C live here).
+fleet:
+  repoURL: https://github.com/AtomiCloud/fleet
+  revision: HEAD
+
+# -- OCI registry that publishes per-service app + primordial charts.
+oci:
+  registry: registry.atomi.cloud
+
+# -- ArgoCD placement.
+argocd:
+  namespace: argocd
+  project: default
+
+# -- The Primordial central cluster (g1 primordial-app destination).
+primordial:
+  server: https://kubernetes.default.svc
+
+# -- Kargo promotion bot identity (fixed git-update promotion template).
+kargo:
+  bot:
+    name: kargo-bot
+    email: kargo-bot@atomi.cloud
+
+# ---- source C (services.yaml) provides these ----
+
+# -- Explicit platform name (S16 single source of truth). Must equal the
+#    release namespace; the compiler refuses a mismatch.
+platform: ''
+
+# -- Machine roster: which <p>.<svc> repos exist. One Warehouse + one Kargo
+#    stage-chain + one AppSet fan-out is rendered per entry.
+services: []
+
+# ---- source B (platform.yaml) provides these ----
+
+# -- Infisical project wiring for the Platform CR.
+infisical:
+  projectSlug: ''
+  serviceFolders: true
+
+# -- Self-onboarding-service registration.
+sos:
+  register: true
+
+# -- Declared registered-fleet serving landscape set. The lapras Landscape is
+#    only a secrets-side anchor; its anonymous Garden clusters are not rows.
+landscapes: []
+
+# -- Pipeline DAG. Each entry is a step: a bare landscape name, an object
+#    {landscape, gate: auto|manual, soak, verification:{analysisTemplates}}, or
+#    a list of either (a [parallel, set] step). Compiled 1:1 into Kargo Stages.
+stages: []
+
+# -- Registered-fleet PlatformDependency modules by class
+#    (database/kv/cache/store). `delivery: local` is Garden-owned and rejected
+#    by this Primordial compiler.
+dependencies: {}
+
+# -- VirtualLandscapeService serve fragments (platform-level, canary exercises one).
+virtualLandscapeServices: []
+
+# -- WebhookEngine config (post-Q-WH1/WH3 shape; NO engine-version field).
+webhookEngine: {}
+
+# -- CloudflareDeploy Worker version-pin blocks (frontend/erbium rail).
+cloudflareDeploy: []
+
+# -- Problem catalog fragments (RFC7807).
+problems: []

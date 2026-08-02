@@ -1,0 +1,164 @@
+# canary platform.yaml — golden-render fixture.
+#
+# In production this file lives in AtomiCloud/canary.carbon (source B of the
+# three-source compiler Application), exactly like any real platform. It is
+# committed here ONLY as the golden-render fixture: canary's job is to touch
+# EVERY platform.yaml feature the compiler chart understands, so the render
+# exercises every code path.
+#
+# Derive-don't-declare: only pipeline DAG + dependency/VLS/webhook/deploy
+# declarations that genuinely originate at the platform appear here — never DNS,
+# discovery docs, the belt, or webhook targets.
+
+infisical:
+  projectSlug: canary
+  serviceFolders: true
+sos:
+  register: true
+
+# The registered WORKLOAD landscape set — exactly the four serving rows.
+# `entei` is infrastructure-only and is NEVER declared here (exclusion law,
+# ENV-SPEC §0.3); Garden-managed landscapes (lapras/ditto/rotom/absol) and
+# hosted/retired identities have no registry row at all, so they cannot appear.
+landscapes:
+  - pichu
+  - pikachu
+  - raichu
+  - ampharos
+
+# The ratified v1 pipeline DAG. It deliberately combines a bare first step, a
+# parallel set mixing an OBJECT member with a BARE member, both gate values,
+# soak, analysisTemplates, and — decisively — a post-parallel RENDEZVOUS step:
+# `ampharos` immediately follows the parallel set, so its rendered Stage must
+# list BOTH `pikachu` and `raichu` under sources.stages with
+# sources.availabilityStrategy: All.
+#
+# With exactly four workload landscapes and `entei` excluded, a rendezvous is
+# only coverable by placing the parallel set MID-DAG — a terminal parallel set
+# is the strictly weaker fan-out-only shape.
+stages:
+  - pichu
+  - - landscape: pikachu
+      gate: manual
+      verification:
+        analysisTemplates:
+          - canary-smoke
+    - raichu
+  - landscape: ampharos
+    gate: auto
+    soak: 15m
+    verification:
+      analysisTemplates:
+        - canary-analysis
+
+# ≥1 registered-fleet PlatformDependency module per class family. External
+# modules reconcile from Primordial; replicated Dragonfly rides every eligible
+# landscape cluster. Local cnpg/minio declarations are intentionally absent:
+# Garden/local-operator owns that held path.
+dependencies:
+  landscape: raichu
+  placement:
+    preferredHost: raichu
+  database:
+    maindb:
+      type: neon
+      delivery: external
+      providerAccountRef: canary-neon
+      credentialMode: standard
+      rotation: 'on'
+      cpu: 1
+      ram: 1Gi
+      storage: 10Gi
+      version: '16'
+      backup:
+        crossVendor: true
+      engine:
+        neon:
+          tier: free
+  kv:
+    sessions:
+      type: upstash
+      delivery: external
+      providerAccountRef: canary-upstash
+      credentialMode: standard
+      rotation: 'on'
+      ram: 128Mi
+      engine:
+        upstash: {}
+  cache:
+    hot:
+      type: dragonfly
+      delivery: replicated
+      credentialMode: standard
+      rotation: 'on'
+      ram: 128Mi
+      engine:
+        dragonfly: {}
+  store:
+    assets:
+      type: tigris
+      delivery: external
+      providerAccountRef: canary-tigris
+      credentialMode: standard
+      rotation: 'on'
+      engine:
+        tigris: {}
+
+# VirtualLandscapeService fragment (mew envelope rendering).
+virtualLandscapeServices:
+  - service: dummy
+    module: api
+    vlandscape: mew
+    landscape: raichu
+    serve: true
+
+# WebhookEngine config (post-Q-WH1/WH3 shape — retention/backoff/dedup/quotas/
+# customDomains; NO worker/d1/hostname/engine-version fields).
+webhookEngine:
+  home:
+    vlandscape: mew
+  retention:
+    cycle: monthly
+    keepMonths: 2
+    archive:
+      store: tigris
+      bucket: canary-webhook-archive
+  retryWindow: 72h
+  backoff:
+    initial: 5s
+    shape: exponential
+  circuitBreaker:
+    failWindow: 24h
+  dedupWindow: 72h
+  quotas:
+    intakeRps: 50
+    burst: 200
+  customDomains: []
+
+# CloudflareDeploy block (frontend/erbium Worker rail — tag-addressed, gradual).
+cloudflareDeploy:
+  - scriptName: canary-web
+    tag: 0.1.0
+    pin: true
+    rollout:
+      strategy: gradual
+      steps:
+        - percent: 10
+          soak: 10m
+        - percent: 100
+
+# Problem catalog fragment (RFC7807).
+problems:
+  - service: dummy
+    landscape: raichu
+    version: 0.1.0
+    entries:
+      - id: CANARY_DUMMY
+        type: https://errors.atomi.cloud/canary/dummy
+        title: Canary dummy problem
+        status: 418
+        recoverable: false
+        schema: {}
+        endpoints:
+          - method: GET
+            path: /

@@ -1,0 +1,93 @@
+# platforms ApplicationSet — the ONE committed AppSet, human-written once.
+#
+# It is an SCM-provider generator over AtomiCloud/*.carbon: creating a carbon
+# repo IS platform registration. A new AtomiCloud/<p>.carbon repo is picked up
+# with ZERO fleet-repo code changes; T3's platform-controller materializer then
+# writes platforms/<p>/ (services.yaml + row stubs) with no human involvement
+# beyond creating the carbon repo.
+#
+# Each match renders one three-source platform-<p> Application (multi-source
+# $values ref, ArgoCD ≥2.10):
+#   source A  the compiler chart @ registry/charts/diene-platform, pinned to the
+#             machinery-stable git tag — the canary platform is the sole
+#             exception, pinned to `main` so it renders every compiler-chart
+#             commit first (its golden render + smoke test).
+#   source B  the carbon repo's platform.yaml   (ref: carbon → $carbon)
+#   source C  fleet's platforms/<p>/services.yaml (ref: services → $services),
+#             read from HEAD through an explicit :443 URL identity. Argo rejects
+#             two revisions of one normalized repo URL; the distinct, valid
+#             GitHub URL keeps materializer-written rosters live while source A
+#             remains release-pinned.
+#
+# Canary runs with AUTO-SYNC DISABLED (see templatePatch): every compiler-chart
+# merge to main surfaces as a human-reviewed Argo out-of-sync render diff — the
+# golden render, for free — and syncing is at the human's discretion. Every
+# other platform auto-syncs and pins the moving machinery-stable tag.
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: platforms
+  namespace: argocd
+  labels:
+    app.kubernetes.io/part-of: diene-fleet
+spec:
+  goTemplate: true
+  goTemplateOptions: ['missingkey=error']
+  generators:
+    # SCM-provider generator over the AtomiCloud org, filtered to *.carbon repos.
+    # A carbon repo's existence is the sole registration signal.
+    - scmProvider:
+        github:
+          organization: AtomiCloud
+          allBranches: false
+        filters:
+          - repositoryMatch: '\.carbon$'
+  template:
+    metadata:
+      name: 'platform-{{ trimSuffix ".carbon" .repository }}'
+      labels:
+        app.kubernetes.io/part-of: diene-fleet
+        atomi.cloud/platform: '{{ trimSuffix ".carbon" .repository }}'
+    spec:
+      project: default
+      destination:
+        # Control-plane objects (Platform CR + Kargo CRs + the per-platform
+        # child AppSet) render onto the Primordial central cluster.
+        server: https://kubernetes.default.svc
+        namespace: '{{ trimSuffix ".carbon" .repository }}'
+      sources:
+        # source A — the compiler chart. machinery-stable for every platform;
+        # canary pins main (renders every commit first).
+        - repoURL: https://github.com/AtomiCloud/fleet
+          path: registry/charts/diene-platform
+          targetRevision: '{{ if eq .repository "canary.carbon" }}main{{ else }}machinery-stable{{ end }}'
+          helm:
+            valueFiles:
+              - '$carbon/platform.yaml'
+              - '$services/platforms/{{ trimSuffix ".carbon" .repository }}/services.yaml'
+        # source B — the carbon repo's platform.yaml (human intent).
+        - repoURL: '{{ .url }}'
+          targetRevision: HEAD
+          ref: carbon
+        # source C — fleet's machine-written services.yaml roster.
+        # The explicit default port is intentional. Argo CD v3.4.5 preserves it
+        # when normalizing repository identities, so this public GitHub checkout
+        # may stay on HEAD while source A uses main/machinery-stable. The live
+        # SIT fails if an Argo upgrade collapses the identities or GitHub stops
+        # serving this valid URL.
+        - repoURL: https://github.com:443/AtomiCloud/fleet
+          targetRevision: HEAD
+          ref: services
+      syncPolicy:
+        syncOptions:
+          - CreateNamespace=true
+  # Canary alone: strip the automated block so its render diff is human-reviewed
+  # (manual sync), not auto-applied. Every other platform gets auto-sync.
+  templatePatch: |
+    {{- if ne .repository "canary.carbon" }}
+    spec:
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+    {{- end }}

@@ -1,0 +1,19 @@
+{{- $platform := include "diene-platform.platform" . -}}
+apiVersion: {{ .Values.apiVersions.fleet }}
+kind: Platform
+metadata:
+  name: {{ $platform }}
+  namespace: {{ $platform }}
+  labels:
+    {{- include "diene-platform.labels" . | nindent 4 }}
+spec:
+  infisical:
+    projectSlug: {{ .Values.infisical.projectSlug | default $platform }}
+    serviceFolders: {{ .Values.infisical.serviceFolders }}
+  sos:
+    register: {{ .Values.sos.register }}
+  pipeline:
+    # Rendered 1:1 from carbon's platform.yaml stages: — the derived Kargo
+    # Stages live in kargo.yaml; this is the DAG of record.
+    stages:
+      {{- toYaml .Values.stages | nindent 6 }}
