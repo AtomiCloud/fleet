@@ -13,13 +13,13 @@ infisical:
 sos:
   register: false
 landscapes:
-  - landscape: pichu
-    gate: manual
+  - pichu
   - pikachu
   - raichu
   - ampharos
 stages:
-  - pichu
+  - landscape: pichu
+    gate: manual
   - - landscape: pikachu
       gate: manual
       verification:
