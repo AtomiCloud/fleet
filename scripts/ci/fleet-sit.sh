@@ -2062,6 +2062,17 @@ kargo_runtime_canonical_image_tag() {
   printf '%s' "${ref}"
 }
 
+kargo_runtime_ctr_saved_display_tag() {
+  local ref
+  ref="$(kargo_runtime_canonical_image_tag "$1")"
+  # containerd's transfer progress renderer turns hyphens in an imported image
+  # name into spaces (for example, `argo-rollouts` is displayed as
+  # `argo rollouts`). Spaces are not legal in an OCI image reference, so this
+  # is an injective comparison against ctr's evidence surface, not acceptance
+  # of an alternate image name.
+  printf '%s' "${ref//-/ }"
+}
+
 kargo_runtime_import_node_image() {
   local tag_ref="$1"
   local digest="$2"
@@ -2097,10 +2108,11 @@ kargo_runtime_assert_import_transcript() {
   # a positive ctr marker binding its canonical tag to the PINNED digest, so an
   # empty, truncated, or silently short transcript is red too. Containerd 1.7
   # prints a one-line `unpacking TAG (DIGEST)...done` marker. The current Wolfi
-  # ctr prints an adjacent `TAG saved` line followed by `MEDIA-TYPE DIGEST`.
+  # ctr prints an adjacent `DISPLAYED-TAG saved` line followed by
+  # `MEDIA-TYPE DIGEST`; its transfer renderer displays hyphens as spaces.
   # Accept both exact shapes, but never infer a binding across intervening
   # output or from the harness's own `== import` marker.
-  local expected_tag digest ref actual_digest bound
+  local expected_tag expected_saved_tag digest ref actual_digest pair bound
   # No process substitution on an instance-executed path. Extract once, with the
   # producer status-checked, so a failed sed cannot read as "no unpack markers"
   # and be blamed on the transcript.
@@ -2110,7 +2122,11 @@ kargo_runtime_assert_import_transcript() {
     sit_fail "could not extract unpack markers from the import transcript: ${transcript}"
   awk -v fleet_import_pairs=1 '
     BEGIN { if (fleet_import_pairs != 1) exit 2 }
-    NF == 2 && $2 == "saved" { saved = $1; next }
+    /[[:space:]]saved[[:space:]]*$/ {
+      saved = $0
+      sub(/[[:space:]]+saved[[:space:]]*$/, "", saved)
+      next
+    }
     saved != "" {
       if (NF == 2 && $1 ~ /^application\// && $2 ~ /^sha256:[0-9a-f]+$/) {
         print saved, $2
@@ -2121,12 +2137,17 @@ kargo_runtime_assert_import_transcript() {
     sit_fail "could not extract saved markers from the import transcript: ${transcript}"
   while [ "$#" -ge 2 ]; do
     expected_tag="$(kargo_runtime_canonical_image_tag "$1")"
+    expected_saved_tag="$(kargo_runtime_ctr_saved_display_tag "$1")"
     digest="$2"
     shift 2
     bound=0
-    while read -r ref actual_digest; do
+    while IFS= read -r pair; do
+      actual_digest="${pair##* }"
+      ref="${pair% "${actual_digest}"}"
+      ref="${ref% }"
       [ -n "${actual_digest}" ] || continue
-      if [ "$(kargo_runtime_canonical_image_tag "${ref}")" = "${expected_tag}" ] &&
+      if { [ "$(kargo_runtime_canonical_image_tag "${ref}")" = "${expected_tag}" ] ||
+        [ "${ref}" = "${expected_saved_tag}" ]; } &&
         [ "${actual_digest}" = "${digest}" ]; then
         bound=1
         break

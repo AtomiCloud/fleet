@@ -2558,7 +2558,8 @@ NSL_INV_GIT_STUB
   : >"${nsl_cat_fns}"
   for nsl_cat_fn in wait_argo_rollouts build_expected_child_apps \
     expected_changed_names kargo_runtime_verify_node_image \
-    kargo_runtime_assert_import_transcript write_direct_input_inventory; do
+    kargo_runtime_ctr_saved_display_tag kargo_runtime_assert_import_transcript \
+    write_direct_input_inventory; do
     sed -n "/^${nsl_cat_fn}() {\$/,/^}\$/p" "${sit_source}" >"${tmp}/nsl-cat-fn.sh"
     test -s "${tmp}/nsl-cat-fn.sh" ||
       fail "could not extract ${nsl_cat_fn}() for the producer-category regression"
@@ -6182,6 +6183,7 @@ sit-node-image-import | sit-node-image)
     namespace_ctr \
     namespace_crictl \
     kargo_runtime_canonical_image_tag \
+    kargo_runtime_ctr_saved_display_tag \
     kargo_runtime_import_node_image \
     kargo_runtime_assert_import_transcript \
     kargo_runtime_verify_node_image \
@@ -6522,7 +6524,7 @@ shim_ctr() {
     return 1
   fi
   # Current Wolfi ctr prints an adjacent saved-name / root-descriptor pair.
-  printf '%s\t\tsaved\n' "${ref}"
+  printf '%s\t\tsaved\n' "${ref//-/ }"
   printf 'application/vnd.docker.distribution.manifest.list.v2+json %s\n' "${digest}"
   printf '%s\t%s\n' "${ref}" "${digest}" >>"${node_state}"
 }
@@ -6860,6 +6862,9 @@ NIIBASE
     fail "R1 the fixed node-image path: ${nii_kargo_alias} is not bound to the pinned digest in the node model"
   grep -q '[[:space:]]saved$' "${tmp}/r1/report/kargo-runtime-image-imports.txt" ||
     fail 'R1 the fixed node-image path: the retained transcript carries no ctr saved marker'
+  grep -qF "${nii_rollouts_tag//-/ }"$'\t\tsaved' \
+    "${tmp}/r1/report/kargo-runtime-image-imports.txt" ||
+    fail 'R1 the fixed node-image path: the Wolfi shim did not reproduce ctr hyphen-to-space display rendering'
   grep -qF "== alias ${nii_kargo_tag} -> ${nii_kargo_alias}" \
     "${tmp}/r1/report/kargo-runtime-image-aliases.txt" ||
     fail 'R1 the fixed node-image path: the retained alias transcript does not record the alias it created'
@@ -6936,7 +6941,17 @@ NIIBASE
   } >"${tmp}/transcript-saved-wrong-pin.txt"
   nii_case r5b transcript "${nii_fns}" "${tmp}/transcript-saved-wrong-pin.txt"
   nii_expect 'R5b saved marker with the wrong digest' 1 'does not bind' r5b
-  echo "  R5 legacy unpack and current Wolfi saved markers carrying other content are both rejected ✓"
+  {
+    printf '%s\t\tsaved\napplication/vnd.oci.image.index.v1+json %s\n' \
+      "${nii_kargo_tag}" "${KARGO_IMAGE_DIGEST}"
+    printf '%s\t\tsaved\napplication/vnd.oci.image.index.v1+json %s\n' \
+      'quay.io/argoproj/argo rolloutz:v1.8.3' "${ROLLOUTS_IMAGE_DIGEST}"
+    printf '%s\t\tsaved\napplication/vnd.oci.image.index.v1+json %s\n' \
+      "${nii_analysis_tag}" "${ANALYSIS_IMAGE_DIGEST}"
+  } >"${tmp}/transcript-saved-wrong-display.txt"
+  nii_case r5c transcript "${nii_fns}" "${tmp}/transcript-saved-wrong-display.txt"
+  nii_expect 'R5c saved marker with an inexact displayed tag' 1 'does not bind' r5c
+  echo "  R5 legacy unpack and current Wolfi saved markers with another digest or displayed tag are rejected ✓"
 
   # P1 — the positive control for the repair itself: unmutated production bytes
   # end with the tag and the pinned digest name on ONE CRI entry per image, and
