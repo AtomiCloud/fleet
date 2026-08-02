@@ -165,6 +165,9 @@ validate_inputs() {
   [ "${NSC_BUSYBOX_PACKAGE}" = 'busybox' ] &&
     [ "${NSC_BUSYBOX_CANONICAL}" = '/usr/bin/busybox' ] ||
     sit_fail 'Namespace BusyBox package and canonical-path pins changed'
+  [ "${NSC_GIT_HTTP_BACKEND_PACKAGE}" = 'git-daemon' ] &&
+    [ "${NSC_GIT_HTTP_BACKEND_CANONICAL}" = '/usr/libexec/git-core/git-http-backend' ] ||
+    sit_fail 'Namespace Git smart-HTTP backend package and canonical-path pins changed'
   [ "${NSC_CONTAINERD_CTR}" = '/vendor/containerd/ctr' ] &&
     [ "${NSC_CONTAINERD_ADDRESS}" = '/var/run/containerd/containerd.sock' ] &&
     [ "${NSC_CONTAINERD_NAMESPACE}" = 'k8s.io' ] ||
@@ -229,12 +232,16 @@ namespace_prepare_tools() {
     package="${entry##* }"
     command -v "${command}" >/dev/null 2>&1 || packages+=("${package}")
   done
+  [ -x "${NSC_GIT_HTTP_BACKEND_CANONICAL}" ] ||
+    packages+=("${NSC_GIT_HTTP_BACKEND_PACKAGE}")
   if [ "${#packages[@]}" -gt 0 ]; then
     apk add --no-cache "${packages[@]}"
     namespace_installed_packages="$(printf '%s\n' "${packages[@]}" | jq -Rsc 'split("\n")[:-1]')"
   else
     namespace_installed_packages='[]'
   fi
+  [ -x "${NSC_GIT_HTTP_BACKEND_CANONICAL}" ] ||
+    sit_fail "Git smart-HTTP backend is missing after tool preparation: ${NSC_GIT_HTTP_BACKEND_CANONICAL}"
 
   local observed_k3s
   observed_k3s="$(k3s --version | awk 'NR == 1 {print $3}')"
@@ -274,6 +281,21 @@ namespace_tool_command_record() {
   shift 2
   version="$(namespace_first_line_receipt "$@")" || return 1
   namespace_tool_record "${name}" "${path}" "${version}"
+}
+
+namespace_git_http_backend_record() {
+  local path="${NSC_GIT_HTTP_BACKEND_CANONICAL}" owner expected_prefix
+  [ -x "${path}" ] || {
+    sit_fail "Git smart-HTTP backend pin is not an executable: ${path}"
+    return 1
+  }
+  owner="$(namespace_first_line_receipt apk info --who-owns "${path}")" || return 1
+  expected_prefix="${path} is owned by ${NSC_GIT_HTTP_BACKEND_PACKAGE}-"
+  [[ ${owner} == "${expected_prefix}"* ]] || {
+    sit_fail "Git smart-HTTP backend has unexpected package ownership: ${owner}"
+    return 1
+  }
+  namespace_tool_record git-http-backend "${path}" "${owner}"
 }
 
 # BusyBox applets such as gzip, sha256sum, tar and timeout are materialised by
@@ -408,6 +430,7 @@ namespace_capture_platform() {
   namespace_tool_command_record curl "$(command -v curl)" curl --version
   namespace_tool_command_record docker "$(command -v docker)" docker --version
   namespace_tool_command_record git "$(command -v git)" git --version
+  namespace_git_http_backend_record
   namespace_tool_command_record go "$(command -v go)" go version
   namespace_tool_command_record helm "$(command -v helm)" helm version --short
   namespace_tool_command_record jq "$(command -v jq)" jq --version

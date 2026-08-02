@@ -1168,6 +1168,36 @@ sit-namespace-lifecycle | sit-proof-lifecycle)
     fail 'the inner preflight no longer binds hostname to exact instance id'
   rg -qF "NSC_INSTANCE_ID_PATTERN='^[a-z0-9]{13}$'" "${pins_source}" ||
     fail 'the Namespace instance-id pin is not the observed exact 13-character contract'
+  # The second live g15 run exposed Wolfi's intentional Git package split:
+  # `git` supplies the client, while `git-daemon` owns git-http-backend. The
+  # smart-HTTP L0 server therefore needs an executable-based package probe, not
+  # another `command -v git` test.
+  rg -qF 'NSC_GIT_HTTP_BACKEND_PACKAGE=git-daemon' "${pins_source}" ||
+    fail 'the Wolfi Git smart-HTTP backend package pin is not git-daemon'
+  rg -qF 'NSC_GIT_HTTP_BACKEND_CANONICAL=/usr/libexec/git-core/git-http-backend' "${pins_source}" ||
+    fail 'the Wolfi Git smart-HTTP backend executable pin changed'
+  rg -qF '[ -x "${NSC_GIT_HTTP_BACKEND_CANONICAL}" ] ||' "${sit_source}" ||
+    fail 'Namespace preparation no longer probes the Git smart-HTTP backend executable'
+  rg -qF 'packages+=("${NSC_GIT_HTTP_BACKEND_PACKAGE}")' "${sit_source}" ||
+    fail 'Namespace preparation no longer installs the pinned Git smart-HTTP backend package'
+  rg -qF 'namespace_git_http_backend_record' "${sit_source}" ||
+    fail 'Namespace platform evidence no longer records the Git smart-HTTP backend owner'
+  rg -qF 'expected_prefix="${path} is owned by ${NSC_GIT_HTTP_BACKEND_PACKAGE}-"' "${sit_source}" ||
+    fail 'Git smart-HTTP backend evidence no longer binds exact APK ownership'
+  nsl_git_backend_prepare="${tmp}/namespace-git-backend-prepare.sh"
+  sed -n '/^namespace_prepare_tools() {$/,/^}$/p' "${sit_source}" >"${nsl_git_backend_prepare}"
+  [ "$(tail -n 1 "${nsl_git_backend_prepare}")" = '}' ] ||
+    fail 'the Namespace tool-preparation body is unterminated'
+  nsl_git_backend_probe_line="$(rg -n -F '[ -x "${NSC_GIT_HTTP_BACKEND_CANONICAL}" ] ||' "${nsl_git_backend_prepare}" | head -n 1 | cut -d: -f1)"
+  nsl_git_backend_install_line="$(rg -n -F 'packages+=("${NSC_GIT_HTTP_BACKEND_PACKAGE}")' "${nsl_git_backend_prepare}" | head -n 1 | cut -d: -f1)"
+  nsl_git_backend_apk_line="$(rg -n -F 'apk add --no-cache "${packages[@]}"' "${nsl_git_backend_prepare}" | head -n 1 | cut -d: -f1)"
+  [ -n "${nsl_git_backend_probe_line}" ] &&
+    [ -n "${nsl_git_backend_install_line}" ] &&
+    [ -n "${nsl_git_backend_apk_line}" ] &&
+    [ "${nsl_git_backend_probe_line}" -lt "${nsl_git_backend_install_line}" ] &&
+    [ "${nsl_git_backend_install_line}" -lt "${nsl_git_backend_apk_line}" ] ||
+    fail 'the Git smart-HTTP backend probe/install sequence no longer precedes APK installation'
+  echo '    Wolfi Git smart-HTTP backend: executable probe installs pinned git-daemon and records exact APK ownership ✓'
   # The first live g15 run reached L0 and exposed a Wolfi/BusyBox portability
   # defect: GNU sed's `0,/pattern/` address is not accepted by the substrate's
   # sed applet. Exercise the exact shipped helper, then prove the structural
