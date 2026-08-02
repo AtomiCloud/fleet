@@ -2891,8 +2891,24 @@ kargo_wait_promotion_succeeded() {
   local stage="$2"
   local freight="$3"
   local output="$4"
-  sit_wait_for 240 "Promotion of ${freight} to ${project}/${stage} to succeed" \
-    kargo_check_promotion_succeeded "${project}" "${stage}" "${freight}"
+  if ! sit_wait_for 240 "Promotion of ${freight} to ${project}/${stage} to succeed" \
+    kargo_check_promotion_succeeded "${project}" "${stage}" "${freight}"; then
+    # The outer lifecycle retains this combined inner log even when the inner
+    # report cannot be collected. Print the exact decision surfaces before the
+    # instance is destroyed so a timeout is diagnosable rather than merely
+    # repeatable.
+    {
+      echo "== Promotion wait diagnostics: ${project}/${stage} freight ${freight} =="
+      kubectl -n "${project}" get stage "${stage}" -o json || true
+      kubectl -n "${project}" get freight "${freight}" -o json || true
+      kubectl -n "${project}" get promotions.kargo.akuity.io -o json || true
+      kubectl -n "${project}" get events --sort-by=.metadata.creationTimestamp || true
+      kubectl -n kargo logs deployment/kargo-controller --tail=500 || true
+      kubectl -n kargo logs deployment/kargo-management-controller --tail=200 || true
+      echo '== end Promotion wait diagnostics =='
+    } >&2
+    return 1
+  fi
   kubectl -n "${project}" get promotions.kargo.akuity.io -o json |
     jq --arg stage "${stage}" --arg freight "${freight}" '
       [.items[] |

@@ -8174,6 +8174,19 @@ PPVTUPLES
   fi
   rg -q 'sit_wait_for 240 ' "${tmp}/ppv-kargo_wait_promotion_succeeded.sh" ||
     fail 'the Promotion success wait no longer retains its literal 240-second budget'
+  rg -qF '== Promotion wait diagnostics:' \
+    "${tmp}/ppv-kargo_wait_promotion_succeeded.sh" ||
+    fail 'the Promotion timeout no longer emits its retained diagnostic block'
+  # shellcheck disable=SC2016 # source-code literals intentionally retain ${}.
+  for ppv_timeout_surface in \
+    'get stage "${stage}" -o json' \
+    'get freight "${freight}" -o json' \
+    'get promotions.kargo.akuity.io -o json' \
+    'logs deployment/kargo-controller --tail=500'; do
+    rg -qF "${ppv_timeout_surface}" \
+      "${tmp}/ppv-kargo_wait_promotion_succeeded.sh" ||
+      fail "the Promotion timeout lost diagnostic surface: ${ppv_timeout_surface}"
+  done
   if rg -qi 'kubectl .*\b(annotate|apply|create|delete|patch|replace)\b|kargo_refresh_stage|kargo_backdate_freight_stage|--subresource[= ]status|projectconfig|promotionpolicies' \
     "${tmp}/ppv-kargo_wait_promotion_succeeded.sh"; then
     fail 'the bounded Promotion wait mutates the Stage or eligibility state it observes'
