@@ -79,6 +79,7 @@ let
         inherit
           actionlint
           bash
+          busybox
           docker-client
           git
           gitlint
