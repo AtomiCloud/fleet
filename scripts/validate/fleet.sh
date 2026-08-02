@@ -1168,6 +1168,62 @@ sit-namespace-lifecycle | sit-proof-lifecycle)
     fail 'the inner preflight no longer binds hostname to exact instance id'
   rg -qF "NSC_INSTANCE_ID_PATTERN='^[a-z0-9]{13}$'" "${pins_source}" ||
     fail 'the Namespace instance-id pin is not the observed exact 13-character contract'
+  # The first live g15 run reached L0 and exposed a Wolfi/BusyBox portability
+  # defect: GNU sed's `0,/pattern/` address is not accepted by the substrate's
+  # sed applet. Exercise the exact shipped helper, then prove the structural
+  # gate rejects a reintroduced first-match sed command.
+  nsl_schema_relaxation_is_portable() {
+    local source="$1" body="${tmp}/schema-relaxation-body.sh"
+    sed -n '/^relax_fleet_repo_url_schema() {$/,/^}$/p' "${source}" >"${body}"
+    [ "$(tail -n 1 "${body}")" = '}' ] || return 1
+    rg -qF 'jq --indent 4' "${body}" &&
+      rg -qF '.properties.fleet.properties.repoURL.pattern = "^https?://"' "${body}" &&
+      rg -qF '"${schema}" >"${schema}.next" || return 1' "${body}" &&
+      rg -qF 'mv -- "${schema}.next" "${schema}"' "${body}" &&
+      ! rg -q '^[[:space:]]*sed[[:space:]]+-i[[:space:]]+.*0,' "${body}"
+  }
+  nsl_schema_relaxation_is_portable "${sit_source}" ||
+    fail 'the runtime fleet.repoURL schema correction is not the reviewed portable helper'
+  nsl_schema_before="${tmp}/schema-relaxation-before.json"
+  nsl_schema_after="${tmp}/schema-relaxation-after.json"
+  cp registry/charts/diene-platform/values.schema.json "${nsl_schema_before}"
+  cp "${nsl_schema_before}" "${nsl_schema_after}"
+  nsl_schema_fn="${tmp}/schema-relaxation-function.sh"
+  sed -n '/^relax_fleet_repo_url_schema() {$/,/^}$/p' "${sit_source}" >"${nsl_schema_fn}"
+  (
+    # shellcheck source=/dev/null
+    source "${nsl_schema_fn}"
+    relax_fleet_repo_url_schema "${nsl_schema_after}"
+  ) || fail 'the shipped portable schema correction failed against the real schema'
+  jq -e '
+    .properties.fleet.properties.repoURL.pattern == "^https?://" and
+    .properties.primordial.properties.server.pattern == "^https://"
+  ' "${nsl_schema_after}" >/dev/null ||
+    fail 'the portable schema correction changed the wrong contract'
+  diff -u "${nsl_schema_before}" "${nsl_schema_after}" \
+    >"${tmp}/schema-relaxation.diff" || true
+  [ "$(rg -c '^[+-] *"pattern"' "${tmp}/schema-relaxation.diff")" -eq 2 ] ||
+    fail 'the portable schema correction changed more than one pattern value'
+  nsl_schema_busybox_old="${tmp}/schema-relaxation-busybox-old.json"
+  cp "${nsl_schema_before}" "${nsl_schema_busybox_old}"
+  busybox sed -i '0,/"pattern": "\^https:\/\/"/s//"pattern": "^https?:\/\/"/' \
+    "${nsl_schema_busybox_old}" ||
+    fail 'the BusyBox first-match regression fixture did not execute'
+  cmp -s "${nsl_schema_before}" "${nsl_schema_busybox_old}" ||
+    fail 'the BusyBox first-match regression fixture no longer reproduces the silent no-op'
+  nsl_schema_mutant="${tmp}/schema-relaxation-mutant.sh"
+  awk '
+    { print }
+    /^relax_fleet_repo_url_schema\(\) \{$/ {
+      print "  sed -i 0, \"${schema}\""
+    }
+  ' "${sit_source}" >"${nsl_schema_mutant}"
+  ! cmp -s "${nsl_schema_mutant}" "${sit_source}" ||
+    fail 'the nonportable schema-rewrite mutant changed no bytes'
+  if nsl_schema_relaxation_is_portable "${nsl_schema_mutant}"; then
+    fail 'the portability gate accepted a reintroduced first-match sed command'
+  fi
+  echo '    L0 schema relaxation: BusyBox reproduces the silent first-match no-op; shipped jq changes one field; mutation gate refuses reintroduction ✓'
   # Structural pins for the created-instance recovery seam. The behavioural
   # regressions below are the real gate; these refuse a silent reversion to a
   # first-nonempty-surface chain or a dropped cidfile check outright.

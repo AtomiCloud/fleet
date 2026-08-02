@@ -636,6 +636,14 @@ make_bare_remote() {
   git -C "${source_repo}" remote add sit "${bare_repo}"
 }
 
+relax_fleet_repo_url_schema() {
+  local schema="$1"
+  jq --indent 4 \
+    '.properties.fleet.properties.repoURL.pattern = "^https?://"' \
+    "${schema}" >"${schema}.next" || return 1
+  mv -- "${schema}.next" "${schema}"
+}
+
 prepare_repositories() {
   local src_root="${work}/src"
   local repos_root="${work}/repos"
@@ -651,7 +659,8 @@ prepare_repositories() {
   local mirror_schema="${FLEET_SOURCE}/registry/charts/diene-platform/values.schema.json"
   cp "${mirror_schema}" "${work}/values.schema.before.json"
   jq -e '.properties.fleet.properties.repoURL.pattern == "^https://"' "${mirror_schema}" >/dev/null
-  sed -i '0,/"pattern": "\^https:\/\/"/s//"pattern": "^https?:\/\/"/' "${mirror_schema}"
+  relax_fleet_repo_url_schema "${mirror_schema}" ||
+    sit_fail 'could not apply the portable fleet.repoURL runtime schema correction'
   jq -e '
     .properties.fleet.properties.repoURL.pattern == "^https?://" and
     .properties.primordial.properties.server.pattern == "^https://"
